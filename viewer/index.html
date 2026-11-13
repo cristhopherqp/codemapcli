@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CodeMap — Visor de Arquitectura</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./vendor/cytoscape.min.js"></script>
+  <script src="./vendor/elk.bundled.js"></script>
+</head>
+<body>
+  <header class="toolbar">
+    <div class="toolbar-brand">
+      <span class="brand-badge">CodeMap</span>
+      <h1 id="project-title">Cargando proyecto…</h1>
+      <span id="project-stats" class="stats-pill"></span>
+    </div>
+
+    <nav class="level-switcher" aria-label="Niveles de abstracción">
+      <button id="level-1" class="level-btn" data-level="1" title="Módulos colapsados">Nivel 1: Arquitectura</button>
+      <button id="level-2" class="level-btn" data-level="2" title="Archivos y funciones">Nivel 2: Interconexión</button>
+      <button id="level-3" class="level-btn" data-level="3" title="Aislar flujo del archivo seleccionado">Nivel 3: Flujo Archivo</button>
+      <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones">Nivel 3+: Intra-función</button>
+    </nav>
+
+    <div class="toolbar-actions">
+      <button id="btn-relayout" class="action-btn" title="Re-ordenar layout (Tecla R)">Re-ordenar (R)</button>
+      <button id="btn-fit" class="action-btn" title="Ajustar grafo a la pantalla">Centrar vista</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="canvas-area">
+      <div id="cy" aria-label="Grafo interactivo de arquitectura"></div>
+
+      <aside class="legend" aria-label="Leyenda visual">
+        <div class="legend-section">
+          <span class="legend-title">Roles</span>
+          <span class="legend-item"><span class="shape shape-entry"></span>Entrada</span>
+          <span class="legend-item"><span class="shape shape-transform"></span>Transformación</span>
+          <span class="legend-item"><span class="shape shape-decision"></span>Decisión</span>
+          <span class="legend-item"><span class="shape shape-io"></span>I/O</span>
+        </div>
+        <div class="legend-section">
+          <span class="legend-title">Llamadas</span>
+          <span class="legend-item"><span class="edge-sample solid"></span>Confirmada</span>
+          <span class="legend-item"><span class="edge-sample dashed"></span>Inferida</span>
+        </div>
+        <div class="legend-hint">Doble clic en módulo/archivo/función para colapsar o expandir</div>
+      </aside>
+    </section>
+
+    <aside id="details-panel" class="details-panel">
+      <div class="details-empty" id="details-empty">
+        <h2>Inspección de Nodo</h2>
+        <p>Haz clic en un módulo, archivo o función para ver sus detalles técnicos, firma y flujo interno.</p>
+      </div>
+
+      <div class="details-content hidden" id="details-content">
+        <div class="details-header">
+          <span id="detail-badge" class="role-badge"></span>
+          <h2 id="detail-title"></h2>
+          <p id="detail-id" class="detail-id"></p>
+        </div>
+
+        <div class="details-actions">
+          <a id="detail-vscode" class="vscode-link hidden" href="#" title="Abrir en Visual Studio Code">
+            Abrir en VS Code
+          </a>
+          <button id="btn-toggle-node" class="toggle-node-btn hidden" type="button"></button>
+        </div>
+
+        <div id="detail-signature-block" class="detail-block hidden">
+          <h3>Firma</h3>
+          <pre id="detail-signature" class="code-box"></pre>
+        </div>
+
+        <div id="detail-docstring-block" class="detail-block hidden">
+          <h3>Docstring</h3>
+          <p id="detail-docstring" class="docstring-text"></p>
+        </div>
+
+        <div id="detail-fingerprint-block" class="detail-block hidden">
+          <h3>Huella AST</h3>
+          <code id="detail-fingerprint" class="fingerprint-code"></code>
+        </div>
+
+        <div id="detail-flow-block" class="detail-block hidden">
+          <h3>Flujo Interno (Nivel 3+)</h3>
+          <ol id="detail-flow-list" class="flow-list"></ol>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

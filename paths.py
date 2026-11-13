@@ -1,0 +1,39 @@
+"""Normalización de rutas y ubicación del almacenamiento central (~/.codemap/).
+
+Regla de la especificación: toda ruta interna pasa por
+`Path(ruta).resolve().as_posix()` antes de calcular hashes o construir IDs.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+STORAGE_DIR_NAME = ".codemap"
+
+
+def normalize_path(path: str | Path) -> str:
+    """Ruta absoluta en formato POSIX (C:/dev/proyecto/archivo.py)."""
+    return Path(path).resolve().as_posix()
+
+
+def project_hash(root_path: str) -> str:
+    """SHA-256 de la ruta absoluta normalizada del proyecto."""
+    return hashlib.sha256(root_path.encode("utf-8")).hexdigest()
+
+
+def storage_root() -> Path:
+    """Directorio central fuera de cualquier proyecto analizado: ~/.codemap/"""
+    return Path.home() / STORAGE_DIR_NAME
+
+
+def project_storage_dir(root_path: str) -> Path:
+    """Directorio ~/.codemap/<hash-proyecto>/ (se crea si no existe)."""
+    directory = storage_root() / project_hash(root_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def relative_id(file_path: str, root_path: str) -> str:
+    """ID de archivo relativo a la raíz del proyecto, en POSIX: 'src/engine.py'."""
+    return Path(file_path).relative_to(Path(root_path)).as_posix()
