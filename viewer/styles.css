@@ -362,3 +362,249 @@ button:hover {
 .flow-step.role-entry { border-left-color: var(--entry); }
 .flow-step.role-decision { border-left-color: var(--decision); }
 .flow-step.role-io { border-left-color: var(--io); }
+
+/* Estado en vivo, botones activos y trazado */
+.live-pill {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.live-pill.online {
+  border-color: var(--entry);
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.live-pill.offline {
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+
+.action-btn.active {
+  background: #13384d;
+  border-color: var(--accent);
+  color: #bae6fd;
+  font-weight: 600;
+}
+
+.action-btn.has-orphans {
+  border-color: var(--decision);
+  color: #fcd34d;
+}
+
+.trace-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.trace-dot.caller {
+  background: #22d3ee;
+}
+
+.trace-dot.callee {
+  background: #fbbf24;
+}
+
+/* Controles cognitivos en el panel lateral */
+.action-row {
+  display: flex;
+  gap: 8px;
+}
+
+.action-row button {
+  flex: 1;
+}
+
+.pin-node-btn.pinned {
+  background: #3a2b08;
+  border-color: var(--decision);
+  color: #fde68a;
+  font-weight: 600;
+}
+
+.role-select {
+  width: 100%;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.note-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.note-header h3 {
+  margin-bottom: 0;
+}
+
+.save-status {
+  font-size: 11px;
+  color: #6ee7b7;
+}
+
+.note-input {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.note-input:focus,
+.role-select:focus,
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Modales (Buscador Ctrl+K y Notas huérfanas) */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 12, 18, 0.72);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 72px;
+  z-index: 40;
+}
+
+.modal-card {
+  width: min(620px, 92vw);
+  max-height: 75vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-titlebar h2 {
+  font-size: 15px;
+}
+
+.search-input {
+  width: 100%;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 12px;
+}
+
+.search-results,
+.orphans-list {
+  list-style: none;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.search-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.search-item:hover,
+.search-item.active {
+  background: var(--bg-elevated);
+  border-color: var(--accent);
+}
+
+.search-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.search-item-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.search-item-note {
+  font-size: 12px;
+  color: #fcd34d;
+  margin-top: 4px;
+}
+
+.orphans-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 10px 14px 2px;
+}
+
+.orphan-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.orphan-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.orphan-note {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.orphan-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.orphan-actions button.danger {
+  border-color: #7f1d1d;
+  color: #fca5a5;
+}

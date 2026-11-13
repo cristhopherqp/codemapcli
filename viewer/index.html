@@ -14,6 +14,7 @@
       <span class="brand-badge">CodeMap</span>
       <h1 id="project-title">Cargando proyecto…</h1>
       <span id="project-stats" class="stats-pill"></span>
+      <span id="live-status" class="live-pill" title="Estado de conexión WebSocket">Conectando…</span>
     </div>
 
     <nav class="level-switcher" aria-label="Niveles de abstracción">
@@ -24,8 +25,11 @@
     </nav>
 
     <div class="toolbar-actions">
-      <button id="btn-relayout" class="action-btn" title="Re-ordenar layout (Tecla R)">Re-ordenar (R)</button>
-      <button id="btn-fit" class="action-btn" title="Ajustar grafo a la pantalla">Centrar vista</button>
+      <button id="btn-trace" class="action-btn" title="Modo Foco / Trazado (Tecla T)">Foco (T)</button>
+      <button id="btn-search" class="action-btn" title="Buscar nodo o nota (Ctrl+K)">Buscar (Ctrl+K)</button>
+      <button id="btn-orphans" class="action-btn" title="Gestionar notas huérfanas">Huérfanas (0)</button>
+      <button id="btn-relayout" class="action-btn" title="Re-ordenar nodos no fijados (Tecla R)">Re-ordenar (R)</button>
+      <button id="btn-fit" class="action-btn" title="Ajustar grafo a la pantalla">Centrar</button>
     </div>
   </header>
 
@@ -45,15 +49,17 @@
           <span class="legend-title">Llamadas</span>
           <span class="legend-item"><span class="edge-sample solid"></span>Confirmada</span>
           <span class="legend-item"><span class="edge-sample dashed"></span>Inferida</span>
+          <span class="legend-item"><span class="trace-dot caller"></span>Quien llama</span>
+          <span class="legend-item"><span class="trace-dot callee"></span>A quien llama</span>
         </div>
-        <div class="legend-hint">Doble clic en módulo/archivo/función para colapsar o expandir</div>
+        <div class="legend-hint">Arrastra un nodo para anclarlo · T: Modo Foco (← / →) · Ctrl+K: Buscar</div>
       </aside>
     </section>
 
     <aside id="details-panel" class="details-panel">
       <div class="details-empty" id="details-empty">
         <h2>Inspección de Nodo</h2>
-        <p>Haz clic en un módulo, archivo o función para ver sus detalles técnicos, firma y flujo interno.</p>
+        <p>Haz clic en un módulo, archivo o función para editar tu nota personal, cambiar su forma o anclar su posición.</p>
       </div>
 
       <div class="details-content hidden" id="details-content">
@@ -67,7 +73,34 @@
           <a id="detail-vscode" class="vscode-link hidden" href="#" title="Abrir en Visual Studio Code">
             Abrir en VS Code
           </a>
-          <button id="btn-toggle-node" class="toggle-node-btn hidden" type="button"></button>
+          <div class="action-row">
+            <button id="btn-pin-node" class="pin-node-btn" type="button">Fijar posición</button>
+            <button id="btn-toggle-node" class="toggle-node-btn hidden" type="button"></button>
+          </div>
+        </div>
+
+        <div id="detail-role-block" class="detail-block hidden">
+          <h3>Forma / Rol Visual</h3>
+          <select id="detail-role-select" class="role-select">
+            <option value="">Automático (AST)</option>
+            <option value="entry">Entrada (Óvalo)</option>
+            <option value="transform">Transformación (Rectángulo)</option>
+            <option value="decision">Decisión (Rombo)</option>
+            <option value="io">I/O (Cilindro)</option>
+          </select>
+        </div>
+
+        <div class="detail-block">
+          <div class="note-header">
+            <h3>Nota Personal</h3>
+            <span id="note-save-status" class="save-status"></span>
+          </div>
+          <textarea
+            id="detail-note-input"
+            class="note-input"
+            rows="4"
+            placeholder="Escribe en tus propias palabras qué hace este nodo y por qué existe…"
+          ></textarea>
         </div>
 
         <div id="detail-signature-block" class="detail-block hidden">
@@ -92,6 +125,34 @@
       </div>
     </aside>
   </main>
+
+  <!-- Modal de Buscador Instantáneo (Ctrl + K) -->
+  <div id="search-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Buscar en el mapa">
+    <div class="modal-card">
+      <div class="modal-header">
+        <input
+          id="search-input"
+          class="search-input"
+          type="text"
+          placeholder="Buscar por función, archivo o texto en tus notas… (Esc para cerrar)"
+          autocomplete="off"
+        />
+      </div>
+      <ul id="search-results" class="search-results"></ul>
+    </div>
+  </div>
+
+  <!-- Modal de Notas Huérfanas -->
+  <div id="orphans-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Notas huérfanas">
+    <div class="modal-card">
+      <div class="modal-titlebar">
+        <h2>Notas Huérfanas</h2>
+        <button id="btn-close-orphans" type="button">Cerrar</button>
+      </div>
+      <p id="orphans-hint" class="orphans-hint"></p>
+      <ul id="orphans-list" class="orphans-list"></ul>
+    </div>
+  </div>
 
   <script src="./app.js"></script>
 </body>
