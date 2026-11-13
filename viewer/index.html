@@ -64,7 +64,10 @@
 
       <div class="details-content hidden" id="details-content">
         <div class="details-header">
-          <span id="detail-badge" class="role-badge"></span>
+          <div class="details-badges">
+            <span id="detail-badge" class="role-badge"></span>
+            <span id="detail-flow-badges" class="flow-badges"></span>
+          </div>
           <h2 id="detail-title"></h2>
           <p id="detail-id" class="detail-id"></p>
         </div>
@@ -111,6 +114,16 @@
         <div id="detail-docstring-block" class="detail-block hidden">
           <h3>Docstring</h3>
           <p id="detail-docstring" class="docstring-text"></p>
+        </div>
+
+        <div id="detail-internal-calls-block" class="detail-block hidden">
+          <h3>Llamadas internas</h3>
+          <ul id="detail-internal-calls-list" class="calls-list"></ul>
+        </div>
+
+        <div id="detail-external-calls-block" class="detail-block hidden">
+          <h3>Librerías y APIs externas</h3>
+          <ul id="detail-external-calls-list" class="calls-list"></ul>
         </div>
 
         <div id="detail-fingerprint-block" class="detail-block hidden">

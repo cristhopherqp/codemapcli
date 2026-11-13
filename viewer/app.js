@@ -300,7 +300,7 @@ function updateLevelButtons(level) {
 // Proyección jerárquica de nodos y aristas visibles (fusionando notes.json)
 // ---------------------------------------------------------------------------
 
-function buildDisplayLabel(rawNode, isCollapsed, noteEntry) {
+function buildDisplayLabel(rawNode, isCollapsed, noteEntry, effectiveRole = null) {
   let label = rawNode.label;
   if (isCollapsed) {
     const childCount = countDescendantFunctions(rawNode.id);
@@ -308,14 +308,23 @@ function buildDisplayLabel(rawNode, isCollapsed, noteEntry) {
       label = `${label} [+ ${childCount}]`;
     }
   }
-  const badges = [];
+  const tags = [];
+  if (rawNode.type === "function") {
+    const role = effectiveRole || noteEntry.custom_role || rawNode.role;
+    if (role === "entry") {
+      tags.push("INICIO");
+    }
+    if (rawNode.is_terminal) {
+      tags.push("FIN");
+    }
+  }
   if (noteEntry.note && noteEntry.note.trim()) {
-    badges.push("📝");
+    tags.push("📝");
   }
   if (noteEntry.pinned) {
-    badges.push("📌");
+    tags.push("📌");
   }
-  return badges.length > 0 ? `${label} ${badges.join("")}` : label;
+  return tags.length > 0 ? `${label} [${tags.join(" · ")}]` : label;
 }
 
 function buildVisibleElements() {
@@ -337,9 +346,10 @@ function buildVisibleElements() {
       data: {
         id: rawNode.id,
         parent: rawNode.parent || undefined,
-        label: buildDisplayLabel(rawNode, isCollapsed, noteEntry),
+        label: buildDisplayLabel(rawNode, isCollapsed, noteEntry, effectiveRole),
         type: rawNode.type,
         role: effectiveRole,
+        terminal: rawNode.type === "function" && rawNode.is_terminal ? "true" : "false",
         pinned: noteEntry.pinned ? "true" : "false",
         hasNote: noteEntry.note && noteEntry.note.trim() ? "true" : "false",
         collapsed: isCollapsed ? "true" : "false",
@@ -649,7 +659,7 @@ function buildStylesheet() {
     },
     {
       selector: 'node[role = "entry"]',
-      style: { "shape": "ellipse", "background-color": "#0d3b2e", "border-color": "#10b981" },
+      style: { "shape": "ellipse", "background-color": "#0d3b2e", "border-color": "#10b981", "border-width": 2.5 },
     },
     {
       selector: 'node[role = "transform"]',
@@ -662,6 +672,10 @@ function buildStylesheet() {
     {
       selector: 'node[role = "io"]',
       style: { "shape": "barrel", "background-color": "#33184d", "border-color": "#a855f7" },
+    },
+    {
+      selector: 'node[terminal = "true"]',
+      style: { "border-color": "#f43f5e", "border-width": 2.5 },
     },
     {
       selector: 'node[pinned = "true"]',
@@ -992,6 +1006,7 @@ function selectNode(nodeId) {
   const badge = document.getElementById("detail-badge");
   badge.textContent = ROLE_LABELS[effectiveRole] || effectiveRole;
   badge.className = `role-badge role-${effectiveRole}`;
+  updateFlowBadges(node, effectiveRole);
 
   document.getElementById("detail-title").textContent = node.label;
   document.getElementById("detail-id").textContent = node.id;
@@ -1006,22 +1021,57 @@ function selectNode(nodeId) {
 
   updateOptionalBlock("detail-signature-block", "detail-signature", node.signature);
   updateOptionalBlock("detail-docstring-block", "detail-docstring", node.docstring);
+  updateInternalCallsBlock(node);
+  updateExternalCallsBlock(node);
   updateOptionalBlock("detail-fingerprint-block", "detail-fingerprint", node.fingerprint);
   updateFlowBlock(node);
 }
 
+function updateFlowBadges(node, effectiveRole) {
+  const container = document.getElementById("detail-flow-badges");
+  container.innerHTML = "";
+  if (node.type !== "function") {
+    return;
+  }
+  if (effectiveRole === "entry") {
+    const startBadge = document.createElement("span");
+    startBadge.className = "flow-badge flow-badge-start";
+    startBadge.textContent = "INICIO";
+    container.appendChild(startBadge);
+  }
+  if (node.is_terminal) {
+    const endBadge = document.createElement("span");
+    endBadge.className = "flow-badge flow-badge-end";
+    endBadge.textContent = "FIN";
+    container.appendChild(endBadge);
+  }
+}
+
+function resolveNodeFilePath(node) {
+  if (node.file_path) {
+    return node.file_path;
+  }
+  if (node.type === "function" && node.parent) {
+    const fileNode = state.nodesById.get(node.parent);
+    return fileNode ? fileNode.file_path : null;
+  }
+  return null;
+}
+
+function buildVsCodeHref(node) {
+  const filePath = resolveNodeFilePath(node);
+  if (!filePath) {
+    return null;
+  }
+  return `vscode://file/${filePath}:${node.line || 1}`;
+}
+
 function updateVsCodeLink(node) {
   const link = document.getElementById("detail-vscode");
-  let filePath = node.file_path;
-  const line = node.line || 1;
+  const href = buildVsCodeHref(node);
 
-  if (!filePath && node.type === "function") {
-    const fileNode = state.nodesById.get(node.parent);
-    filePath = fileNode ? fileNode.file_path : null;
-  }
-
-  if (filePath) {
-    link.href = `vscode://file/${filePath}:${line}`;
+  if (href) {
+    link.href = href;
     link.textContent = node.line ? `Abrir en VS Code (línea ${node.line})` : "Abrir en VS Code";
     link.classList.remove("hidden");
   } else {
@@ -1090,6 +1140,154 @@ function updateFlowBlock(node) {
   block.classList.remove("hidden");
 }
 
+function createInternalCallCard(targetNode) {
+  const li = document.createElement("li");
+  li.className = "call-card";
+
+  const header = document.createElement("div");
+  header.className = "call-card-header";
+
+  const name = document.createElement("span");
+  name.className = "call-name";
+  name.textContent = targetNode.label;
+  header.appendChild(name);
+
+  const fileNode = targetNode.parent ? state.nodesById.get(targetNode.parent) : null;
+  const origin = document.createElement("span");
+  origin.className = "call-origin";
+  origin.textContent = fileNode ? fileNode.id : targetNode.parent || "";
+  header.appendChild(origin);
+  li.appendChild(header);
+
+  if (targetNode.signature) {
+    const sig = document.createElement("pre");
+    sig.className = "call-signature";
+    sig.textContent = targetNode.signature;
+    li.appendChild(sig);
+  }
+
+  if (targetNode.docstring) {
+    const doc = document.createElement("p");
+    doc.className = "call-doc";
+    doc.textContent = targetNode.docstring;
+    li.appendChild(doc);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "call-card-actions";
+
+  const goBtn = document.createElement("button");
+  goBtn.type = "button";
+  goBtn.className = "call-action-btn";
+  goBtn.textContent = "Ir al nodo";
+  goBtn.addEventListener("click", () => navigateToNode(targetNode.id));
+  actions.appendChild(goBtn);
+
+  const href = buildVsCodeHref(targetNode);
+  if (href) {
+    const vsLink = document.createElement("a");
+    vsLink.className = "call-link";
+    vsLink.href = href;
+    vsLink.textContent = targetNode.line ? `VS Code (línea ${targetNode.line})` : "VS Code";
+    actions.appendChild(vsLink);
+  }
+
+  li.appendChild(actions);
+  return li;
+}
+
+function updateInternalCallsBlock(node) {
+  const block = document.getElementById("detail-internal-calls-block");
+  const list = document.getElementById("detail-internal-calls-list");
+  list.innerHTML = "";
+
+  if (node.type !== "function" || !state.rawGraph || !Array.isArray(state.rawGraph.edges)) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  const seenTargets = new Set();
+  const callees = [];
+  for (const edge of state.rawGraph.edges) {
+    if (edge.source !== node.id || edge.target === node.id || seenTargets.has(edge.target)) {
+      continue;
+    }
+    const targetNode = state.nodesById.get(edge.target);
+    if (targetNode && targetNode.type === "function") {
+      seenTargets.add(edge.target);
+      callees.push(targetNode);
+    }
+  }
+
+  if (callees.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  for (const targetNode of callees) {
+    list.appendChild(createInternalCallCard(targetNode));
+  }
+  block.classList.remove("hidden");
+}
+
+const EXTERNAL_KIND_LABELS = {
+  stdlib: "Stdlib",
+  native: "Nativo JS",
+  package: "Paquete",
+};
+
+function updateExternalCallsBlock(node) {
+  const block = document.getElementById("detail-external-calls-block");
+  const list = document.getElementById("detail-external-calls-list");
+  list.innerHTML = "";
+
+  if (node.type !== "function" || !Array.isArray(node.external_calls) || node.external_calls.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  for (const ext of node.external_calls) {
+    const li = document.createElement("li");
+    li.className = "call-card";
+
+    const header = document.createElement("div");
+    header.className = "call-card-header";
+
+    const symbol = document.createElement("span");
+    symbol.className = "call-name";
+    symbol.textContent = `${ext.symbol}()`;
+    header.appendChild(symbol);
+
+    const origin = document.createElement("span");
+    origin.className = "call-origin";
+    origin.textContent = ext.module || "";
+    header.appendChild(origin);
+    li.appendChild(header);
+
+    const actions = document.createElement("div");
+    actions.className = "call-card-actions";
+
+    const kindTag = document.createElement("span");
+    kindTag.className = "call-kind-tag";
+    kindTag.textContent = EXTERNAL_KIND_LABELS[ext.kind] || ext.kind || "externo";
+    actions.appendChild(kindTag);
+
+    if (ext.docs_url) {
+      const docsLink = document.createElement("a");
+      docsLink.className = "call-link docs-link";
+      docsLink.href = ext.docs_url;
+      docsLink.target = "_blank";
+      docsLink.rel = "noopener noreferrer";
+      docsLink.textContent = "Docs ↗";
+      actions.appendChild(docsLink);
+    }
+
+    li.appendChild(actions);
+    list.appendChild(li);
+  }
+  block.classList.remove("hidden");
+}
+
 function refreshCyNodeMetadata(nodeId) {
   const raw = state.nodesById.get(nodeId);
   const cyNode = state.cy.getElementById(nodeId);
@@ -1097,9 +1295,11 @@ function refreshCyNodeMetadata(nodeId) {
     return;
   }
   const entry = getNoteEntry(nodeId);
-  cyNode.data("role", entry.custom_role || raw.role || raw.type);
+  const effectiveRole = entry.custom_role || raw.role || raw.type;
+  cyNode.data("role", effectiveRole);
+  cyNode.data("terminal", raw.type === "function" && raw.is_terminal ? "true" : "false");
   cyNode.data("pinned", entry.pinned ? "true" : "false");
-  cyNode.data("label", buildDisplayLabel(raw, cyNode.data("collapsed") === "true", entry));
+  cyNode.data("label", buildDisplayLabel(raw, cyNode.data("collapsed") === "true", entry, effectiveRole));
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,8 +1365,7 @@ function renderSearchResults(query) {
   });
 }
 
-async function focusSearchResult(nodeId) {
-  closeSearchModal();
+async function navigateToNode(nodeId) {
   let changed = false;
   let current = state.nodesById.get(nodeId);
   while (current && current.parent) {
@@ -1187,6 +1386,11 @@ async function focusSearchResult(nodeId) {
     applyTraceHighlight();
     state.cy.animate({ center: { eles: cyNode }, zoom: Math.max(state.cy.zoom(), 1.1), duration: 220 });
   }
+}
+
+async function focusSearchResult(nodeId) {
+  closeSearchModal();
+  await navigateToNode(nodeId);
 }
 
 function updateOrphansBadge() {
