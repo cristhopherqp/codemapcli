@@ -1,0 +1,12 @@
+generated/
+*.log
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.codemap/
+repomix*
+repomix-output*
+repomix-output.*
+repomix-output/
+repomix.config.json
