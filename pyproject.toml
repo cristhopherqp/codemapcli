@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codemap"
+version = "1.0.0"
+description = "Herramienta CLI local de análisis estático y mapeo cognitivo interactivo."
+requires-python = ">=3.11"
+dependencies = [
+    "tree-sitter",
+    "tree-sitter-language-pack",
+    "watchdog",
+    "aiohttp",
+    "pathspec",
+]
+
+[project.scripts]
+codemap = "codemap.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codemap*"]
+
+[tool.setuptools.package-data]
+codemap = ["viewer/*.html", "viewer/*.css", "viewer/*.js", "viewer/vendor/*.js"]
