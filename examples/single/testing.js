@@ -1,11 +1,17 @@
 const someArray = ["Minjeong", 25];
 
-const whoAmI = (someArray) => {
-  someArray.forEach(element => {
-    console.log(element);
-  });
+const nameOrAge = (someArray) => {
 
-  console.log(`Hello my name is ${someArray[0]} and I have ${someArray[1]}`)
+  someArray.forEach(elem => {
+    if (typeof elem === "string" ){
+      console.log(`Hi, my name is ${someArray[0]}`)
+    };
+
+    console.log(`I'm ${someArray[1]} years old.`)
+  }); 
+
 };
 
-whoAmI(someArray);
+nameOrAge(someArray);
+
+

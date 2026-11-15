@@ -16,12 +16,26 @@ ROLE_IO = "io"                # cilindro
 
 
 @dataclass
+class FlowEdge:
+    """Arista dirigida entre pasos del flujo intra-función (Nivel 3+)."""
+
+    target: str
+    label: str = ""
+    kind: str = "flow"  # "flow" | "branch_yes" | "branch_no" | "exception"
+
+
+@dataclass
 class FlowStep:
-    """Un paso del flujo intra-función (Nivel 3+)."""
+    """Un paso o sub-contenedor del flujo intra-función (Nivel 3+)."""
 
     id: str
     role: str
     label: str
+    code: str = ""
+    parent_id: str | None = None
+    is_container: bool = False
+    kind: str = "step"  # "step" | "loop" | "merge" | "except"
+    edges: list[FlowEdge] = field(default_factory=list)
 
 
 @dataclass

@@ -17,46 +17,102 @@
       <span id="live-status" class="live-pill" title="Estado de conexión WebSocket">Conectando…</span>
     </div>
 
-    <nav class="level-switcher" aria-label="Niveles de abstracción">
-      <button id="level-1" class="level-btn" data-level="1" title="Módulos colapsados">Nivel 1: Arquitectura</button>
-      <button id="level-2" class="level-btn" data-level="2" title="Archivos y funciones">Nivel 2: Interconexión</button>
-      <button id="level-3" class="level-btn" data-level="3" title="Aislar flujo del archivo seleccionado">Nivel 3: Flujo Archivo</button>
-      <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones">Nivel 3+: Intra-función</button>
-    </nav>
+    <div class="toolbar-center">
+      <nav class="level-switcher" aria-label="Niveles de abstracción">
+        <button id="level-1" class="level-btn" data-level="1" title="Módulos colapsados">Nivel 1: Arquitectura</button>
+        <button id="level-2" class="level-btn" data-level="2" title="Archivos y funciones">Nivel 2: Interconexión</button>
+        <button id="level-3" class="level-btn" data-level="3" title="Aislar flujo del archivo seleccionado">Nivel 3: Flujo Archivo</button>
+        <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones">Nivel 3+: Intra-función</button>
+      </nav>
 
-    <div class="toolbar-actions">
-      <button id="btn-trace" class="action-btn" title="Modo Foco / Trazado (Tecla T)">Foco (T)</button>
-      <button id="btn-search" class="action-btn" title="Buscar nodo o nota (Ctrl+K)">Buscar (Ctrl+K)</button>
-      <button id="btn-orphans" class="action-btn" title="Gestionar notas huérfanas">Huérfanas (0)</button>
-      <button id="btn-relayout" class="action-btn" title="Re-ordenar nodos no fijados (Tecla R)">Re-ordenar (R)</button>
-      <button id="btn-fit" class="action-btn" title="Ajustar grafo a la pantalla">Centrar</button>
+      <div class="zoom-controls" aria-label="Control de zoom">
+        <button id="btn-zoom-out" class="zoom-step-btn" type="button" title="Alejar (-)">−</button>
+        <button id="zoom-indicator" class="zoom-indicator" type="button" title="Ajustar grafo a la pantalla (F o Ctrl+0)">100%</button>
+        <button id="btn-zoom-in" class="zoom-step-btn" type="button" title="Acercar (+)">+</button>
+      </div>
+    </div>
+
+    <div class="toolbar-right">
+      <button id="btn-topbar-inspector" class="action-btn inspector-toggle-btn" type="button" title="Mostrar u ocultar panel inspector (] o Ctrl+\)">Ocultar Inspector</button>
     </div>
   </header>
 
   <main class="workspace">
-    <section class="canvas-area">
-      <div id="cy" aria-label="Grafo interactivo de arquitectura"></div>
+    <aside id="left-sidebar" class="left-sidebar collapsed" aria-label="Herramientas de exploración">
+      <div class="sidebar-header">
+        <span class="sidebar-title">Herramientas</span>
+        <button id="btn-toggle-sidebar" class="sidebar-toggle-btn" type="button" title="Expandir barra de herramientas" aria-expanded="false">»</button>
+      </div>
+      <nav class="sidebar-nav">
+        <button id="btn-trace" class="action-btn sidebar-btn" type="button" title="Modo Foco / Trazado (Tecla T)">
+          <span class="tool-icon" aria-hidden="true">🎯</span>
+          <span class="tool-label">Modo Foco (T)</span>
+        </button>
+        <button id="btn-search" class="action-btn sidebar-btn" type="button" title="Buscar nodo o nota (Ctrl+K)">
+          <span class="tool-icon" aria-hidden="true">🔍</span>
+          <span class="tool-label">Buscar (Ctrl+K)</span>
+        </button>
+        <button id="btn-orphans" class="action-btn sidebar-btn" type="button" title="Gestionar notas huérfanas (0)">
+          <span class="tool-icon" aria-hidden="true">🧩</span>
+          <span id="orphans-label-text" class="tool-label">Huérfanas (0)</span>
+          <span id="orphans-count-badge" class="tool-badge hidden">0</span>
+        </button>
+        <button id="btn-known-apis" class="action-btn sidebar-btn" type="button" title="APIs (0 pendientes / 0 aprendidas)">
+          <span class="tool-icon" aria-hidden="true">📚</span>
+          <span id="apis-label-text" class="tool-label">APIs (0 pendientes / 0 aprendidas)</span>
+          <span id="apis-count-badge" class="tool-badge">0/0</span>
+        </button>
+        <button id="btn-relayout" class="action-btn sidebar-btn" type="button" title="Reordenar nodos no fijados (Tecla R)">
+          <span class="tool-icon" aria-hidden="true">✨</span>
+          <span class="tool-label">Reordenar (R)</span>
+        </button>
+        <button id="btn-fit" class="action-btn sidebar-btn" type="button" title="Centrar grafo en pantalla (Tecla F o Ctrl+0)">
+          <span class="tool-icon" aria-hidden="true">⛶</span>
+          <span class="tool-label">Centrar (F)</span>
+        </button>
+        <button id="btn-help" class="action-btn sidebar-btn" type="button" title="Ayuda / Atajos de teclado (?)">
+          <span class="tool-icon" aria-hidden="true">?</span>
+          <span class="tool-label">Ayuda / Atajos (?)</span>
+        </button>
+      </nav>
+    </aside>
 
-      <aside class="legend" aria-label="Leyenda visual">
-        <div class="legend-section">
-          <span class="legend-title">Roles</span>
-          <span class="legend-item"><span class="shape shape-entry"></span>Entrada</span>
-          <span class="legend-item"><span class="shape shape-transform"></span>Transformación</span>
-          <span class="legend-item"><span class="shape shape-decision"></span>Decisión</span>
-          <span class="legend-item"><span class="shape shape-io"></span>I/O</span>
+    <section class="canvas-area" id="canvas-area">
+      <div id="cy" aria-label="Grafo interactivo de arquitectura"></div>
+      <button id="btn-show-panel" class="floating-panel-toggle hidden" type="button" title="Mostrar inspector (] o Ctrl+\)">◀ Inspector</button>
+
+      <aside id="graph-legend" class="legend" aria-label="Leyenda visual">
+        <div class="legend-header">
+          <button id="btn-toggle-legend" class="legend-toggle-btn" type="button" aria-expanded="true" title="Mostrar u ocultar leyenda">Leyenda ▾</button>
         </div>
-        <div class="legend-section">
-          <span class="legend-title">Llamadas</span>
-          <span class="legend-item"><span class="edge-sample solid"></span>Confirmada</span>
-          <span class="legend-item"><span class="edge-sample dashed"></span>Inferida</span>
-          <span class="legend-item"><span class="trace-dot caller"></span>Quien llama</span>
-          <span class="legend-item"><span class="trace-dot callee"></span>A quien llama</span>
+        <div id="legend-body" class="legend-body">
+          <div class="legend-section">
+            <span class="legend-title">Roles</span>
+            <span class="legend-item"><span class="shape shape-entry"></span>Entrada</span>
+            <span class="legend-item"><span class="shape shape-transform"></span>Transformación</span>
+            <span class="legend-item"><span class="shape shape-decision"></span>Decisión</span>
+            <span class="legend-item"><span class="shape shape-io"></span>I/O</span>
+            <span class="legend-item"><span class="shape shape-loop"></span>🔁 Bucle / Callback</span>
+          </div>
+          <div class="legend-section">
+            <span class="legend-title">Flujo</span>
+            <span class="edge-sample solid"></span><span>Confirmada</span>
+            <span class="edge-sample dashed"></span><span>Inferida</span>
+            <span class="legend-item"><span class="edge-branch-tag yes">Sí</span> / <span class="edge-branch-tag no">No</span></span>
+            <span class="legend-item"><span class="edge-branch-tag exc">⚠️ except / catch</span></span>
+            <span class="legend-item"><span class="trace-dot caller"></span>Quien llama</span>
+            <span class="legend-item"><span class="trace-dot callee"></span>A quien llama</span>
+          </div>
+          <div class="legend-hint">Espacio+Arrastrar / Clic central: Mover cámara · F: Ajustar · T: Foco · ] / Ctrl+\: Panel · ?: Atajos</div>
         </div>
-        <div class="legend-hint">Arrastra un nodo para anclarlo · T: Modo Foco (← / →) · Ctrl+K: Buscar</div>
       </aside>
     </section>
 
     <aside id="details-panel" class="details-panel">
+      <div class="panel-topbar">
+        <span class="panel-topbar-title">Inspector</span>
+        <button id="btn-collapse-panel" class="panel-collapse-btn" type="button" title="Ocultar inspector (] o Ctrl+\)">Ocultar ▶</button>
+      </div>
       <div class="details-empty" id="details-empty">
         <h2>Inspección de Nodo</h2>
         <p>Haz clic en un módulo, archivo o función para editar tu nota personal, cambiar su forma o anclar su posición.</p>
@@ -134,6 +190,12 @@
         <div id="detail-flow-block" class="detail-block hidden">
           <h3>Flujo Interno (Nivel 3+)</h3>
           <ol id="detail-flow-list" class="flow-list"></ol>
+          <div id="detail-flow-step-code-block" class="flow-step-code-block hidden">
+            <div class="flow-step-code-header">
+              <span id="detail-flow-step-title">Código del paso</span>
+            </div>
+            <pre id="detail-flow-step-code" class="code-box"></pre>
+          </div>
         </div>
       </div>
     </aside>
@@ -164,6 +226,53 @@
       </div>
       <p id="orphans-hint" class="orphans-hint"></p>
       <ul id="orphans-list" class="orphans-list"></ul>
+    </div>
+  </div>
+
+  <!-- Modal de Inventario Global de APIs y Aprendizaje -->
+  <div id="apis-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Inventario de APIs y métodos">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-titlebar">
+        <h2>Inventario de APIs y Métodos</h2>
+        <button id="btn-close-apis" type="button">Cerrar</button>
+      </div>
+      <div class="apis-toolbar">
+        <div class="apis-tabs" role="tablist">
+          <button id="tab-apis-pending" class="apis-tab active" type="button" data-tab="pending">Por aprender (0)</button>
+          <button id="tab-apis-known" class="apis-tab" type="button" data-tab="known">Aprendidas (0)</button>
+        </div>
+        <input
+          id="apis-search-input"
+          class="search-input apis-search"
+          type="text"
+          placeholder="Filtrar por API, método, módulo o tipo…"
+          autocomplete="off"
+        />
+      </div>
+      <p id="apis-summary-hint" class="orphans-hint"></p>
+      <ul id="apis-list" class="orphans-list"></ul>
+    </div>
+  </div>
+
+  <!-- Modal de Atajos de Teclado y Navegación (?) -->
+  <div id="help-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Atajos de navegación">
+    <div class="modal-card modal-card-compact">
+      <div class="modal-titlebar">
+        <h2>Atajos y Navegación</h2>
+        <button id="btn-close-help" type="button">Cerrar</button>
+      </div>
+      <ul class="shortcuts-list">
+        <li><span><kbd>Espacio</kbd> + Arrastrar</span><span>Modo Mano: mover cámara incluso encima de nodos</span></li>
+        <li><span>Clic central + Arrastrar</span><span>Paneo libre en cualquier momento sin mover nodos</span></li>
+        <li><span>Rueda / <kbd>+</kbd> / <kbd>-</kbd></span><span>Acercar o alejar zoom centrado</span></li>
+        <li><span><kbd>F</kbd> o <kbd>Ctrl</kbd>+<kbd>0</kbd></span><span>Ajustar todo el grafo a la pantalla</span></li>
+        <li><span><kbd>T</kbd> y <kbd>←</kbd> / <kbd>→</kbd></span><span>Activar Modo Foco y avanzar entre llamadas</span></li>
+        <li><span><kbd>Ctrl</kbd>+<kbd>K</kbd></span><span>Abrir buscador instantáneo</span></li>
+        <li><span><kbd>R</kbd></span><span>Re-ordenar nodos no fijados (ELKjs)</span></li>
+        <li><span><kbd>]</kbd> o <kbd>Ctrl</kbd>+<kbd>\</kbd></span><span>Ocultar o desplegar panel lateral inspector</span></li>
+        <li><span><kbd>Esc</kbd></span><span>Cerrar modales / salir de Foco / deseleccionar nodo</span></li>
+        <li><span>Doble clic en nodo</span><span>Colapsar / expandir contenedor o flujo interno</span></li>
+      </ul>
     </div>
   </div>
 

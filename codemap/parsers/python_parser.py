@@ -25,17 +25,21 @@ from codemap.models import (
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
+    FlowGraphBuilder,
     NodeKey,
+    PendingExit,
     collect_metrics,
+    collapse_whitespace,
     contains_type,
+    dedent_code,
     find_enclosing_key,
     first_capture,
+    flow_label,
     iter_body_nodes,
     line_of,
     node_key,
     node_text,
     normalize_callee,
-    one_line,
     parameter_names,
     run_matches,
     signature_text,
@@ -108,21 +112,15 @@ AWAIT_TYPES = frozenset({"await"})
 GLOBAL_TYPES = frozenset({"global_statement", "nonlocal_statement"})
 CALL_TYPES = frozenset({"call"})
 
-# Flujo intra-función: sentencias que bifurcan (rombo) y cláusulas hijas.
-FLOW_DECISION_TYPES = frozenset(
-    {
-        "if_statement", "elif_clause", "for_statement", "while_statement",
-        "match_statement", "case_clause", "except_clause", "except_group_clause",
-    }
-)
-FLOW_CLAUSE_TYPES = frozenset(
-    {
-        "elif_clause", "else_clause", "except_clause", "except_group_clause",
-        "finally_clause", "case_clause",
-    }
+# Flujo intra-función: bucles, decisiones, asignaciones y saltos.
+FLOW_LOOP_TYPES = frozenset({"for_statement", "while_statement"})
+FLOW_DECISION_TYPES = frozenset({"if_statement", "match_statement"})
+FLOW_ASSIGNMENT_TYPES = frozenset({"assignment", "augmented_assignment"})
+FLOW_JUMP_TYPES = frozenset(
+    {"return_statement", "raise_statement", "break_statement", "continue_statement", "pass_statement"}
 )
 FLOW_SKIP_TYPES = frozenset({"class_definition", "decorated_definition", "comment"})
-FLOW_MAX_STEPS = 30
+FLOW_MAX_STEPS = 40
 
 # Decoradores que marcan puntos de entrada (Flask/FastAPI/Click/eventos...).
 ENTRY_DECORATOR_PATTERN = re.compile(
@@ -343,66 +341,414 @@ def build_flow(
     source: bytes,
     function_nodes: dict[NodeKey, Node],
 ) -> list[FlowStep]:
-    """Secuencia en orden de código: entrada, bifurcaciones, bucles,
-    llamadas clave y retornos."""
-    steps: list[FlowStep] = []
-    add_step(steps, ROLE_ENTRY, "in: " + (", ".join(params) or "∅"))
+    """Construye el grafo intra-función con sub-contenedores, ramas Sí/No y try/except."""
+    builder = FlowGraphBuilder(FLOW_MAX_STEPS)
+    param_summary = ", ".join(params) or "∅"
+    _, pending = builder.emit_sequential(
+        [], ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+    )
     if body is not None:
-        walk_flow_block(body, source, function_nodes, steps)
-    return steps
+        pending = walk_flow_block(body, source, function_nodes, builder, pending, parent_id=None)
+    builder.close_dangling_branches(pending, parent_id=None)
+    return builder.steps
 
 
-def add_step(steps: list[FlowStep], role: str, label: str) -> None:
-    if len(steps) > FLOW_MAX_STEPS:
-        return
-    if len(steps) == FLOW_MAX_STEPS:
-        role, label = ROLE_TRANSFORM, "…"
-    steps.append(FlowStep(id=f"n{len(steps) + 1}", role=role, label=label))
+def _is_docstring_statement(stmt: Node) -> bool:
+    if stmt.type == "string":
+        return True
+    if stmt.type == "expression_statement" and stmt.named_child_count == 1:
+        return stmt.named_children[0].type == "string"
+    return False
 
 
 def walk_flow_block(
-    block: Node, source: bytes, function_nodes: dict[NodeKey, Node], steps: list[FlowStep]
-) -> None:
+    block: Node | None,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    if block is None:
+        return pending
+    current = pending
     for statement in block.named_children:
-        walk_flow_statement(statement, source, function_nodes, steps)
+        if _is_docstring_statement(statement):
+            continue
+        current = walk_flow_statement(statement, source, function_nodes, builder, current, parent_id)
+    return current
+
+
+def collect_inline_lambdas(root: Node, function_nodes: dict[NodeKey, Node]) -> list[tuple[Node, Node]]:
+    """Localiza en orden de ejecución pares (call, lambda) dentro de una sentencia."""
+    found: list[tuple[Node, Node]] = []
+
+    def scan_arg_for_lambdas(arg: Node, call_node: Node) -> None:
+        if arg.type == "lambda":
+            found.append((call_node, arg))
+            return
+        if arg.type == "keyword_argument":
+            val = arg.child_by_field_name("value")
+            if val is not None:
+                scan_arg_for_lambdas(val, call_node)
+            return
+        visit(arg)
+
+    def visit(node: Node) -> None:
+        if node_key(node) in function_nodes or node.type == "lambda":
+            return
+        if node.type == "call":
+            callee = node.child_by_field_name("function")
+            if callee is not None:
+                visit(callee)
+            args = node.child_by_field_name("arguments")
+            if args is not None:
+                for arg in args.named_children:
+                    scan_arg_for_lambdas(arg, node)
+            return
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return found
+
+
+def emit_lambda_steps(
+    stmt: Node,
+    lambdas: list[tuple[Node, Node]],
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    current = pending
+    for idx, (call_node, lambda_node) in enumerate(lambdas):
+        callee_node = call_node.child_by_field_name("function")
+        callee_name = normalize_callee(node_text(callee_node, source)) if callee_node else "lambda"
+        lam_params = parameter_names(lambda_node.child_by_field_name("parameters"), source)
+        params_label = ", ".join(lam_params) or "∅"
+
+        lead = ""
+        if idx == 0 and stmt is not call_node:
+            raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
+            if raw_lead and len(raw_lead) <= 40:
+                lead = f"{raw_lead} "
+
+        header_label = f"🔁 {lead}{callee_name}({params_label})"
+        code_node = stmt if (idx == 0 and len(lambdas) == 1) else call_node
+        lam_step, current = builder.emit_sequential(
+            current,
+            step_role(callee_node or call_node, source, function_nodes),
+            header_label,
+            code=dedent_code(node_text(code_node, source)),
+            parent_id=parent_id,
+            is_container=True,
+            kind="loop",
+        )
+        if lam_step is None:
+            return current
+
+        body_node = lambda_node.child_by_field_name("body")
+        if body_node is not None:
+            builder.emit_sequential(
+                [],
+                step_role(body_node, source, function_nodes),
+                flow_label(node_text(body_node, source)),
+                code=dedent_code(node_text(body_node, source)),
+                parent_id=lam_step.id,
+            )
+        builder.finalize_container(lam_step)
+    return current
 
 
 def walk_flow_statement(
-    node: Node, source: bytes, function_nodes: dict[NodeKey, Node], steps: list[FlowStep]
-) -> None:
+    node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
     if node_key(node) in function_nodes or node.type in FLOW_SKIP_TYPES:
-        return
+        return pending
 
-    if node.type in FLOW_DECISION_TYPES:
-        add_step(steps, ROLE_DECISION, header_text(node, source))
-        walk_flow_children(node, source, function_nodes, steps)
-    elif node.type == "with_statement":
-        add_step(steps, step_role(node, source, function_nodes), header_text(node, source))
-        walk_flow_children(node, source, function_nodes, steps)
-    elif node.type in ("try_statement", "else_clause", "finally_clause", "block"):
-        walk_flow_children(node, source, function_nodes, steps)
-    elif node.type in ("return_statement", "raise_statement"):
-        add_step(steps, step_role(node, source, function_nodes), one_line(node_text(node, source)))
-    elif contains_type(node, CALL_TYPES, function_nodes):
-        add_step(steps, step_role(node, source, function_nodes), one_line(node_text(node, source)))
+    if node.type == "block":
+        return walk_flow_block(node, source, function_nodes, builder, pending, parent_id)
+
+    if node.type in FLOW_LOOP_TYPES:
+        return walk_loop_statement(node, source, function_nodes, builder, pending, parent_id)
+
+    if node.type == "if_statement":
+        return walk_if_statement(node, source, function_nodes, builder, pending, parent_id)
+
+    if node.type == "match_statement":
+        return walk_match_statement(node, source, function_nodes, builder, pending, parent_id)
+
+    if node.type == "try_statement":
+        return walk_try_statement(node, source, function_nodes, builder, pending, parent_id)
+
+    if node.type == "with_statement":
+        _, next_pending = builder.emit_sequential(
+            pending,
+            step_role(node, source, function_nodes),
+            header_text(node, source),
+            code=dedent_code(node_text(node, source)),
+            parent_id=parent_id,
+        )
+        body = next((c for c in node.named_children if c.type == "block"), None)
+        return walk_flow_block(body, source, function_nodes, builder, next_pending, parent_id)
+
+    lambdas = collect_inline_lambdas(node, function_nodes)
+    if lambdas:
+        return emit_lambda_steps(node, lambdas, source, function_nodes, builder, pending, parent_id)
+
+    is_standard = (
+        node.type in FLOW_JUMP_TYPES
+        or contains_type(node, CALL_TYPES | AWAIT_TYPES | FLOW_ASSIGNMENT_TYPES, function_nodes)
+    )
+    if not is_standard:
+        return pending
+
+    _, next_pending = builder.emit_sequential(
+        pending,
+        step_role(node, source, function_nodes),
+        flow_label(node_text(node, source)),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    return next_pending
 
 
-def walk_flow_children(
-    node: Node, source: bytes, function_nodes: dict[NodeKey, Node], steps: list[FlowStep]
-) -> None:
-    """Desciende solo a bloques y cláusulas (no a condiciones ni expresiones)."""
+def walk_loop_statement(
+    node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    loop_step, next_pending = builder.emit_sequential(
+        pending,
+        step_role(node, source, function_nodes),
+        f"🔁 {header_text(node, source)}",
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+        is_container=True,
+        kind="loop",
+    )
+    if loop_step is None:
+        return next_pending
+
+    body = node.child_by_field_name("body") or next(
+        (c for c in node.named_children if c.type == "block"), None
+    )
+    if body is not None:
+        inner_pending = walk_flow_block(
+            body, source, function_nodes, builder, [], parent_id=loop_step.id
+        )
+        builder.close_dangling_branches(inner_pending, parent_id=loop_step.id)
+    builder.finalize_container(loop_step)
+
+    else_clause = next((c for c in node.named_children if c.type == "else_clause"), None)
+    if else_clause is not None:
+        else_block = next((c for c in else_clause.named_children if c.type == "block"), None)
+        return walk_flow_block(else_block, source, function_nodes, builder, next_pending, parent_id)
+    return next_pending
+
+
+def walk_if_statement(
+    node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    if_step, _ = builder.emit_sequential(
+        pending,
+        ROLE_DECISION,
+        header_text(node, source),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    if if_step is None:
+        return pending
+
+    consequence = node.child_by_field_name("consequence")
+    end_exits = walk_flow_block(
+        consequence,
+        source,
+        function_nodes,
+        builder,
+        [(if_step.id, "Sí", "branch_yes")],
+        parent_id=parent_id,
+    )
+    no_pending: list[PendingExit] = [(if_step.id, "No", "branch_no")]
+
+    for alt in node.children_by_field_name("alternative"):
+        if alt.type == "elif_clause":
+            elif_step, _ = builder.emit_sequential(
+                no_pending,
+                ROLE_DECISION,
+                header_text(alt, source),
+                code=dedent_code(node_text(alt, source)),
+                parent_id=parent_id,
+            )
+            if elif_step is None:
+                continue
+            elif_body = alt.child_by_field_name("consequence")
+            end_exits.extend(
+                walk_flow_block(
+                    elif_body,
+                    source,
+                    function_nodes,
+                    builder,
+                    [(elif_step.id, "Sí", "branch_yes")],
+                    parent_id=parent_id,
+                )
+            )
+            no_pending = [(elif_step.id, "No", "branch_no")]
+        elif alt.type == "else_clause":
+            else_body = next((c for c in alt.named_children if c.type == "block"), None)
+            end_exits.extend(
+                walk_flow_block(
+                    else_body,
+                    source,
+                    function_nodes,
+                    builder,
+                    no_pending,
+                    parent_id=parent_id,
+                )
+            )
+            no_pending = []
+
+    end_exits.extend(no_pending)
+    return end_exits
+
+
+def walk_match_statement(
+    node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    match_step, _ = builder.emit_sequential(
+        pending,
+        ROLE_DECISION,
+        header_text(node, source),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    if match_step is None:
+        return pending
+
+    body = node.child_by_field_name("body") or next(
+        (c for c in node.named_children if c.type == "block"), None
+    )
+    exits: list[PendingExit] = []
+    has_wildcard = False
+    if body is not None:
+        for clause in body.named_children:
+            if clause.type != "case_clause":
+                continue
+            clause_lbl = header_text(clause, source)
+            if re.match(r"^case\s+_\b", clause_lbl):
+                has_wildcard = True
+            clause_block = next((c for c in clause.named_children if c.type == "block"), None)
+            clause_exits = walk_flow_block(
+                clause_block,
+                source,
+                function_nodes,
+                builder,
+                [(match_step.id, clause_lbl, "branch_yes")],
+                parent_id=parent_id,
+            )
+            exits.extend(clause_exits)
+    if not has_wildcard:
+        exits.append((match_step.id, "No", "branch_no"))
+    return exits or [(match_step.id, "", "flow")]
+
+
+def walk_try_statement(
+    node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    try_body = node.child_by_field_name("body") or next(
+        (c for c in node.named_children if c.type == "block"), None
+    )
+    before_try = len(builder.steps)
+    try_exits = walk_flow_block(try_body, source, function_nodes, builder, pending, parent_id)
+    if len(builder.steps) == before_try:
+        anchor_step, try_exits = builder.emit_sequential(
+            pending,
+            ROLE_TRANSFORM,
+            "try",
+            code=dedent_code(node_text(try_body, source)) or "try",
+            parent_id=parent_id,
+        )
+        try_anchor_id = anchor_step.id if anchor_step else None
+    else:
+        try_anchor_id = builder.steps[before_try].id
+
+    combined_exits = list(try_exits)
     for child in node.named_children:
-        if child.type == "block":
-            walk_flow_block(child, source, function_nodes, steps)
-        elif child.type in FLOW_CLAUSE_TYPES:
-            walk_flow_statement(child, source, function_nodes, steps)
+        if child.type not in ("except_clause", "except_group_clause") or try_anchor_id is None:
+            continue
+        exc_label = header_text(child, source)
+        edge_label = f"⚠️ {exc_label}"
+        exc_start: list[PendingExit] = [(try_anchor_id, edge_label, "exception")]
+        clause_block = next((c for c in child.named_children if c.type == "block"), None)
+        before_exc = len(builder.steps)
+        exc_exits = walk_flow_block(
+            clause_block, source, function_nodes, builder, exc_start, parent_id
+        )
+        if len(builder.steps) == before_exc:
+            exc_step, exc_exits = builder.emit_sequential(
+                exc_start,
+                ROLE_TRANSFORM,
+                exc_label,
+                code=dedent_code(node_text(child, source)),
+                parent_id=parent_id,
+                kind="except",
+            )
+            if exc_step is None:
+                exc_exits = exc_start
+        else:
+            for step in builder.steps[before_exc:]:
+                if step.kind == "step":
+                    step.kind = "except"
+        combined_exits.extend(exc_exits)
+
+    else_clause = next((c for c in node.named_children if c.type == "else_clause"), None)
+    if else_clause is not None:
+        else_block = next((c for c in else_clause.named_children if c.type == "block"), None)
+        else_exits = walk_flow_block(
+            else_block, source, function_nodes, builder, try_exits, parent_id
+        )
+        combined_exits.extend(else_exits)
+
+    finally_clause = next((c for c in node.named_children if c.type == "finally_clause"), None)
+    if finally_clause is not None:
+        fin_block = next((c for c in finally_clause.named_children if c.type == "block"), None)
+        combined_exits = walk_flow_block(
+            fin_block, source, function_nodes, builder, combined_exits, parent_id
+        )
+
+    return combined_exits
 
 
 def header_text(node: Node, source: bytes) -> str:
     """Cabecera de una sentencia compuesta: 'for v in reversed(topo)'."""
     block = next((c for c in node.named_children if c.type == "block"), None)
     raw = text_between(source, node, block) if block is not None else node_text(node, source)
-    return one_line(raw).rstrip(":").rstrip()
+    return flow_label(raw).rstrip(":").rstrip()
 
 
 def step_role(node: Node, source: bytes, function_nodes: dict[NodeKey, Node]) -> str:

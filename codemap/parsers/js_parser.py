@@ -27,17 +27,21 @@ from codemap.models import (
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
+    FlowGraphBuilder,
     NodeKey,
+    PendingExit,
     collect_metrics,
+    collapse_whitespace,
     contains_type,
+    dedent_code,
     find_enclosing_key,
     first_capture,
+    flow_label,
     iter_body_nodes,
     line_of,
     node_key,
     node_text,
     normalize_callee,
-    one_line,
     parameter_names,
     run_matches,
     signature_text,
@@ -174,18 +178,16 @@ IGNORED_CALLEES = frozenset({"require", "super", "import"})
 GLOBAL_TARGET_PATTERN = re.compile(r"^(window|globalThis|global|document)\.")
 
 # Flujo intra-función.
-FLOW_DECISION_TYPES = frozenset(
-    {
-        "if_statement", "for_statement", "for_in_statement", "while_statement",
-        "do_statement", "switch_statement", "switch_case", "switch_default",
-        "catch_clause",
-    }
+FLOW_LOOP_TYPES = frozenset({"for_statement", "for_in_statement", "while_statement", "do_statement"})
+FLOW_DECISION_TYPES = frozenset({"if_statement", "switch_statement"})
+FLOW_ASSIGNMENT_TYPES = frozenset(
+    {"assignment_expression", "augmented_assignment_expression", "update_expression"}
 )
-FLOW_CONTAINER_TYPES = frozenset(
-    {"statement_block", "switch_body", "else_clause", "try_statement", "finally_clause"}
+FLOW_JUMP_TYPES = frozenset(
+    {"return_statement", "throw_statement", "break_statement", "continue_statement"}
 )
 FLOW_DECLARATION_TYPES = frozenset({"lexical_declaration", "variable_declaration"})
-FLOW_MAX_STEPS = 30
+FLOW_MAX_STEPS = 40
 
 
 @dataclass
@@ -467,66 +469,406 @@ def build_flow(
     source: bytes,
     functions: dict[NodeKey, FunctionNode],
 ) -> list[FlowStep]:
-    steps: list[FlowStep] = []
-    add_step(steps, ROLE_ENTRY, "in: " + (", ".join(params) or "∅"))
+    builder = FlowGraphBuilder(FLOW_MAX_STEPS)
+    param_summary = ", ".join(params) or "∅"
+    _, pending = builder.emit_sequential(
+        [], ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+    )
     if body is None:
-        return steps
+        return builder.steps
     if body.type == "statement_block":
-        walk_flow_block(body, source, functions, steps)
+        pending = walk_flow_block(body, source, functions, builder, pending, parent_id=None)
     else:  # arrow function de expresión: x => x + 1
-        add_step(steps, step_role(body, source, functions), "return " + one_line(node_text(body, source)))
-    return steps
+        pending = walk_flow_expr_body(body, source, functions, builder, pending, parent_id=None)
+    builder.close_dangling_branches(pending, parent_id=None)
+    return builder.steps
 
 
-def add_step(steps: list[FlowStep], role: str, label: str) -> None:
-    if len(steps) > FLOW_MAX_STEPS:
-        return
-    if len(steps) == FLOW_MAX_STEPS:
-        role, label = ROLE_TRANSFORM, "…"
-    steps.append(FlowStep(id=f"n{len(steps) + 1}", role=role, label=label))
+def walk_flow_expr_body(
+    body: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    callbacks = collect_inline_callbacks(body, functions)
+    if callbacks:
+        return emit_callback_steps(body, callbacks, source, functions, builder, pending, parent_id)
+    body_text = flow_label(node_text(body, source))
+    role = step_role(body, source, functions)
+    label = f"return {body_text}" if parent_id is None else body_text
+    _, next_pending = builder.emit_sequential(
+        pending,
+        role,
+        label,
+        code=dedent_code(node_text(body, source)),
+        parent_id=parent_id,
+    )
+    return next_pending
 
 
 def walk_flow_block(
-    block: Node, source: bytes, functions: dict[NodeKey, FunctionNode], steps: list[FlowStep]
-) -> None:
+    block: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    current = pending
     for statement in block.named_children:
-        walk_flow_statement(statement, source, functions, steps)
+        current = walk_flow_statement(statement, source, functions, builder, current, parent_id)
+    return current
+
+
+def walk_flow_clause_or_block(
+    node: Node | None,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    if node is None:
+        return pending
+    if node.type == "statement_block":
+        return walk_flow_block(node, source, functions, builder, pending, parent_id)
+    return walk_flow_statement(node, source, functions, builder, pending, parent_id)
 
 
 def walk_flow_statement(
-    node: Node, source: bytes, functions: dict[NodeKey, FunctionNode], steps: list[FlowStep]
-) -> None:
-    if node_key(node) in functions or node.type == "comment":
-        return
+    node: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    if node_key(node) in functions or node.type in ("comment", "empty_statement"):
+        return pending
     # const f = () => {} dentro de una función: es una función propia, no un paso.
     if node.type in FLOW_DECLARATION_TYPES and declares_only_functions(node, functions):
-        return
+        return pending
 
-    if node.type in FLOW_DECISION_TYPES:
-        add_step(steps, ROLE_DECISION, header_text(node, source))
-        walk_flow_children(node, source, functions, steps)
-    elif node.type in FLOW_CONTAINER_TYPES:
-        walk_flow_children(node, source, functions, steps)
-    elif node.type in ("return_statement", "throw_statement"):
-        add_step(steps, step_role(node, source, functions), one_line(node_text(node, source)))
-    elif contains_type(node, CALL_TYPES, functions):
-        add_step(steps, step_role(node, source, functions), one_line(node_text(node, source)))
+    if node.type == "statement_block":
+        return walk_flow_block(node, source, functions, builder, pending, parent_id)
+
+    if node.type in FLOW_LOOP_TYPES:
+        return walk_loop_statement(node, source, functions, builder, pending, parent_id)
+
+    if node.type == "if_statement":
+        return walk_if_statement(node, source, functions, builder, pending, parent_id)
+
+    if node.type == "switch_statement":
+        return walk_switch_statement(node, source, functions, builder, pending, parent_id)
+
+    if node.type == "try_statement":
+        return walk_try_statement(node, source, functions, builder, pending, parent_id)
+
+    callbacks = collect_inline_callbacks(node, functions)
+    if callbacks:
+        return emit_callback_steps(node, callbacks, source, functions, builder, pending, parent_id)
+
+    is_standard = (
+        node.type in FLOW_JUMP_TYPES
+        or node.type in FLOW_DECLARATION_TYPES
+        or contains_type(node, CALL_TYPES | AWAIT_TYPES | FLOW_ASSIGNMENT_TYPES, functions)
+    )
+    if not is_standard:
+        return pending
+
+    _, next_pending = builder.emit_sequential(
+        pending,
+        step_role(node, source, functions),
+        flow_label(node_text(node, source)),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    return next_pending
 
 
-def walk_flow_children(
-    node: Node, source: bytes, functions: dict[NodeKey, FunctionNode], steps: list[FlowStep]
-) -> None:
-    """Desciende a bloques, cláusulas y sentencias hijas; ignora condiciones,
-    inicializadores y valores de `case`."""
-    for child in node.named_children:
-        if child.type in ("statement_block", "switch_body"):
-            walk_flow_block(child, source, functions, steps)
-        elif (
-            child.type in FLOW_DECISION_TYPES
-            or child.type in FLOW_CONTAINER_TYPES
-            or child.type.endswith("_statement")
-        ):
-            walk_flow_statement(child, source, functions, steps)
+def walk_loop_statement(
+    node: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    loop_step, next_pending = builder.emit_sequential(
+        pending,
+        step_role(node, source, functions),
+        f"🔁 {header_text(node, source)}",
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+        is_container=True,
+        kind="loop",
+    )
+    if loop_step is None:
+        return next_pending
+    body = node.child_by_field_name("body")
+    if body is not None:
+        inner_pending = walk_flow_clause_or_block(
+            body, source, functions, builder, [], parent_id=loop_step.id
+        )
+        builder.close_dangling_branches(inner_pending, parent_id=loop_step.id)
+    builder.finalize_container(loop_step)
+    return next_pending
+
+
+def walk_if_statement(
+    node: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    if_step, _ = builder.emit_sequential(
+        pending,
+        ROLE_DECISION,
+        header_text(node, source),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    if if_step is None:
+        return pending
+
+    consequence = node.child_by_field_name("consequence")
+    yes_start: list[PendingExit] = [(if_step.id, "Sí", "branch_yes")]
+    then_exits = walk_flow_clause_or_block(
+        consequence, source, functions, builder, yes_start, parent_id=parent_id
+    )
+
+    alt = node.child_by_field_name("alternative")
+    no_start: list[PendingExit] = [(if_step.id, "No", "branch_no")]
+    if alt is not None:
+        alt_targets = [c for c in alt.named_children if c.type != "comment"]
+        else_exits = no_start
+        if alt_targets:
+            else_exits = walk_flow_clause_or_block(
+                alt_targets[0], source, functions, builder, no_start, parent_id=parent_id
+            )
+    else:
+        else_exits = no_start
+
+    return then_exits + else_exits
+
+
+def walk_switch_statement(
+    node: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    sw_step, _ = builder.emit_sequential(
+        pending,
+        ROLE_DECISION,
+        header_text(node, source),
+        code=dedent_code(node_text(node, source)),
+        parent_id=parent_id,
+    )
+    if sw_step is None:
+        return pending
+
+    exits: list[PendingExit] = []
+    has_default = False
+    body = node.child_by_field_name("body")
+    if body is not None:
+        for clause in body.named_children:
+            if clause.type not in ("switch_case", "switch_default"):
+                continue
+            if clause.type == "switch_default":
+                has_default = True
+            clause_pending: list[PendingExit] = [(sw_step.id, header_text(clause, source), "branch_yes")]
+            for child in clause.named_children:
+                if child.type == "comment":
+                    continue
+                if clause.type == "switch_case" and child == clause.child_by_field_name("value"):
+                    continue
+                clause_pending = walk_flow_clause_or_block(
+                    child, source, functions, builder, clause_pending, parent_id=parent_id
+                )
+            exits.extend(clause_pending)
+    if not has_default:
+        exits.append((sw_step.id, "default", "branch_no"))
+    return exits or [(sw_step.id, "", "flow")]
+
+
+def walk_try_statement(
+    node: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    try_body = node.child_by_field_name("body")
+    before_try = len(builder.steps)
+    try_exits = walk_flow_clause_or_block(
+        try_body, source, functions, builder, pending, parent_id=parent_id
+    )
+    if len(builder.steps) == before_try:
+        anchor_step, try_exits = builder.emit_sequential(
+            pending,
+            ROLE_TRANSFORM,
+            "try",
+            code=dedent_code(node_text(try_body, source)) or "try",
+            parent_id=parent_id,
+        )
+        try_anchor_id = anchor_step.id if anchor_step else None
+    else:
+        try_anchor_id = builder.steps[before_try].id
+
+    combined_exits = list(try_exits)
+    handler = node.child_by_field_name("handler")
+    if handler is not None and try_anchor_id is not None:
+        catch_label = header_text(handler, source)
+        edge_label = f"⚠️ {catch_label}"
+        catch_start: list[PendingExit] = [(try_anchor_id, edge_label, "exception")]
+        before_catch = len(builder.steps)
+        catch_exits = walk_flow_clause_or_block(
+            handler.child_by_field_name("body"),
+            source,
+            functions,
+            builder,
+            catch_start,
+            parent_id=parent_id,
+        )
+        if len(builder.steps) == before_catch:
+            exc_step, catch_exits = builder.emit_sequential(
+                catch_start,
+                ROLE_TRANSFORM,
+                catch_label,
+                code=dedent_code(node_text(handler, source)),
+                parent_id=parent_id,
+                kind="except",
+            )
+            if exc_step is None:
+                catch_exits = catch_start
+        else:
+            for step in builder.steps[before_catch:]:
+                if step.kind == "step":
+                    step.kind = "except"
+        combined_exits.extend(catch_exits)
+
+    finalizer = node.child_by_field_name("finalizer")
+    if finalizer is not None:
+        combined_exits = walk_flow_clause_or_block(
+            finalizer.child_by_field_name("body"),
+            source,
+            functions,
+            builder,
+            combined_exits,
+            parent_id=parent_id,
+        )
+    return combined_exits
+
+
+def collect_inline_callbacks(
+    root: Node, functions: dict[NodeKey, FunctionNode]
+) -> list[tuple[Node, Node]]:
+    """Localiza en orden de ejecución pares (call_expression, callback) cuyos
+    cuerpos son callbacks anónimos inline (no funciones nombradas propias)."""
+    found: list[tuple[Node, Node]] = []
+
+    def visit(node: Node) -> None:
+        if node_key(node) in functions or node.type in FUNCTION_VALUE_TYPES:
+            return
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None:
+                visit(callee)
+            args = node.child_by_field_name("arguments")
+            inline_cbs: list[Node] = []
+            if args is not None:
+                for arg in args.named_children:
+                    if arg.type in FUNCTION_VALUE_TYPES and node_key(arg) not in functions:
+                        inline_cbs.append(arg)
+                    else:
+                        visit(arg)
+            for cb in inline_cbs:
+                found.append((node, cb))
+            return
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return found
+
+
+def callback_call_title(call_node: Node, source: bytes) -> str:
+    callee = call_node.child_by_field_name("function")
+    if callee is None:
+        return "callback"
+    if callee.type == "member_expression":
+        obj = callee.child_by_field_name("object")
+        prop = callee.child_by_field_name("property")
+        if obj is not None and obj.type == "call_expression" and prop is not None:
+            return "." + node_text(prop, source)
+    return normalize_callee(node_text(callee, source))
+
+
+def shallow_call_role(call_node: Node, source: bytes) -> str:
+    callee = call_node.child_by_field_name("function")
+    if callee is not None and is_io_call(normalize_callee(node_text(callee, source))):
+        return ROLE_IO
+    return ROLE_TRANSFORM
+
+
+def emit_callback_steps(
+    stmt: Node,
+    callbacks: list[tuple[Node, Node]],
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None = None,
+) -> list[PendingExit]:
+    """Emite un sub-contenedor 🔁 para cada callback y coloca dentro sus pasos limpios."""
+    current = pending
+    for idx, (call_node, cb_node) in enumerate(callbacks):
+        call_title = callback_call_title(call_node, source)
+        cb_params_node = cb_node.child_by_field_name("parameters") or cb_node.child_by_field_name("parameter")
+        cb_params = parameter_names(cb_params_node, source)
+        params_label = ", ".join(cb_params) or "∅"
+
+        lead = ""
+        if idx == 0 and stmt.type in ("return_statement", "throw_statement", *FLOW_DECLARATION_TYPES):
+            raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
+            if raw_lead and len(raw_lead) <= 40:
+                lead = f"{raw_lead} "
+
+        header_label = f"🔁 {lead}{call_title}({params_label})"
+        code_node = stmt if (idx == 0 and len(callbacks) == 1) else call_node
+        cb_step, current = builder.emit_sequential(
+            current,
+            shallow_call_role(call_node, source),
+            header_label,
+            code=dedent_code(node_text(code_node, source)),
+            parent_id=parent_id,
+            is_container=True,
+            kind="loop",
+        )
+        if cb_step is None:
+            return current
+
+        cb_body = cb_node.child_by_field_name("body")
+        if cb_body is not None:
+            if cb_body.type == "statement_block":
+                inner_pending = walk_flow_block(
+                    cb_body, source, functions, builder, [], parent_id=cb_step.id
+                )
+            else:
+                inner_pending = walk_flow_expr_body(
+                    cb_body, source, functions, builder, [], parent_id=cb_step.id
+                )
+            builder.close_dangling_branches(inner_pending, parent_id=cb_step.id)
+        builder.finalize_container(cb_step)
+    return current
 
 
 def declares_only_functions(node: Node, functions: dict[NodeKey, FunctionNode]) -> bool:
@@ -543,14 +885,15 @@ def declares_only_functions(node: Node, functions: dict[NodeKey, FunctionNode]) 
 def header_text(node: Node, source: bytes) -> str:
     """Cabecera legible: 'if (x > 0)', 'for (const a of b)', 'case 1', 'catch (e)'."""
     if node.type == "switch_case":
-        return "case " + one_line(node_text(node.child_by_field_name("value"), source))
+        return "case " + flow_label(node_text(node.child_by_field_name("value"), source))
     if node.type == "switch_default":
         return "default"
     if node.type == "do_statement":
-        return "do … while " + one_line(node_text(node.child_by_field_name("condition"), source))
+        return "do … while " + flow_label(node_text(node.child_by_field_name("condition"), source))
     body = node.child_by_field_name("body") or node.child_by_field_name("consequence")
     raw = text_between(source, node, body) if body is not None else node_text(node, source)
-    return one_line(raw)
+    cleaned = flow_label(raw).rstrip("{").rstrip(":").strip()
+    return re.sub(r"\s+\)", ")", cleaned)
 
 
 def step_role(node: Node, source: bytes, functions: dict[NodeKey, FunctionNode]) -> str:

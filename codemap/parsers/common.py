@@ -9,12 +9,14 @@ Convenciones:
 from __future__ import annotations
 
 import re
+import textwrap
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from tree_sitter import Node, QueryCursor
 
 from codemap.languages import compile_query
+from codemap.models import ROLE_TRANSFORM, FlowEdge, FlowStep
 
 NodeKey = tuple[int, int]
 
@@ -52,6 +54,26 @@ def one_line(text: str, max_chars: int = LABEL_MAX_CHARS) -> str:
     if len(first) > max_chars:
         return first[: max_chars - 1] + "…"
     return first
+
+
+def flow_label(text: str) -> str:
+    """Etiqueta completa en una línea para pasos de flujo, sin truncamiento rígido."""
+    return collapse_whitespace(text)
+
+
+def dedent_code(text: str) -> str:
+    """Normaliza la indentación de un fragmento de código preservando saltos de línea."""
+    normalized = text.replace("\r\n", "\n").strip()
+    if "\n" not in normalized:
+        return normalized
+    dedented = textwrap.dedent(normalized)
+    lines = dedented.splitlines()
+    if len(lines) > 1 and not lines[0].startswith((" ", "\t")):
+        indents = [len(line) - len(line.lstrip(" ")) for line in lines[1:] if line.strip()]
+        base = min(indents) if indents else 0
+        if base > 0:
+            lines = [lines[0]] + [line[base:] if len(line) >= base else line for line in lines[1:]]
+    return "\n".join(lines)
 
 
 def text_between(source: bytes, start_node: Node, end_node: Node) -> str:
@@ -185,3 +207,123 @@ def collect_metrics(
         elif item.type in global_types:
             metrics.mutates_global = True
     return metrics
+
+
+# --------------------------------------------------------------------------
+# Constructor compartido de grafo de flujo intra-función (Nivel 3+)
+# --------------------------------------------------------------------------
+
+PendingExit = tuple[str, str, str]
+
+
+class FlowGraphBuilder:
+    """Construye pasos jerárquicos y aristas dirigidas para Nivel 3+."""
+
+    def __init__(self, max_steps: int = 40) -> None:
+        self.max_steps = max_steps
+        self.steps: list[FlowStep] = []
+        self._by_id: dict[str, FlowStep] = {}
+
+    def add_step(
+        self,
+        role: str,
+        label: str,
+        code: str = "",
+        parent_id: str | None = None,
+        is_container: bool = False,
+        kind: str = "step",
+    ) -> FlowStep | None:
+        if len(self.steps) > self.max_steps:
+            return None
+        if len(self.steps) == self.max_steps:
+            role = ROLE_TRANSFORM
+            label = "… (límite de pasos alcanzado)"
+            code = ""
+            is_container = False
+            kind = "step"
+        step = FlowStep(
+            id=f"n{len(self.steps) + 1}",
+            role=role,
+            label=label,
+            code=code or label,
+            parent_id=parent_id,
+            is_container=is_container,
+            kind=kind,
+        )
+        self.steps.append(step)
+        self._by_id[step.id] = step
+        return step
+
+    def connect(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str = "",
+        kind: str = "flow",
+    ) -> None:
+        if source_id == target_id:
+            return
+        source = self._by_id.get(source_id)
+        if source is None or target_id not in self._by_id:
+            return
+        if any(edge.target == target_id and edge.label == label for edge in source.edges):
+            return
+        source.edges.append(FlowEdge(target=target_id, label=label, kind=kind))
+
+    def connect_pending(self, pending: list[PendingExit], target_id: str) -> None:
+        for src_id, edge_label, edge_kind in pending:
+            self.connect(src_id, target_id, label=edge_label, kind=edge_kind)
+
+    def emit_sequential(
+        self,
+        pending: list[PendingExit],
+        role: str,
+        label: str,
+        code: str = "",
+        parent_id: str | None = None,
+        is_container: bool = False,
+        kind: str = "step",
+    ) -> tuple[FlowStep | None, list[PendingExit]]:
+        step = self.add_step(
+            role,
+            label,
+            code=code,
+            parent_id=parent_id,
+            is_container=is_container,
+            kind=kind,
+        )
+        if step is None:
+            return None, pending
+        self.connect_pending(pending, step.id)
+        return step, [(step.id, "", "flow")]
+
+    def close_dangling_branches(
+        self,
+        pending: list[PendingExit],
+        parent_id: str | None,
+    ) -> list[PendingExit]:
+        has_branch_or_multi = len(pending) > 1 or any(
+            lbl in ("Sí", "No") or knd in ("branch_yes", "branch_no", "exception")
+            for _, lbl, knd in pending
+        )
+        if not has_branch_or_multi:
+            return pending
+        merge_step = self.add_step(
+            ROLE_TRANSFORM,
+            "fin",
+            code="fin",
+            parent_id=parent_id,
+            is_container=False,
+            kind="merge",
+        )
+        if merge_step is None:
+            return pending
+        self.connect_pending(pending, merge_step.id)
+        return [(merge_step.id, "", "flow")]
+
+    def finalize_container(self, container_step: FlowStep | None) -> None:
+        if container_step is None:
+            return
+        has_children = any(step.parent_id == container_step.id for step in self.steps)
+        if not has_children:
+            container_step.is_container = False

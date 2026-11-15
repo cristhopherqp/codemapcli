@@ -4,6 +4,7 @@ Sirve:
   /            -> index.html y estáticos de codemap/viewer/
   /graph.json  -> grafo estructural vigente en memoria / disco
   /notes.json  -> GET carga notes.json; POST aplica cambios parciales
+  /known-apis  -> GET carga ~/.codemap/known_apis.json; POST marca/desmarca APIs
   /ws          -> WebSocket bidireccional (push de recarga en vivo + guardado)
 """
 
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
+from codemap.known_apis_storage import load_known_apis, update_known_apis
 from codemap.notes_storage import load_notes, update_notes
 from codemap.watcher import start_watcher
 
@@ -47,6 +49,8 @@ def create_app(
     app.router.add_get("/graph.json", handle_get_graph)
     app.router.add_get("/notes.json", handle_get_notes)
     app.router.add_post("/notes.json", handle_post_notes)
+    app.router.add_get("/known-apis", handle_get_known_apis)
+    app.router.add_post("/known-apis", handle_post_known_apis)
     app.router.add_get("/ws", handle_websocket)
     app.router.add_static("/", VIEWER_DIR, show_index=False)
     app.on_shutdown.append(close_websockets)
@@ -78,6 +82,23 @@ async def handle_post_notes(request: web.Request) -> web.Response:
     return web.json_response(notes, headers=NO_STORE_HEADERS)
 
 
+async def handle_get_known_apis(_request: web.Request) -> web.Response:
+    return web.json_response(load_known_apis(), headers=NO_STORE_HEADERS)
+
+
+async def handle_post_known_apis(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "JSON inválido"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Se esperaba un objeto JSON"}, status=400)
+
+    known_apis = update_known_apis(payload)
+    await _broadcast_json(request.app, {"type": "known_apis_updated", "known_apis": known_apis})
+    return web.json_response(known_apis, headers=NO_STORE_HEADERS)
+
+
 async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -85,7 +106,10 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
 
     try:
         notes = load_notes(request.app[APP_TARGET_PATH])
-        await ws.send_json({"type": "init", "graph": request.app[APP_GRAPH], "notes": notes})
+        known_apis = load_known_apis()
+        await ws.send_json(
+            {"type": "init", "graph": request.app[APP_GRAPH], "notes": notes, "known_apis": known_apis}
+        )
 
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -102,15 +126,18 @@ async def _handle_ws_message(app: web.Application, ws: web.WebSocketResponse, ra
         message = json.loads(raw_data)
     except json.JSONDecodeError:
         return
-    if message.get("type") == "save_notes" and isinstance(message.get("payload"), dict):
-        notes = update_notes(app[APP_TARGET_PATH], message["payload"], app[APP_GRAPH])
+    msg_type = message.get("type")
+    payload = message.get("payload")
+    if msg_type == "save_notes" and isinstance(payload, dict):
+        notes = update_notes(app[APP_TARGET_PATH], payload, app[APP_GRAPH])
         await ws.send_json({"type": "notes_updated", "notes": notes})
+    elif msg_type == "save_known_apis" and isinstance(payload, dict):
+        known_apis = update_known_apis(payload)
+        await _broadcast_json(app, {"type": "known_apis_updated", "known_apis": known_apis})
 
 
-async def broadcast_update(app: web.Application, graph: dict, notes: dict) -> None:
-    """Envía el nuevo grafo y las notas conciliadas a todos los visores conectados."""
+async def _broadcast_json(app: web.Application, payload: dict) -> None:
     stale: list[web.WebSocketResponse] = []
-    payload = {"type": "update", "graph": graph, "notes": notes}
     for ws in list(app[APP_WEBSOCKETS]):
         if ws.closed:
             stale.append(ws)
@@ -121,6 +148,11 @@ async def broadcast_update(app: web.Application, graph: dict, notes: dict) -> No
             stale.append(ws)
     for ws in stale:
         app[APP_WEBSOCKETS].discard(ws)
+
+
+async def broadcast_update(app: web.Application, graph: dict, notes: dict) -> None:
+    """Envía el nuevo grafo y las notas conciliadas a todos los visores conectados."""
+    await _broadcast_json(app, {"type": "update", "graph": graph, "notes": notes})
 
 
 async def rebuild_and_broadcast(app: web.Application) -> None:
