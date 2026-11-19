@@ -20,6 +20,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".jsx": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".html": "html",
+    ".htm": "html",
 }
 
 

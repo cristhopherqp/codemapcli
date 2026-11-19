@@ -9,10 +9,11 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from codemap.discovery import IGNORED_DIRS, is_ignored, is_supported_file, load_gitignore
+from codemap.discovery import IGNORED_DIRS, GitIgnoreMatcher, is_supported_file
 
 DEFAULT_DEBOUNCE_SECONDS = 1.0
 READ_ONLY_EVENTS = frozenset({"opened", "closed", "closed_no_write"})
+RELEVANT_CONFIG_NAMES = frozenset({"tsconfig.json", "jsconfig.json"})
 
 
 class DebouncedRebuildHandler(FileSystemEventHandler):
@@ -32,7 +33,7 @@ class DebouncedRebuildHandler(FileSystemEventHandler):
         self.loop = loop
         self.on_rebuild = on_rebuild
         self.debounce_seconds = debounce_seconds
-        self.gitignore_spec = None if is_single_file else load_gitignore(self.target)
+        self.gitignore = None if is_single_file else GitIgnoreMatcher(self.target)
         self._timer_handle: asyncio.TimerHandle | None = None
 
     def on_any_event(self, event: FileSystemEvent) -> None:
@@ -59,15 +60,21 @@ class DebouncedRebuildHandler(FileSystemEventHandler):
         if any(part in IGNORED_DIRS for part in rel_parts[:-1]):
             return False
 
-        if path.name == ".gitignore" and len(rel_parts) == 1:
-            self.gitignore_spec = load_gitignore(self.target)
-            return True
+        if path.name == ".gitignore" and self.gitignore is not None:
+            if len(rel_parts) == 1 or not self.gitignore.is_path_ignored(path.parent, is_dir=True):
+                self.gitignore.reload_dir(path.parent)
+                return True
+            return False
+
+        if path.name in RELEVANT_CONFIG_NAMES:
+            return self.gitignore is None or not self.gitignore.is_path_ignored(path, is_dir=False)
 
         if not is_supported_file(path):
             return False
 
-        rel_posix = "/".join(rel_parts)
-        return not is_ignored(rel_posix, self.gitignore_spec)
+        if self.gitignore is None:
+            return True
+        return not self.gitignore.is_path_ignored(path, is_dir=False)
 
     def _schedule_debounce(self) -> None:
         if self._timer_handle is not None:

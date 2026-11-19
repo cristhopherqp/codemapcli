@@ -15,6 +15,12 @@ from tree_sitter import Node
 from codemap.fingerprint import compute_fingerprint
 from codemap.languages import get_parser
 from codemap.models import (
+    EDGE_DIRECT_CALL,
+    EDGE_EVENT_LISTENER,
+    EDGE_REACTIVE_SUBSCRIBE,
+    ENTRY_KIND_EVENT,
+    ENTRY_KIND_MAIN,
+    ENTRY_KIND_ROUTE,
     ROLE_DECISION,
     ROLE_ENTRY,
     ROLE_IO,
@@ -23,10 +29,13 @@ from codemap.models import (
     FileAnalysis,
     FlowStep,
     FunctionInfo,
+    HtmlRef,
     ImportBinding,
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
+    FLOW_COMPACT_MIN_RUN,
+    FLOW_MAX_STEPS,
     FlowGraphBuilder,
     NodeKey,
     PendingExit,
@@ -34,9 +43,11 @@ from codemap.parsers.common import (
     collapse_whitespace,
     contains_type,
     dedent_code,
+    extract_html_path_from_string,
     find_enclosing_key,
     first_capture,
     flow_label,
+    format_compacted_step_label,
     iter_body_nodes,
     line_of,
     node_key,
@@ -48,7 +59,19 @@ from codemap.parsers.common import (
     text_between,
     unique_qualname,
 )
-from codemap.roles import is_io_call, looks_like_entry_name
+from codemap.roles import (
+    classify_callback_container,
+    is_boot_event_name,
+    is_event_registrar,
+    is_io_call,
+    is_non_callback_container,
+    is_reactive_registrar,
+    is_route_registrar,
+    is_server_call,
+    is_static_mount_call,
+    looks_like_event_handler_name,
+    looks_like_main_entry_name,
+)
 
 # ---------------------------------------------------------------------------
 # Consultas AST (S-expressions de tree-sitter)
@@ -187,17 +210,37 @@ FLOW_JUMP_TYPES = frozenset(
     {"return_statement", "throw_statement", "break_statement", "continue_statement"}
 )
 FLOW_DECLARATION_TYPES = frozenset({"lexical_declaration", "variable_declaration"})
-FLOW_MAX_STEPS = 40
+IGNORED_CALLBACK_REFS = frozenset(
+    {"true", "false", "null", "undefined", "this", "super", "arguments", "NaN", "Infinity"}
+)
+JSX_EVENT_PROP_PATTERN = re.compile(r"^on[A-Z]")
+JS_TRIVIAL_DOM_LOOKUP_METHODS = frozenset(
+    {
+        "getElementById",
+        "querySelector",
+        "querySelectorAll",
+        "getElementsByClassName",
+        "getElementsByTagName",
+        "createElement",
+        "createTextNode",
+        "setAttribute",
+        "removeAttribute",
+    }
+)
+JS_CLASSLIST_METHODS = frozenset({"add", "remove", "toggle", "replace"})
 
 
 @dataclass
 class FunctionNode:
     """Función candidata antes de convertirse en FunctionInfo."""
 
-    node: Node         # nodo con parámetros y cuerpo
-    name: str          # nombre propio o derivado del contexto
-    anchor: Node       # inicio de la firma
-    is_callback: bool  # callback de nivel de módulo (manejador)
+    node: Node                    # nodo con parámetros y cuerpo
+    name: str                     # nombre propio o derivado del contexto
+    anchor: Node                  # inicio de la firma
+    is_callback: bool             # callback de nivel de módulo (manejador)
+    callback_kind: str | None = None  # "main" | "route_handler" | "event_handler" | None
+    callback_event: str = ""
+    callback_via: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -217,17 +260,30 @@ def parse_js_file(path: str, source: bytes, language: str) -> FileAnalysis:
     collect_module_callbacks(root, source, language, function_nodes)
     function_nodes = dict(sorted(function_nodes.items()))
 
-    calls_by_function = collect_calls(root, source, language, function_nodes)
+    calls_by_function, module_calls = collect_calls(root, source, language, function_nodes)
 
     used_names: set[str] = set()
+    qualname_by_key: dict[NodeKey, str] = {}
     for key, candidate in function_nodes.items():
         info = build_function(candidate, source, function_nodes, calls_by_function.get(key, []))
         info.qualname = unique_qualname(info.qualname, info.line, used_names)
+        qualname_by_key[key] = info.qualname
         analysis.functions.append(info)
 
     analysis.class_names = collect_class_names(root, source, language, function_nodes)
     analysis.imports = collect_imports(root, source, language)
     analysis.default_export = default_name
+    analysis.module_calls = module_calls
+    analysis.html_refs = collect_html_refs(root, source, function_nodes, qualname_by_key)
+    analysis.serves_static_dirs = collect_static_dirs(root, source, language)
+    analysis.is_server_file = any(
+        is_server_call(c.callee) for c in module_calls if c.is_invocation
+    ) or any(
+        is_server_call(c.callee)
+        for fn in analysis.functions
+        for c in fn.calls
+        if c.is_invocation
+    )
     return analysis
 
 
@@ -249,6 +305,20 @@ def collect_function_nodes(root: Node, source: bytes, language: str) -> dict[Nod
     return functions
 
 
+def _extract_first_string_arg(call: Node, source: bytes) -> str:
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None or arguments.named_child_count == 0:
+        return ""
+    first_arg = arguments.named_children[0]
+    if first_arg.type == "string":
+        return node_text(first_arg, source).strip("'\"`")
+    if first_arg.type == "template_string" and not any(
+        c.type == "template_substitution" for c in first_arg.named_children
+    ):
+        return node_text(first_arg, source).strip("`")
+    return ""
+
+
 def collect_module_callbacks(
     root: Node, source: bytes, language: str, functions: dict[NodeKey, FunctionNode]
 ) -> None:
@@ -266,16 +336,34 @@ def collect_module_callbacks(
             continue
         if node_key(callback) in functions or find_enclosing_key(callback, functions) is not None:
             continue
+        outer_callee = normalize_callee(node_text(callee, source))
+        first_str = _extract_first_string_arg(call, source)
+        cb_kind: str | None = None
+        cb_event = first_str
+        if is_boot_event_name(first_str):
+            cb_kind = ENTRY_KIND_MAIN
+        elif is_route_registrar(outer_callee, first_str):
+            cb_kind = ENTRY_KIND_ROUTE
+            if not cb_event and outer_callee.rsplit(".", 1)[-1] == "createServer":
+                cb_event = "http:request"
+        elif is_event_registrar(outer_callee, first_str):
+            cb_kind = ENTRY_KIND_EVENT
         name = callback_name(call, callee, callback, source)
-        functions[node_key(callback)] = FunctionNode(callback, name, callback, is_callback=True)
+        functions[node_key(callback)] = FunctionNode(
+            callback,
+            name,
+            callback,
+            is_callback=True,
+            callback_kind=cb_kind,
+            callback_event=cb_event,
+            callback_via=outer_callee,
+        )
 
 
 def callback_name(call: Node, callee: Node, callback: Node, source: bytes) -> str:
     context = normalize_callee(node_text(callee, source))
-    arguments = call.child_by_field_name("arguments")
-    first_arg = arguments.named_children[0] if arguments and arguments.named_child_count else None
-    if first_arg is not None and first_arg.type == "string":
-        route = node_text(first_arg, source).strip("'\"`")
+    route = _extract_first_string_arg(call, source)
+    if route:
         context += f"[{route}]"
     return f"{context}@L{line_of(callback)}"
 
@@ -361,8 +449,21 @@ def build_function(
     has_io = (
         metrics.has_await
         or mutates_global(body, source, functions)
-        or any(is_io_call(call.callee) for call in calls)
+        or any(is_io_call(call.callee) for call in calls if call.is_invocation)
     )
+
+    if candidate.callback_kind is not None:
+        entry_kind_hint = candidate.callback_kind
+        is_entry_hint = candidate.callback_kind == ENTRY_KIND_MAIN
+    elif looks_like_main_entry_name(candidate.name) and class_name is None and container is None:
+        entry_kind_hint = ENTRY_KIND_MAIN
+        is_entry_hint = True
+    elif looks_like_event_handler_name(candidate.name):
+        entry_kind_hint = ENTRY_KIND_EVENT
+        is_entry_hint = False
+    else:
+        entry_kind_hint = None
+        is_entry_hint = False
 
     return FunctionInfo(
         qualname=".".join(scope_names + [candidate.name]),
@@ -378,9 +479,15 @@ def build_function(
         branch_count=metrics.branch_count,
         return_count=metrics.return_count,
         has_io=has_io,
-        is_entry_hint=candidate.is_callback or looks_like_entry_name(candidate.name),
+        is_entry_hint=is_entry_hint,
+        entry_kind_hint=entry_kind_hint,
+        event_trigger=candidate.callback_event,
+        callback_via=candidate.callback_via,
         fingerprint=compute_fingerprint(
-            len(params), metrics.node_types, [c.callee for c in calls], candidate.name
+            len(params),
+            metrics.node_types,
+            [c.callee for c in calls if c.is_invocation],
+            candidate.name,
         ),
     )
 
@@ -416,10 +523,150 @@ def extract_jsdoc(anchor: Node, source: bytes) -> str:
 # Llamadas e imports
 # ---------------------------------------------------------------------------
 
+def _extract_callback_target(arg: Node, source: bytes) -> tuple[Node, str] | None:
+    """Extrae el nodo y callee normalizado si `arg` referencia una función/método
+    (identificador, acceso a miembro o `fn.bind(...)`)."""
+    target: Node | None = None
+    if arg.type in ("identifier", "member_expression"):
+        target = arg
+    elif arg.type == "call_expression":
+        fn_node = arg.child_by_field_name("function")
+        if fn_node is not None and fn_node.type == "member_expression":
+            prop = fn_node.child_by_field_name("property")
+            obj = fn_node.child_by_field_name("object")
+            if (
+                prop is not None
+                and node_text(prop, source) == "bind"
+                and obj is not None
+                and obj.type in ("identifier", "member_expression")
+            ):
+                target = obj
+    if target is None:
+        return None
+    ref = normalize_callee(node_text(target, source))
+    if not ref or ref in IGNORED_CALLEES or ref in IGNORED_CALLBACK_REFS:
+        return None
+    return target, ref
+
+
+def _has_callback_argument(call_node: Node) -> bool:
+    arguments = call_node.child_by_field_name("arguments")
+    if arguments is None:
+        return False
+    for arg in arguments.named_children:
+        if arg.type in FUNCTION_VALUE_TYPES or arg.type in ("identifier", "member_expression"):
+            return True
+        if arg.type == "call_expression":
+            fn_node = arg.child_by_field_name("function")
+            if fn_node is not None and fn_node.type == "member_expression":
+                return True
+    return False
+
+
+def _is_top_level_statement_call(call_node: Node) -> bool:
+    """True si la llamada top-level se ejecuta como sentencia de arranque (no inicializador const/let)."""
+    parent = call_node.parent
+    while parent is not None:
+        if parent.type in (
+            "variable_declarator",
+            "assignment_expression",
+            "pair",
+            "array",
+            "object",
+            "return_statement",
+        ):
+            return False
+        if parent.type == "program":
+            return True
+        parent = parent.parent
+    return False
+
+
+def _enclosing_inline_callback_context(
+    call_node: Node,
+    owner_key: NodeKey,
+    functions: dict[NodeKey, FunctionNode],
+    source: bytes,
+) -> tuple[str, str, str] | None:
+    """Detecta si `call_node` vive dentro de un callback anónimo inline pasado a
+    un registrador de eventos, suscripción reactiva o prop JSX `onX={...}`."""
+    parent = call_node.parent
+    while parent is not None and node_key(parent) != owner_key:
+        if parent.type in FUNCTION_VALUE_TYPES and node_key(parent) not in functions:
+            cb_parent = parent.parent
+            if cb_parent is not None and cb_parent.type == "arguments":
+                outer_call = cb_parent.parent
+                if outer_call is not None and outer_call.type == "call_expression":
+                    outer_callee_node = outer_call.child_by_field_name("function")
+                    if outer_callee_node is not None:
+                        outer_callee = normalize_callee(node_text(outer_callee_node, source))
+                        first_str = _extract_first_string_arg(outer_call, source)
+                        cb_kind, event_label = classify_callback_container(outer_callee, first_str)
+                        if cb_kind in (EDGE_EVENT_LISTENER, EDGE_REACTIVE_SUBSCRIBE):
+                            return cb_kind, outer_callee, event_label
+            elif cb_parent is not None and cb_parent.type == "jsx_expression":
+                attr_node = cb_parent.parent
+                if attr_node is not None and attr_node.type == "jsx_attribute":
+                    prop = attr_node.named_children[0] if attr_node.named_child_count else None
+                    prop_name = node_text(prop, source) if prop is not None else ""
+                    if JSX_EVENT_PROP_PATTERN.match(prop_name):
+                        return EDGE_EVENT_LISTENER, f"jsx.{prop_name}", prop_name[2:].lower()
+        parent = parent.parent
+    return None
+
+
+def _collect_jsx_event_refs(
+    root: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    params_by_function: dict[NodeKey, set[str]],
+    calls: dict[NodeKey, list[CallSite]],
+    module_calls: list[CallSite],
+) -> None:
+    """Extrae handlers pasados por referencia en props JSX (`onClick={handleClick}`)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "jsx_attribute" and node.named_child_count >= 2:
+            prop_node = node.named_children[0]
+            val_node = node.named_children[1]
+            prop_name = node_text(prop_node, source)
+            if JSX_EVENT_PROP_PATTERN.match(prop_name) and val_node.type == "jsx_expression":
+                expr = val_node.named_children[0] if val_node.named_child_count else None
+                if expr is not None:
+                    extracted = _extract_callback_target(expr, source)
+                    if extracted is not None:
+                        target_node, ref = extracted
+                        owner = find_enclosing_key(node, functions)
+                        owner_params = params_by_function.get(owner, set()) if owner is not None else set()
+                        if "." in ref or ref not in owner_params:
+                            site = CallSite(
+                                callee=ref,
+                                line=line_of(target_node),
+                                kind=EDGE_EVENT_LISTENER,
+                                is_invocation=False,
+                                via=f"jsx.{prop_name}",
+                                event=prop_name[2:].lower(),
+                            )
+                            if owner is None:
+                                module_calls.append(site)
+                            else:
+                                calls.setdefault(owner, []).append(site)
+        stack.extend(reversed(node.named_children))
+
+
 def collect_calls(
     root: Node, source: bytes, language: str, functions: dict[NodeKey, FunctionNode]
-) -> dict[NodeKey, list[CallSite]]:
+) -> tuple[dict[NodeKey, list[CallSite]], list[CallSite]]:
+    """Recopila invocaciones directas, callbacks pasados por referencia y llamadas top-level."""
     calls: dict[NodeKey, list[CallSite]] = {}
+    module_calls: list[CallSite] = []
+
+    params_by_function: dict[NodeKey, set[str]] = {}
+    for key, candidate in functions.items():
+        p_node = candidate.node.child_by_field_name("parameters") or candidate.node.child_by_field_name("parameter")
+        params_by_function[key] = set(parameter_names(p_node, source))
+
     for captures in run_matches(language, CALL_QUERY, root):
         call_node = first_capture(captures, "call")
         callee_node = first_capture(captures, "callee")
@@ -429,10 +676,129 @@ def collect_calls(
         if callee in IGNORED_CALLEES:
             continue
         owner = find_enclosing_key(call_node, functions)
+        is_top_stmt = owner is None and _is_top_level_statement_call(call_node)
+        first_str = _extract_first_string_arg(call_node, source)
+
+        inline_ctx = (
+            _enclosing_inline_callback_context(call_node, owner, functions, source)
+            if owner is not None
+            else None
+        )
+        if inline_ctx is not None:
+            call_kind, call_via, call_event = inline_ctx
+        elif is_reactive_registrar(callee) and _has_callback_argument(call_node):
+            call_kind, call_via, call_event = EDGE_REACTIVE_SUBSCRIBE, "", first_str
+        else:
+            call_kind, call_via, call_event = EDGE_DIRECT_CALL, "", ""
+
+        direct_site = CallSite(
+            callee=callee,
+            line=line_of(call_node),
+            kind=call_kind,
+            is_invocation=True,
+            via=call_via,
+            event=call_event,
+            is_top_level_stmt=is_top_stmt,
+        )
         if owner is None:
+            module_calls.append(direct_site)
+        else:
+            calls.setdefault(owner, []).append(direct_site)
+
+        # Inspeccionar argumentos en busca de funciones pasadas por referencia (sin paréntesis).
+        if is_non_callback_container(callee) or callee.endswith(".bind"):
             continue
-        calls.setdefault(owner, []).append(CallSite(callee=callee, line=line_of(call_node)))
-    return calls
+        arguments = call_node.child_by_field_name("arguments")
+        if arguments is None:
+            continue
+        ref_kind, ref_event = classify_callback_container(callee, first_str)
+        owner_params = params_by_function.get(owner, set()) if owner is not None else set()
+
+        for arg in arguments.named_children:
+            extracted = _extract_callback_target(arg, source)
+            if extracted is None:
+                continue
+            target_node, ref = extracted
+            if "." not in ref and ref in owner_params:
+                continue
+            ref_site = CallSite(
+                callee=ref,
+                line=line_of(target_node),
+                kind=ref_kind,
+                is_invocation=False,
+                via=callee,
+                event=ref_event,
+                is_top_level_stmt=is_top_stmt,
+            )
+            if owner is None:
+                module_calls.append(ref_site)
+            else:
+                calls.setdefault(owner, []).append(ref_site)
+
+    if language in ("javascript", "tsx"):
+        _collect_jsx_event_refs(root, source, functions, params_by_function, calls, module_calls)
+
+    return calls, module_calls
+
+
+def collect_html_refs(
+    root: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    qualname_by_key: dict[NodeKey, str],
+) -> list[HtmlRef]:
+    """Detecta referencias literales a archivos `.html`/`.htm` (p. ej. `sendFile('index.html')`)."""
+    refs: list[HtmlRef] = []
+    seen: set[tuple[str | None, str]] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in ("string", "template_string"):
+            if node.type == "template_string" and any(
+                c.type == "template_substitution" for c in node.named_children
+            ):
+                continue
+            html_path = extract_html_path_from_string(node_text(node, source))
+            if html_path is not None:
+                owner = find_enclosing_key(node, functions)
+                owner_qn = qualname_by_key.get(owner) if owner is not None else None
+                key = (owner_qn, html_path)
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(HtmlRef(target=html_path, line=line_of(node), owner_qualname=owner_qn))
+            continue
+        stack.extend(reversed(node.named_children))
+    return refs
+
+
+def collect_static_dirs(root: Node, source: bytes, language: str) -> list[str]:
+    """Extrae directorios estáticos montados por servidores (`express.static('public')`)."""
+    dirs: list[str] = []
+    for captures in run_matches(language, CALL_QUERY, root):
+        call_node = first_capture(captures, "call")
+        callee_node = first_capture(captures, "callee")
+        if call_node is None or callee_node is None:
+            continue
+        callee = normalize_callee(node_text(callee_node, source))
+        if not is_static_mount_call(callee):
+            continue
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            continue
+        found_str = False
+        stack = list(reversed(args.named_children))
+        while stack:
+            item = stack.pop()
+            if item.type == "string":
+                val = node_text(item, source).strip("'\"`").strip()
+                if val and val not in dirs:
+                    dirs.append(val)
+                    found_str = True
+            else:
+                stack.extend(reversed(item.named_children))
+        if not found_str and "." not in dirs:
+            dirs.append(".")
+    return dirs
 
 
 def collect_imports(root: Node, source: bytes, language: str) -> list[ImportBinding]:
@@ -508,6 +874,128 @@ def walk_flow_expr_body(
     return next_pending
 
 
+def _is_trivial_dom_call(call_node: Node, source: bytes) -> bool:
+    """True si la llamada es una consulta/operación DOM simple (sin lógica interna)."""
+    callee_node = call_node.child_by_field_name("function") or call_node.child_by_field_name("constructor")
+    if callee_node is None:
+        return False
+    callee = normalize_callee(node_text(callee_node, source))
+    if "." not in callee:
+        return False
+    obj, _, member = callee.rpartition(".")
+    if member in JS_TRIVIAL_DOM_LOOKUP_METHODS:
+        return True
+    if (obj == "classList" or obj.endswith(".classList")) and member in JS_CLASSLIST_METHODS:
+        return True
+    return False
+
+
+def _extract_js_stmt_target_name(stmt: Node, source: bytes) -> str:
+    if stmt.type in FLOW_DECLARATION_TYPES:
+        for child in stmt.named_children:
+            if child.type == "variable_declarator":
+                name_node = child.child_by_field_name("name")
+                if name_node is not None:
+                    return collapse_whitespace(node_text(name_node, source))
+    if stmt.type == "expression_statement" and stmt.named_child_count > 0:
+        expr = stmt.named_children[0]
+        if expr.type in ("assignment_expression", "augmented_assignment_expression"):
+            left = expr.child_by_field_name("left")
+            if left is not None:
+                return collapse_whitespace(node_text(left, source))
+        if expr.type == "update_expression":
+            arg = expr.child_by_field_name("argument")
+            if arg is not None:
+                return collapse_whitespace(node_text(arg, source))
+        if expr.type == "call_expression":
+            fn = expr.child_by_field_name("function")
+            if fn is not None and fn.type == "member_expression":
+                obj = fn.child_by_field_name("object")
+                if obj is not None:
+                    return collapse_whitespace(node_text(obj, source)).split(".")[0]
+    return ""
+
+
+def _classify_compactable_js_stmt(
+    stmt: Node,
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+) -> tuple[str, str] | None:
+    """Si `stmt` es una declaración/asignación simple sin ramas ni llamadas internas,
+    devuelve `(categoría, nombre_objetivo)`; en caso contrario `None`."""
+    if node_key(stmt) in functions or stmt.type in ("comment", "empty_statement", "statement_block"):
+        return None
+    if stmt.type in FLOW_LOOP_TYPES or stmt.type in FLOW_DECISION_TYPES or stmt.type in FLOW_JUMP_TYPES:
+        return None
+    if stmt.type == "try_statement":
+        return None
+    if stmt.type in FLOW_DECLARATION_TYPES and declares_only_functions(stmt, functions):
+        return None
+    if collect_inline_callbacks(stmt, functions):
+        return None
+    if step_role(stmt, source, functions) == ROLE_IO:
+        return None
+
+    is_decl = stmt.type in FLOW_DECLARATION_TYPES
+    is_expr_stmt = stmt.type == "expression_statement"
+    if not is_decl and not is_expr_stmt:
+        return None
+
+    call_nodes = [item for item in iter_body_nodes(stmt, functions) if item.type in CALL_TYPES]
+    if not call_nodes:
+        if is_decl:
+            return ("declaraciones", _extract_js_stmt_target_name(stmt, source))
+        if contains_type(stmt, FLOW_ASSIGNMENT_TYPES, functions):
+            return ("asignaciones", _extract_js_stmt_target_name(stmt, source))
+        return None
+
+    if all(_is_trivial_dom_call(call_node, source) for call_node in call_nodes):
+        cat = "declaraciones DOM" if is_decl else "operaciones DOM"
+        return (cat, _extract_js_stmt_target_name(stmt, source))
+    return None
+
+
+def _flush_js_compact_buffer(
+    buffer: list[tuple[Node, str, str]],
+    source: bytes,
+    functions: dict[NodeKey, FunctionNode],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    if not buffer:
+        return pending
+    if len(buffer) < FLOW_COMPACT_MIN_RUN:
+        current = pending
+        for stmt, _, _ in buffer:
+            current = walk_flow_statement(stmt, source, functions, builder, current, parent_id)
+        buffer.clear()
+        return current
+
+    categories = [cat for _, cat, _ in buffer]
+    names = [name for _, _, name in buffer]
+    dom_decl_count = sum(1 for c in categories if c == "declaraciones DOM")
+    dom_op_count = sum(1 for c in categories if c == "operaciones DOM")
+    if dom_decl_count + dom_op_count > 0:
+        category = "declaraciones DOM" if dom_decl_count >= dom_op_count else "operaciones DOM"
+    elif all(c == "declaraciones" for c in categories):
+        category = "declaraciones"
+    else:
+        category = "asignaciones"
+
+    label = format_compacted_step_label(category, names, len(buffer))
+    code = "\n".join(dedent_code(node_text(stmt, source)) for stmt, _, _ in buffer)
+    _, next_pending = builder.emit_sequential(
+        pending,
+        ROLE_TRANSFORM,
+        label,
+        code=code,
+        parent_id=parent_id,
+    )
+    buffer.clear()
+    return next_pending
+
+
 def walk_flow_block(
     block: Node,
     source: bytes,
@@ -517,8 +1005,30 @@ def walk_flow_block(
     parent_id: str | None = None,
 ) -> list[PendingExit]:
     current = pending
+    compact_buffer: list[tuple[Node, str, str]] = []
+
     for statement in block.named_children:
+        if statement.type in ("comment", "empty_statement"):
+            continue
+        compactable = _classify_compactable_js_stmt(statement, source, functions)
+        if compactable is not None:
+            if compact_buffer:
+                prev_is_dom = "DOM" in compact_buffer[-1][1]
+                cur_is_dom = "DOM" in compactable[0]
+                if prev_is_dom != cur_is_dom:
+                    current = _flush_js_compact_buffer(
+                        compact_buffer, source, functions, builder, current, parent_id
+                    )
+            compact_buffer.append((statement, compactable[0], compactable[1]))
+            continue
+        current = _flush_js_compact_buffer(
+            compact_buffer, source, functions, builder, current, parent_id
+        )
         current = walk_flow_statement(statement, source, functions, builder, current, parent_id)
+
+    current = _flush_js_compact_buffer(
+        compact_buffer, source, functions, builder, current, parent_id
+    )
     return current
 
 

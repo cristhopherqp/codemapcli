@@ -23,6 +23,39 @@ NodeKey = tuple[int, int]
 LABEL_MAX_CHARS = 48
 DOCSTRING_MAX_CHARS = 400
 CALLEE_MAX_CHARS = 80
+FLOW_MAX_STEPS = 96
+FLOW_COMPACT_MIN_RUN = 3
+
+_HTML_FILE_PATTERN = re.compile(r"^[./\\\w\-@]+\.(?:html?|HTM|HTML)$")
+
+
+def extract_html_path_from_string(raw: str) -> str | None:
+    """Devuelve una ruta relativa limpia a un archivo .html/.htm si el literal la representa."""
+    cleaned = raw.strip().strip("'\"`").strip()
+    if not cleaned or "<" in cleaned or ">" in cleaned or " " in cleaned:
+        return None
+    lower = cleaned.lower()
+    if lower.startswith(("http://", "https://", "//", "data:")):
+        return None
+    cleaned = cleaned.split("?", 1)[0].split("#", 1)[0]
+    if not _HTML_FILE_PATTERN.match(cleaned):
+        return None
+    return cleaned.replace("\\", "/")
+
+
+def format_compacted_step_label(category: str, names: list[str], count: int) -> str:
+    """Etiqueta resumida para un grupo de sentencias simples contiguas (Nivel 3+)."""
+    unique_names: list[str] = []
+    for name in names:
+        clean = name.strip()
+        if clean and clean not in unique_names:
+            unique_names.append(clean)
+    if not unique_names:
+        return f"{count} {category}"
+    preview = ", ".join(unique_names[:3])
+    if len(unique_names) > 3:
+        preview += ", …"
+    return f"{count} {category} ({preview})"
 
 
 # --------------------------------------------------------------------------
@@ -219,7 +252,7 @@ PendingExit = tuple[str, str, str]
 class FlowGraphBuilder:
     """Construye pasos jerárquicos y aristas dirigidas para Nivel 3+."""
 
-    def __init__(self, max_steps: int = 40) -> None:
+    def __init__(self, max_steps: int = FLOW_MAX_STEPS) -> None:
         self.max_steps = max_steps
         self.steps: list[FlowStep] = []
         self._by_id: dict[str, FlowStep] = {}

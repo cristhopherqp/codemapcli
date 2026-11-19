@@ -6,6 +6,7 @@ from pathlib import Path
 
 from codemap.languages import language_for_path
 from codemap.models import FileAnalysis
+from codemap.parsers.html_parser import parse_html_file
 from codemap.parsers.js_parser import parse_js_file
 from codemap.parsers.python_parser import parse_python_file
 from codemap.paths import normalize_path
@@ -20,4 +21,6 @@ def parse_file(path: Path) -> FileAnalysis | None:
     posix_path = normalize_path(path)
     if language == "python":
         return parse_python_file(posix_path, source)
+    if language == "html":
+        return parse_html_file(posix_path, source)
     return parse_js_file(posix_path, source, language)

@@ -13,6 +13,13 @@ from tree_sitter import Node
 from codemap.fingerprint import compute_fingerprint
 from codemap.languages import get_parser
 from codemap.models import (
+    EDGE_CALLBACK_REF,
+    EDGE_DIRECT_CALL,
+    EDGE_EVENT_LISTENER,
+    EDGE_REACTIVE_SUBSCRIBE,
+    ENTRY_KIND_EVENT,
+    ENTRY_KIND_MAIN,
+    ENTRY_KIND_ROUTE,
     ROLE_DECISION,
     ROLE_ENTRY,
     ROLE_IO,
@@ -21,10 +28,13 @@ from codemap.models import (
     FileAnalysis,
     FlowStep,
     FunctionInfo,
+    HtmlRef,
     ImportBinding,
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
+    FLOW_COMPACT_MIN_RUN,
+    FLOW_MAX_STEPS,
     FlowGraphBuilder,
     NodeKey,
     PendingExit,
@@ -32,9 +42,11 @@ from codemap.parsers.common import (
     collapse_whitespace,
     contains_type,
     dedent_code,
+    extract_html_path_from_string,
     find_enclosing_key,
     first_capture,
     flow_label,
+    format_compacted_step_label,
     iter_body_nodes,
     line_of,
     node_key,
@@ -46,7 +58,16 @@ from codemap.parsers.common import (
     text_between,
     unique_qualname,
 )
-from codemap.roles import is_io_call, looks_like_entry_name
+from codemap.roles import (
+    classify_callback_container,
+    is_io_call,
+    is_non_callback_container,
+    is_reactive_registrar,
+    is_server_call,
+    is_static_mount_call,
+    looks_like_event_handler_name,
+    looks_like_main_entry_name,
+)
 
 LANGUAGE = "python"
 
@@ -120,12 +141,14 @@ FLOW_JUMP_TYPES = frozenset(
     {"return_statement", "raise_statement", "break_statement", "continue_statement", "pass_statement"}
 )
 FLOW_SKIP_TYPES = frozenset({"class_definition", "decorated_definition", "comment"})
-FLOW_MAX_STEPS = 40
+IGNORED_CALLBACK_REFS = frozenset({"True", "False", "None", "self", "cls", "super"})
+EVENT_KEYWORD_ARGS = frozenset({"command", "view_func", "handler", "on_click", "on_change", "on_event"})
 
-# Decoradores que marcan puntos de entrada (Flask/FastAPI/Click/eventos...).
-ENTRY_DECORATOR_PATTERN = re.compile(
-    r"\.(route|get|post|put|delete|patch|websocket|command|on_event|event|"
-    r"callback|listener|handler|task)\b"
+# Decoradores clasificados por semántica de entrada.
+CLI_DECORATOR_PATTERN = re.compile(r"\.(command)\b")
+ROUTE_DECORATOR_PATTERN = re.compile(r"\.(route|get|post|put|delete|patch|websocket)\b")
+EVENT_DECORATOR_PATTERN = re.compile(
+    r"\.(on_event|event|on|callback|listener|handler|task|receiver|subscribe)\b"
 )
 
 
@@ -138,16 +161,29 @@ def parse_python_file(path: str, source: bytes) -> FileAnalysis:
     analysis = FileAnalysis(path=path, language=LANGUAGE)
 
     function_nodes = collect_function_nodes(root)
-    calls_by_function = collect_calls(root, source, function_nodes)
+    calls_by_function, module_calls = collect_calls(root, source, function_nodes)
 
     used_names: set[str] = set()
+    qualname_by_key: dict[NodeKey, str] = {}
     for key, node in function_nodes.items():
         info = build_function(node, source, function_nodes, calls_by_function.get(key, []))
         info.qualname = unique_qualname(info.qualname, info.line, used_names)
+        qualname_by_key[key] = info.qualname
         analysis.functions.append(info)
 
     analysis.class_names = collect_class_names(root, source)
     analysis.imports = collect_imports(root, source)
+    analysis.module_calls = module_calls
+    analysis.html_refs = collect_html_refs(root, source, function_nodes, qualname_by_key)
+    analysis.serves_static_dirs = collect_static_dirs(root, source)
+    analysis.is_server_file = any(
+        is_server_call(c.callee) for c in module_calls if c.is_invocation
+    ) or any(
+        is_server_call(c.callee)
+        for fn in analysis.functions
+        for c in fn.calls
+        if c.is_invocation
+    )
     return analysis
 
 
@@ -223,8 +259,22 @@ def build_function(
     has_io = (
         metrics.has_await
         or metrics.mutates_global
-        or any(is_io_call(call.callee) for call in calls)
+        or any(is_io_call(call.callee) for call in calls if call.is_invocation)
     )
+
+    dec_kind, dec_trigger = inspect_entry_decorator(node, source)
+    if dec_kind is not None:
+        entry_kind_hint = dec_kind
+        is_entry_hint = dec_kind == ENTRY_KIND_MAIN
+    elif looks_like_main_entry_name(short_name) and class_name is None and container is None:
+        entry_kind_hint = ENTRY_KIND_MAIN
+        is_entry_hint = True
+    elif looks_like_event_handler_name(short_name):
+        entry_kind_hint = ENTRY_KIND_EVENT
+        is_entry_hint = False
+    else:
+        entry_kind_hint = None
+        is_entry_hint = False
 
     return FunctionInfo(
         qualname=qualname,
@@ -240,22 +290,51 @@ def build_function(
         branch_count=metrics.branch_count,
         return_count=metrics.return_count,
         has_io=has_io,
-        is_entry_hint=looks_like_entry_name(short_name) or has_entry_decorator(node, source),
+        is_entry_hint=is_entry_hint,
+        entry_kind_hint=entry_kind_hint,
+        event_trigger=dec_trigger,
         fingerprint=compute_fingerprint(
-            len(params), metrics.node_types, [c.callee for c in calls], short_name
+            len(params),
+            metrics.node_types,
+            [c.callee for c in calls if c.is_invocation],
+            short_name,
         ),
     )
 
 
-def has_entry_decorator(node: Node, source: bytes) -> bool:
-    """@app.route(...), @router.get(...), @click.command() ..."""
+def _first_string_literal_in_node(node: Node, source: bytes) -> str:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == "string":
+            parts = [node_text(c, source) for c in current.named_children if c.type == "string_content"]
+            return "".join(parts) if parts else node_text(current, source).strip("\"'")
+        stack.extend(reversed(current.named_children))
+    return ""
+
+
+def inspect_entry_decorator(node: Node, source: bytes) -> tuple[str | None, str]:
+    """Clasifica decoradores de entrada: CLI (`main`), ruta (`route_handler`) o evento (`event_handler`)."""
     parent = node.parent
     if parent is None or parent.type != "decorated_definition":
-        return False
+        return None, ""
     for child in parent.named_children:
-        if child.type == "decorator" and ENTRY_DECORATOR_PATTERN.search(node_text(child, source)):
-            return True
-    return False
+        if child.type != "decorator":
+            continue
+        text = node_text(child, source)
+        trigger = _first_string_literal_in_node(child, source)
+        if CLI_DECORATOR_PATTERN.search(text):
+            return ENTRY_KIND_MAIN, trigger
+        if ROUTE_DECORATOR_PATTERN.search(text):
+            return ENTRY_KIND_ROUTE, trigger
+        if EVENT_DECORATOR_PATTERN.search(text):
+            return ENTRY_KIND_EVENT, trigger
+    return None, ""
+
+
+def has_entry_decorator(node: Node, source: bytes) -> bool:
+    """Compatibilidad: True si la función posee un decorador de entrada/ruta/evento."""
+    return inspect_entry_decorator(node, source)[0] is not None
 
 
 def extract_docstring(body: Node | None, source: bytes) -> str:
@@ -276,25 +355,250 @@ def extract_docstring(body: Node | None, source: bytes) -> str:
 # Llamadas
 # ---------------------------------------------------------------------------
 
+def _extract_py_string(node: Node, source: bytes) -> str:
+    parts = [node_text(c, source) for c in node.named_children if c.type == "string_content"]
+    return "".join(parts) if parts else node_text(node, source).strip("\"'")
+
+
+def _extract_first_string_arg(call_node: Node, source: bytes) -> str:
+    args = call_node.child_by_field_name("arguments")
+    if args is None or args.named_child_count == 0:
+        return ""
+    first_arg = args.named_children[0]
+    if first_arg.type == "string":
+        return _extract_py_string(first_arg, source)
+    return ""
+
+
+def _is_main_guard_if(node: Node, source: bytes) -> bool:
+    if node.type != "if_statement":
+        return False
+    cond = node.child_by_field_name("condition")
+    if cond is None or cond.type != "comparison_operator":
+        return False
+    text = collapse_whitespace(node_text(cond, source))
+    return "__name__" in text and "==" in text and ("'__main__'" in text or '"__main__"' in text)
+
+
+def _top_level_call_flags(call_node: Node, source: bytes) -> tuple[bool, bool]:
+    """Devuelve `(is_top_level_stmt, is_main_guard)` para llamadas sin función contenedora."""
+    in_main_guard = False
+    is_stmt = True
+    parent = call_node.parent
+    while parent is not None:
+        if _is_main_guard_if(parent, source):
+            in_main_guard = True
+        if parent.type in (
+            "decorator",
+            "class_definition",
+            "default_parameter",
+            "typed_default_parameter",
+            "assignment",
+            "augmented_assignment",
+            "pair",
+            "list",
+            "tuple",
+            "dictionary",
+            "set",
+            "return_statement",
+        ):
+            is_stmt = False
+        if parent.type == "module":
+            break
+        parent = parent.parent
+    return (is_stmt or in_main_guard), in_main_guard
+
+
+def _has_callback_argument(call_node: Node) -> bool:
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return False
+    for arg in args.named_children:
+        val = arg.child_by_field_name("value") if arg.type == "keyword_argument" else arg
+        if val is not None and val.type in ("lambda", "identifier", "attribute"):
+            return True
+    return False
+
+
+def _enclosing_inline_lambda_context(
+    call_node: Node,
+    owner_key: NodeKey,
+    source: bytes,
+) -> tuple[str, str, str] | None:
+    """Detecta si `call_node` vive dentro de un `lambda` pasado a un registrador de eventos/reactivo."""
+    parent = call_node.parent
+    while parent is not None and node_key(parent) != owner_key:
+        if parent.type == "lambda":
+            lam_parent = parent.parent
+            if lam_parent is not None and lam_parent.type == "keyword_argument":
+                lam_parent = lam_parent.parent
+            if lam_parent is not None and lam_parent.type == "argument_list":
+                outer_call = lam_parent.parent
+                if outer_call is not None and outer_call.type == "call":
+                    outer_callee_node = outer_call.child_by_field_name("function")
+                    if outer_callee_node is not None:
+                        outer_callee = normalize_callee(node_text(outer_callee_node, source))
+                        first_str = _extract_first_string_arg(outer_call, source)
+                        cb_kind, event_label = classify_callback_container(outer_callee, first_str)
+                        if cb_kind in (EDGE_EVENT_LISTENER, EDGE_REACTIVE_SUBSCRIBE):
+                            return cb_kind, outer_callee, event_label
+        parent = parent.parent
+    return None
+
+
 def collect_calls(
     root: Node,
     source: bytes,
     function_nodes: dict[NodeKey, Node],
-) -> dict[NodeKey, list[CallSite]]:
-    """Asigna cada llamada a la función que la contiene más de cerca.
-    Las llamadas a nivel de módulo (sin función contenedora) se descartan."""
+) -> tuple[dict[NodeKey, list[CallSite]], list[CallSite]]:
+    """Asigna llamadas directas y callbacks por referencia a su función o al nivel de módulo."""
     calls: dict[NodeKey, list[CallSite]] = {}
+    module_calls: list[CallSite] = []
+
+    params_by_function: dict[NodeKey, set[str]] = {
+        key: set(parameter_names(node.child_by_field_name("parameters"), source))
+        for key, node in function_nodes.items()
+    }
+
     for captures in run_matches(LANGUAGE, CALL_QUERY, root):
         call_node = first_capture(captures, "call")
         callee_node = first_capture(captures, "callee")
         if call_node is None or callee_node is None:
             continue
         owner = find_enclosing_key(call_node, function_nodes)
+        callee = normalize_callee(node_text(callee_node, source))
+        first_str = _extract_first_string_arg(call_node, source)
+
+        is_top_stmt = False
+        is_main_guard = False
         if owner is None:
+            is_top_stmt, is_main_guard = _top_level_call_flags(call_node, source)
+
+        inline_ctx = (
+            _enclosing_inline_lambda_context(call_node, owner, source)
+            if owner is not None
+            else None
+        )
+        if inline_ctx is not None:
+            call_kind, call_via, call_event = inline_ctx
+        elif is_reactive_registrar(callee) and _has_callback_argument(call_node):
+            call_kind, call_via, call_event = EDGE_REACTIVE_SUBSCRIBE, "", first_str
+        else:
+            call_kind, call_via, call_event = EDGE_DIRECT_CALL, "", ""
+
+        direct_site = CallSite(
+            callee=callee,
+            line=line_of(call_node),
+            kind=call_kind,
+            is_invocation=True,
+            via=call_via,
+            event=call_event,
+            is_top_level_stmt=is_top_stmt,
+            is_main_guard=is_main_guard,
+        )
+        if owner is None:
+            module_calls.append(direct_site)
+        else:
+            calls.setdefault(owner, []).append(direct_site)
+
+        # Inspeccionar argumentos posicionales y nombrados en busca de callbacks por referencia.
+        if is_non_callback_container(callee):
+            continue
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            continue
+        base_ref_kind, ref_event = classify_callback_container(callee, first_str)
+        owner_params = params_by_function.get(owner, set()) if owner is not None else set()
+
+        for arg in args.named_children:
+            kw_name = ""
+            val = arg
+            if arg.type == "keyword_argument":
+                name_node = arg.child_by_field_name("name")
+                val = arg.child_by_field_name("value")
+                kw_name = node_text(name_node, source) if name_node is not None else ""
+            if val is None or val.type not in ("identifier", "attribute"):
+                continue
+            ref = normalize_callee(node_text(val, source))
+            if not ref or ref in IGNORED_CALLBACK_REFS:
+                continue
+            if "." not in ref and ref in owner_params:
+                continue
+            ref_kind = base_ref_kind
+            if ref_kind == EDGE_CALLBACK_REF and kw_name in EVENT_KEYWORD_ARGS:
+                ref_kind = EDGE_EVENT_LISTENER
+            ref_site = CallSite(
+                callee=ref,
+                line=line_of(val),
+                kind=ref_kind,
+                is_invocation=False,
+                via=callee,
+                event=ref_event,
+                is_top_level_stmt=is_top_stmt,
+                is_main_guard=is_main_guard,
+            )
+            if owner is None:
+                module_calls.append(ref_site)
+            else:
+                calls.setdefault(owner, []).append(ref_site)
+
+    return calls, module_calls
+
+
+def collect_html_refs(
+    root: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    qualname_by_key: dict[NodeKey, str],
+) -> list[HtmlRef]:
+    """Detecta literales de ruta `.html`/`.htm` (p. ej. `FileResponse(... / 'index.html')`)."""
+    refs: list[HtmlRef] = []
+    seen: set[tuple[str | None, str]] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "string":
+            html_path = extract_html_path_from_string(_extract_py_string(node, source))
+            if html_path is not None:
+                owner = find_enclosing_key(node, function_nodes)
+                owner_qn = qualname_by_key.get(owner) if owner is not None else None
+                key = (owner_qn, html_path)
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(HtmlRef(target=html_path, line=line_of(node), owner_qualname=owner_qn))
+            continue
+        stack.extend(reversed(node.named_children))
+    return refs
+
+
+def collect_static_dirs(root: Node, source: bytes) -> list[str]:
+    """Detecta directorios estáticos montados (`add_static`, `StaticFiles`, `send_from_directory`)."""
+    dirs: list[str] = []
+    for captures in run_matches(LANGUAGE, CALL_QUERY, root):
+        call_node = first_capture(captures, "call")
+        callee_node = first_capture(captures, "callee")
+        if call_node is None or callee_node is None:
             continue
         callee = normalize_callee(node_text(callee_node, source))
-        calls.setdefault(owner, []).append(CallSite(callee=callee, line=line_of(call_node)))
-    return calls
+        if not is_static_mount_call(callee):
+            continue
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            continue
+        found_str = False
+        stack = list(reversed(args.named_children))
+        while stack:
+            item = stack.pop()
+            if item.type == "string":
+                val = _extract_py_string(item, source).strip()
+                if val and val != "/" and val not in dirs:
+                    dirs.append(val)
+                    found_str = True
+            else:
+                stack.extend(reversed(item.named_children))
+        if not found_str and "." not in dirs:
+            dirs.append(".")
+    return dirs
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +665,69 @@ def _is_docstring_statement(stmt: Node) -> bool:
     return False
 
 
+def _extract_py_assignment_target(stmt: Node, source: bytes) -> str:
+    expr = stmt.named_children[0] if stmt.type == "expression_statement" and stmt.named_child_count else stmt
+    if expr.type in FLOW_ASSIGNMENT_TYPES:
+        left = expr.child_by_field_name("left")
+        if left is not None:
+            return collapse_whitespace(node_text(left, source))
+    return ""
+
+
+def _classify_compactable_py_stmt(
+    stmt: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+) -> str | None:
+    """Devuelve el nombre asignado si `stmt` es una asignación simple sin ramas, I/O ni llamadas."""
+    if node_key(stmt) in function_nodes or stmt.type in FLOW_SKIP_TYPES:
+        return None
+    if stmt.type in ("block", "try_statement", "with_statement") or stmt.type in FLOW_LOOP_TYPES:
+        return None
+    if stmt.type in FLOW_DECISION_TYPES or stmt.type in FLOW_JUMP_TYPES:
+        return None
+    if collect_inline_lambdas(stmt, function_nodes):
+        return None
+    if contains_type(stmt, CALL_TYPES | AWAIT_TYPES, function_nodes):
+        return None
+    if not contains_type(stmt, FLOW_ASSIGNMENT_TYPES, function_nodes):
+        return None
+    if step_role(stmt, source, function_nodes) == ROLE_IO:
+        return None
+    return _extract_py_assignment_target(stmt, source)
+
+
+def _flush_py_compact_buffer(
+    buffer: list[tuple[Node, str]],
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+    builder: FlowGraphBuilder,
+    pending: list[PendingExit],
+    parent_id: str | None,
+) -> list[PendingExit]:
+    if not buffer:
+        return pending
+    if len(buffer) < FLOW_COMPACT_MIN_RUN:
+        current = pending
+        for stmt, _ in buffer:
+            current = walk_flow_statement(stmt, source, function_nodes, builder, current, parent_id)
+        buffer.clear()
+        return current
+
+    names = [name for _, name in buffer]
+    label = format_compacted_step_label("asignaciones", names, len(buffer))
+    code = "\n".join(dedent_code(node_text(stmt, source)) for stmt, _ in buffer)
+    _, next_pending = builder.emit_sequential(
+        pending,
+        ROLE_TRANSFORM,
+        label,
+        code=code,
+        parent_id=parent_id,
+    )
+    buffer.clear()
+    return next_pending
+
+
 def walk_flow_block(
     block: Node | None,
     source: bytes,
@@ -372,10 +739,23 @@ def walk_flow_block(
     if block is None:
         return pending
     current = pending
+    compact_buffer: list[tuple[Node, str]] = []
+
     for statement in block.named_children:
-        if _is_docstring_statement(statement):
+        if _is_docstring_statement(statement) or statement.type == "comment":
             continue
+        compact_target = _classify_compactable_py_stmt(statement, source, function_nodes)
+        if compact_target is not None:
+            compact_buffer.append((statement, compact_target))
+            continue
+        current = _flush_py_compact_buffer(
+            compact_buffer, source, function_nodes, builder, current, parent_id
+        )
         current = walk_flow_statement(statement, source, function_nodes, builder, current, parent_id)
+
+    current = _flush_py_compact_buffer(
+        compact_buffer, source, function_nodes, builder, current, parent_id
+    )
     return current
 
 
