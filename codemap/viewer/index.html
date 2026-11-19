@@ -19,10 +19,10 @@
 
     <div class="toolbar-center">
       <nav class="level-switcher" aria-label="Niveles de abstracción">
-        <button id="level-1" class="level-btn" data-level="1" title="Módulos colapsados">Nivel 1: Arquitectura</button>
-        <button id="level-2" class="level-btn" data-level="2" title="Archivos y funciones">Nivel 2: Interconexión</button>
-        <button id="level-3" class="level-btn" data-level="3" title="Aislar flujo del archivo seleccionado">Nivel 3: Flujo Archivo</button>
-        <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones">Nivel 3+: Intra-función</button>
+        <button id="level-1" class="level-btn" data-level="1" title="Módulos y archivos raíz colapsados (Tecla 1)">Nivel 1: Módulos</button>
+        <button id="level-2" class="level-btn" data-level="2" title="Carpetas abiertas y archivos colapsados para ver flujo inter-archivos (Tecla 2)">Nivel 2: Archivos</button>
+        <button id="level-3" class="level-btn" data-level="3" title="Todas las funciones e interconexiones visibles (Tecla 3)">Nivel 3: Funciones</button>
+        <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones (Tecla 4)">Nivel 3+: Intra-función</button>
       </nav>
 
       <div class="flow-selector-wrap" aria-label="Selector de hilos de ejecución">
@@ -105,6 +105,10 @@
           <button id="btn-trace-go" class="trace-hud-btn primary" type="button" title="Saltar a la rama seleccionada (→ o Enter)">Ir →</button>
         </div>
       </div>
+      <div id="file-isolation-hud" class="file-isolation-hud hidden" role="status" aria-live="polite">
+        <span id="file-isolation-label" class="file-isolation-label"></span>
+        <button id="btn-exit-file-isolation" class="trace-hud-btn primary" type="button" title="Restaurar vista (Esc)">Mostrar todos</button>
+      </div>
       <div id="edge-tooltip" class="edge-tooltip hidden" role="tooltip"></div>
       <button id="btn-show-panel" class="floating-panel-toggle hidden" type="button" title="Mostrar inspector (] o Ctrl+\)">◀ Inspector</button>
 
@@ -167,8 +171,24 @@
       </section>
 
       <div class="details-empty" id="details-empty">
-        <h2>Inspección de Nodo</h2>
-        <p>Haz clic en un módulo, archivo o función para editar tu nota personal, cambiar su forma o anclar su posición.</p>
+        <div class="summary-header">
+          <span id="summary-level-badge" class="summary-level-badge">Nivel 2: Archivos</span>
+          <h2 id="summary-title">Resumen del Flujo</h2>
+          <p id="summary-hint" class="summary-hint">Haz clic en un nodo para inspeccionar su firma, llamadas y nota personal.</p>
+          <div id="summary-stats" class="summary-stats"></div>
+        </div>
+        <div id="summary-entries-block" class="summary-section hidden">
+          <h3>Puntos de entrada</h3>
+          <ul id="summary-entries-list" class="summary-list"></ul>
+        </div>
+        <div id="summary-connections-block" class="summary-section hidden">
+          <h3>Conexiones principales visibles</h3>
+          <ul id="summary-connections-list" class="summary-list"></ul>
+        </div>
+        <div id="summary-flows-block" class="summary-section hidden">
+          <h3>Hilos de ejecución</h3>
+          <ul id="summary-flows-list" class="summary-list"></ul>
+        </div>
       </div>
 
       <div class="details-content hidden" id="details-content">
@@ -196,6 +216,14 @@
             title="Expandir en ventana flotante sin alterar el grafo principal (Alt + Doble clic)"
           >
             ↗ Abrir en ventana flotante
+          </button>
+          <button
+            id="btn-isolate-file"
+            class="isolate-file-btn hidden"
+            type="button"
+            title="Colapsar el resto de archivos para enfocar únicamente este archivo"
+          >
+            🎯 Aislar este archivo
           </button>
         </div>
 
@@ -404,6 +432,7 @@
         <button id="btn-close-help" type="button">Cerrar</button>
       </div>
       <ul class="shortcuts-list">
+        <li><span><kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> / <kbd>4</kbd></span><span>Cambiar nivel: Módulos · Archivos · Funciones · Intra-función</span></li>
         <li><span><kbd>Espacio</kbd> + Arrastrar</span><span>Modo Mano: mover cámara incluso encima de nodos</span></li>
         <li><span>Clic central + Arrastrar</span><span>Paneo libre en cualquier momento sin mover nodos</span></li>
         <li><span>Rueda / <kbd>+</kbd> / <kbd>-</kbd></span><span>Acercar o alejar zoom centrado</span></li>
@@ -413,7 +442,7 @@
         <li><span><kbd>Ctrl</kbd>+<kbd>K</kbd></span><span>Abrir buscador instantáneo</span></li>
         <li><span><kbd>R</kbd></span><span>Re-ordenar nodos no fijados (ELKjs)</span></li>
         <li><span><kbd>]</kbd> o <kbd>Ctrl</kbd>+<kbd>\</kbd></span><span>Ocultar o desplegar panel lateral inspector</span></li>
-        <li><span><kbd>Esc</kbd></span><span>Cerrar modales / ventana flotante hoja / salir de Foco / limpiar Hilo</span></li>
+        <li><span><kbd>Esc</kbd></span><span>Cerrar modales / ventana flotante hoja / salir de Foco, aislamiento o Hilo / deseleccionar</span></li>
         <li><span>Doble clic en nodo</span><span>Colapsar / expandir contenedor o flujo interno</span></li>
         <li><span><kbd>Alt</kbd> + Doble clic</span><span>Abrir módulo, archivo o función en ventana flotante aislada</span></li>
       </ul>

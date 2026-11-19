@@ -252,11 +252,16 @@ HTML_CANVAS_METHODS = frozenset({"getContext", "toDataURL", "toBlob", "transferC
 SELF_RECEIVER_PREFIXES = ("self.", "cls.", "this.")
 PYTHON_BUILTINS = frozenset(name for name in dir(builtins) if not name.startswith("_"))
 
-# Niveles de apertura (§3). El Nivel "3+" se codifica como 4 en meta.recommended_level.
-LEVEL_ARCHITECTURE = 1
-LEVEL_INTERCONNECTION = 2
-LEVEL_FILE_FLOW = 3
+# Escala multiescala: Módulos (1) -> Archivos (2) -> Funciones (3) -> Intra-función (4 / "3+").
+LEVEL_MODULES = 1
+LEVEL_FILES = 2
+LEVEL_FUNCTIONS = 3
 LEVEL_INTRA_FUNCTION = 4
+
+# Alias de retrocompatibilidad para posibles importaciones externas.
+LEVEL_ARCHITECTURE = LEVEL_MODULES
+LEVEL_INTERCONNECTION = LEVEL_FILES
+LEVEL_FILE_FLOW = LEVEL_FUNCTIONS
 
 LARGE_PROJECT_FUNCTIONS = 25
 TINY_FILE_FUNCTIONS = 2
@@ -386,7 +391,11 @@ def build_graph(
             "root_path": target_path,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "total_functions": total_functions,
-            "recommended_level": recommended_level(total_functions, is_single_file),
+            "recommended_level": recommended_level(
+                total_functions,
+                is_single_file,
+                has_modules=bool(module_nodes),
+            ),
             "main_entry_files": sorted(entry_meta["main_entry_files"]),
             "main_entry_functions": sorted(entry_meta["main_entry_fn_ids"]),
         },
@@ -396,15 +405,25 @@ def build_graph(
     }
 
 
-def recommended_level(total_functions: int, is_single_file: bool) -> int:
-    """Apertura adaptativa según tamaño (tabla de §3)."""
+def recommended_level(
+    total_functions: int,
+    is_single_file: bool,
+    *,
+    has_modules: bool = True,
+) -> int:
+    """Apertura adaptativa según tamaño y estructura:
+      - <= 2 funciones:       Nivel 3+ (Intra-función)
+      - Archivo suelto:       Nivel 3 (Funciones)
+      - > 25 funciones:       Nivel 1 (Módulos) si hay carpetas, o Nivel 2 (Archivos) si es plano
+      - Mediano multi-archivo: Nivel 2 (Archivos colapsados)
+    """
     if total_functions <= TINY_FILE_FUNCTIONS:
         return LEVEL_INTRA_FUNCTION
     if is_single_file:
-        return LEVEL_FILE_FLOW
+        return LEVEL_FUNCTIONS
     if total_functions > LARGE_PROJECT_FUNCTIONS:
-        return LEVEL_ARCHITECTURE
-    return LEVEL_INTERCONNECTION
+        return LEVEL_MODULES if has_modules else LEVEL_FILES
+    return LEVEL_FILES
 
 
 # ---------------------------------------------------------------------------

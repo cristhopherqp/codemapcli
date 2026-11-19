@@ -63,6 +63,36 @@ const ENTRY_KIND_LABELS = {
 };
 
 const NOTE_AUTOSAVE_MS = 500;
+const LARGE_PROJECT_FUNCTION_LIMIT = 25;
+
+const LEVEL_METADATA = {
+  1: {
+    badge: "Nivel 1 · Módulos",
+    title: "Arquitectura de Módulos",
+    hint: "Carpetas y archivos raíz colapsados. Doble clic para expandir o Alt+Doble clic para ventana flotante.",
+  },
+  2: {
+    badge: "Nivel 2 · Archivos",
+    title: "Interconexión de Archivos",
+    hint: "Carpetas desplegadas con archivos colapsados para visualizar dependencias limpias entre archivos.",
+  },
+  3: {
+    badge: "Nivel 3 · Funciones",
+    title: "Mapa de Funciones",
+    hint: "Todas las funciones e invocaciones visibles. Pulsa T para Modo Foco o elige un hilo en la barra superior.",
+  },
+  4: {
+    badge: "Nivel 3+ · Intra-función",
+    title: "Flujo Intra-función",
+    hint: "Desglose interno de ramas, bucles, eventos y llamadas dentro de las funciones.",
+  },
+};
+
+const LEGACY_PIN_FALLBACK_KEY = {
+  modules: "level_1",
+  functions: "level_2",
+  intra: "level_4",
+};
 
 const state = {
   rawGraph: null,
@@ -73,6 +103,10 @@ const state = {
   flowsById: new Map(),
   activeFlowId: null,
   preFlowCollapsedContainers: null,
+  isolatedFileId: null,
+  preIsolateCollapsedContainers: null,
+  lastProjectedEdges: [],
+  lastVisibleSummaryCounts: { modules: 0, files: 0, functions: 0, edges: 0 },
   utilityNodeIds: new Set(),
   utilityDetectionMode: "strict",
   hideUtilities: false,
@@ -237,6 +271,11 @@ function pruneStaleExpansionState() {
   if (state.activeFlowId && !state.flowsById.has(state.activeFlowId)) {
     state.activeFlowId = null;
     state.preFlowCollapsedContainers = null;
+  }
+  if (state.isolatedFileId && !state.nodesById.has(state.isolatedFileId)) {
+    state.isolatedFileId = null;
+    state.preIsolateCollapsedContainers = null;
+    updateFileIsolationHud();
   }
 }
 
@@ -473,6 +512,12 @@ function populateFlowSelector() {
 async function applyExecutionFlow(flowId, { fit = true } = {}) {
   const cleanId = flowId && state.flowsById.has(flowId) ? flowId : null;
 
+  if (cleanId && state.isolatedFileId) {
+    state.isolatedFileId = null;
+    state.preIsolateCollapsedContainers = null;
+    updateFileIsolationHud();
+  }
+
   if (cleanId && state.traceMode) {
     state.traceMode = false;
     state.traceHistory = [];
@@ -597,28 +642,37 @@ function renderHeader(meta, edgeCount) {
 
 function getCurrentLayoutContextKey() {
   if (state.expandedFunctions.size > 0 || state.activeLevel === 4) {
-    return "level_4";
+    return "intra";
   }
   if (state.activeLevel === 1) {
-    return "level_1";
+    return "modules";
   }
-  if (state.activeLevel === 3) {
-    return "level_3";
+  if (state.activeLevel === 2) {
+    return "files";
   }
-  return "level_2";
+  return "functions";
 }
 
 function getPinnedPositionForContext(noteEntry, contextKey = getCurrentLayoutContextKey()) {
   if (!noteEntry) {
     return null;
   }
-  const byLevel = noteEntry.pinned_positions && noteEntry.pinned_positions[contextKey];
+  const positions = noteEntry.pinned_positions || {};
+  const byLevel = positions[contextKey];
   if (byLevel && typeof byLevel.x === "number" && typeof byLevel.y === "number") {
     return { x: byLevel.x, y: byLevel.y };
   }
-  // Retrocompatibilidad con notes.json antiguos: x/y planos solo aplican en Nivel 2 sin funciones expandidas.
+  // Retrocompatibilidad controlada: "files" es una escala nueva y NUNCA hereda pines de otras escalas.
+  const legacyKey = LEGACY_PIN_FALLBACK_KEY[contextKey];
+  if (legacyKey) {
+    const legacyPos = positions[legacyKey];
+    if (legacyPos && typeof legacyPos.x === "number" && typeof legacyPos.y === "number") {
+      return { x: legacyPos.x, y: legacyPos.y };
+    }
+  }
+  // Coordenadas planas x/y heredadas corresponden a la vista de funciones (antes Nivel 2).
   if (
-    contextKey === "level_2"
+    contextKey === "functions"
     && state.expandedFunctions.size === 0
     && noteEntry.pinned
     && typeof noteEntry.x === "number"
@@ -687,23 +741,27 @@ async function saveOrphansList(orphans) {
 }
 
 // ---------------------------------------------------------------------------
-// Niveles multiescala (Nivel 1, 2, 3 y 3+)
+// Niveles multiescala (N1 Módulos -> N2 Archivos -> N3 Funciones -> N3+ Intra)
+// y aislamiento puntual de archivo
 // ---------------------------------------------------------------------------
 
 async function applyLevel(level) {
   state.activeLevel = level;
   state.preFlowCollapsedContainers = null;
+  state.isolatedFileId = null;
+  state.preIsolateCollapsedContainers = null;
   updateLevelButtons(level);
+  updateFileIsolationHud();
 
   state.collapsedContainers.clear();
   state.expandedFunctions.clear();
 
   if (level === 1) {
-    collapseTopModules();
-  } else if (level === 3) {
-    isolateFocusedFile();
+    collapseTopContainers();
+  } else if (level === 2) {
+    collapseAllFiles();
   } else if (level === 4) {
-    expandAllFunctionFlows();
+    expandFunctionFlowsSmart();
   }
 
   // Si hay un hilo activo, aseguramos que sus contenedores ancestros queden abiertos.
@@ -719,34 +777,33 @@ async function applyLevel(level) {
   }
 
   await refreshGraphView({ fit: true });
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    updateIsolateFileButton(state.nodesById.get(state.selectedNodeId));
+  }
 }
 
-function collapseTopModules() {
+function collapseTopContainers() {
   const topNodes = state.childrenByParent.get(null) || [];
-  const topModules = topNodes.filter((n) => n.type === "module");
-  const targets = topModules.length > 0 ? topModules : topNodes.filter((n) => n.type === "file");
-  for (const node of targets) {
-    state.collapsedContainers.add(node.id);
-  }
-}
-
-function isolateFocusedFile() {
-  const focusedFileId = resolveSelectedFileId();
-  if (!focusedFileId) {
-    return;
-  }
-  for (const node of state.rawGraph.nodes) {
-    if (node.type === "file" && node.id !== focusedFileId) {
+  for (const node of topNodes) {
+    if ((node.type === "module" || node.type === "file") && countDescendantFunctions(node.id) > 0) {
       state.collapsedContainers.add(node.id);
     }
   }
 }
 
-function resolveSelectedFileId() {
-  if (!state.selectedNodeId) {
+function collapseAllFiles() {
+  for (const node of state.rawGraph.nodes) {
+    if (node.type === "file" && countDescendantFunctions(node.id) > 0) {
+      state.collapsedContainers.add(node.id);
+    }
+  }
+}
+
+function resolveFileIdForNode(nodeId) {
+  if (!nodeId) {
     return null;
   }
-  const node = state.nodesById.get(state.selectedNodeId);
+  const node = state.nodesById.get(nodeId);
   if (!node) {
     return null;
   }
@@ -759,11 +816,162 @@ function resolveSelectedFileId() {
   return null;
 }
 
-function expandAllFunctionFlows() {
-  for (const node of state.rawGraph.nodes) {
-    if (node.type === "function" && node.internal_flow && node.internal_flow.length > 0) {
+function resolveSelectedFileId() {
+  return resolveFileIdForNode(state.selectedNodeId);
+}
+
+function expandFunctionFlowsSmart() {
+  const flowFunctions = state.rawGraph.nodes.filter(
+    (node) => node.type === "function" && node.internal_flow && node.internal_flow.length > 0
+  );
+  if (flowFunctions.length <= LARGE_PROJECT_FUNCTION_LIMIT) {
+    for (const node of flowFunctions) {
       state.expandedFunctions.add(node.id);
     }
+    return;
+  }
+
+  // En proyectos grandes evitamos expandir todas las funciones de golpe para no bloquear ELKjs.
+  const selected = state.selectedNodeId ? state.nodesById.get(state.selectedNodeId) : null;
+  if (selected && selected.type === "function" && selected.internal_flow && selected.internal_flow.length > 0) {
+    state.expandedFunctions.add(selected.id);
+    return;
+  }
+  const selectedFileId = resolveSelectedFileId();
+  if (selectedFileId) {
+    for (const fn of flowFunctions) {
+      if (fn.parent === selectedFileId) {
+        state.expandedFunctions.add(fn.id);
+      }
+    }
+    if (state.expandedFunctions.size > 0) {
+      return;
+    }
+  }
+  const activeFlow = getActiveFlow();
+  const priorityIds = activeFlow
+    ? (activeFlow.node_ids || [])
+    : ((state.rawGraph.meta && state.rawGraph.meta.main_entry_functions) || []);
+  for (const id of priorityIds) {
+    const fn = state.nodesById.get(id);
+    if (fn && fn.type === "function" && fn.internal_flow && fn.internal_flow.length > 0) {
+      state.expandedFunctions.add(fn.id);
+      if (state.expandedFunctions.size >= 6) {
+        break;
+      }
+    }
+  }
+  if (state.expandedFunctions.size === 0) {
+    for (const fn of flowFunctions.slice(0, 6)) {
+      state.expandedFunctions.add(fn.id);
+    }
+  }
+}
+
+function updateFileIsolationHud() {
+  const hud = document.getElementById("file-isolation-hud");
+  const label = document.getElementById("file-isolation-label");
+  if (!hud || !label) {
+    return;
+  }
+  if (!state.isolatedFileId) {
+    hud.classList.add("hidden");
+    label.textContent = "";
+    return;
+  }
+  label.textContent = `🎯 Archivo aislado: ${state.isolatedFileId}`;
+  hud.classList.remove("hidden");
+}
+
+function updateIsolateFileButton(node) {
+  const btn = document.getElementById("btn-isolate-file");
+  if (!btn) {
+    return;
+  }
+  const fileId = node ? resolveFileIdForNode(node.id) : null;
+  const totalFiles = state.rawGraph
+    ? state.rawGraph.nodes.filter((n) => n.type === "file").length
+    : 0;
+  if (!fileId || totalFiles <= 1) {
+    btn.classList.add("hidden");
+    btn.classList.remove("active");
+    return;
+  }
+  const isThisIsolated = state.isolatedFileId === fileId;
+  btn.textContent = isThisIsolated ? "✕ Salir de aislamiento de archivo" : "🎯 Aislar este archivo";
+  btn.classList.toggle("active", isThisIsolated);
+  btn.classList.remove("hidden");
+}
+
+async function isolateFileById(fileId) {
+  if (!fileId || !state.nodesById.has(fileId)) {
+    return;
+  }
+  if (!state.isolatedFileId) {
+    state.preIsolateCollapsedContainers = new Set(state.collapsedContainers);
+  }
+  state.isolatedFileId = fileId;
+
+  // Abrir el archivo seleccionado y sus carpetas ancestro; colapsar los demás archivos con funciones.
+  let cursor = state.nodesById.get(fileId);
+  while (cursor) {
+    state.collapsedContainers.delete(cursor.id);
+    cursor = cursor.parent ? state.nodesById.get(cursor.parent) : null;
+  }
+  for (const node of state.rawGraph.nodes) {
+    if (node.type === "file" && node.id !== fileId && countDescendantFunctions(node.id) > 0) {
+      state.collapsedContainers.add(node.id);
+    }
+  }
+
+  updateFileIsolationHud();
+  await refreshGraphView({ fit: false });
+  if (state.cy) {
+    const targetEle = state.cy.getElementById(fileId);
+    if (targetEle && targetEle.length > 0) {
+      const focusEles = targetEle.union(targetEle.descendants());
+      state.cy.animate({ fit: { eles: focusEles, padding: 52 } }, { duration: 220 });
+    }
+  }
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    updateIsolateFileButton(state.nodesById.get(state.selectedNodeId));
+  }
+}
+
+async function exitFileIsolation({ refresh = true } = {}) {
+  if (!state.isolatedFileId) {
+    return;
+  }
+  state.isolatedFileId = null;
+  if (state.preIsolateCollapsedContainers) {
+    state.collapsedContainers = new Set(state.preIsolateCollapsedContainers);
+    state.preIsolateCollapsedContainers = null;
+  } else {
+    state.collapsedContainers.clear();
+    if (state.activeLevel === 1) {
+      collapseTopContainers();
+    } else if (state.activeLevel === 2) {
+      collapseAllFiles();
+    }
+  }
+  updateFileIsolationHud();
+  if (refresh) {
+    await refreshGraphView({ fit: true });
+  }
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    updateIsolateFileButton(state.nodesById.get(state.selectedNodeId));
+  }
+}
+
+async function toggleIsolateSelectedFile() {
+  const fileId = resolveSelectedFileId();
+  if (!fileId) {
+    return;
+  }
+  if (state.isolatedFileId === fileId) {
+    await exitFileIsolation();
+  } else {
+    await isolateFileById(fileId);
   }
 }
 
@@ -1231,6 +1439,10 @@ function initCytoscape() {
     if (event.target === state.cy) {
       clearActiveFloatingWindowFocus();
       hideEdgeTooltip();
+      if (!state.traceMode && state.selectedNodeId) {
+        state.cy.nodes().unselect();
+        clearSelectionPanel();
+      }
       if (state.traceMode || state.activeFlowId) {
         applyCanvasHighlights();
       }
@@ -1364,8 +1576,8 @@ async function handleNodeDragFree(cyNode) {
     const entry = {
       ...existing,
       pinned: true,
-      x: contextKey === "level_2" ? x : existing.x,
-      y: contextKey === "level_2" ? y : existing.y,
+      x: contextKey === "functions" ? x : existing.x,
+      y: contextKey === "functions" ? y : existing.y,
       pinned_positions: nextPositions,
       last_fingerprint: (raw && raw.fingerprint) || existing.last_fingerprint || "",
     };
@@ -1865,6 +2077,15 @@ function buildStylesheet() {
 async function refreshGraphView({ fit = true } = {}) {
   hideEdgeTooltip();
   const { nodes, edges } = buildVisibleElements();
+  const callEdges = edges.filter((e) => e.data && e.data.kind === "call");
+  state.lastProjectedEdges = callEdges.map((e) => e.data);
+  state.lastVisibleSummaryCounts = {
+    modules: nodes.filter((n) => n.data && n.data.type === "module").length,
+    files: nodes.filter((n) => n.data && n.data.type === "file").length,
+    functions: nodes.filter((n) => n.data && n.data.type === "function").length,
+    edges: callEdges.length,
+  };
+
   state.cy.elements().remove();
   state.cy.add([...nodes, ...edges]);
   await runElkLayout(nodes, edges);
@@ -1873,6 +2094,9 @@ async function refreshGraphView({ fit = true } = {}) {
   }
   updateZoomIndicator();
   applyCanvasHighlights();
+  if (!state.selectedNodeId) {
+    renderEmptyInspectorSummary();
+  }
 }
 
 async function runElkLayout(visibleNodes, visibleEdges) {
@@ -2417,12 +2641,205 @@ async function toggleNodeExpansion(nodeId) {
   }
 }
 
+function shortSummaryLabel(nodeId) {
+  const node = state.nodesById.get(nodeId);
+  if (!node) {
+    return nodeId;
+  }
+  if (node.type === "function" && nodeId.includes("::")) {
+    const [filePart, fnPart] = nodeId.split("::");
+    const fileName = filePart.split("/").pop() || filePart;
+    return `${fileName}::${fnPart}()`;
+  }
+  return node.id;
+}
+
+function renderEmptyInspectorSummary() {
+  const container = document.getElementById("details-empty");
+  if (!container || !state.rawGraph) {
+    return;
+  }
+
+  const levelMeta = LEVEL_METADATA[state.activeLevel] || LEVEL_METADATA[2];
+  const badgeEl = document.getElementById("summary-level-badge");
+  const titleEl = document.getElementById("summary-title");
+  const hintEl = document.getElementById("summary-hint");
+  const statsEl = document.getElementById("summary-stats");
+
+  if (badgeEl) {
+    badgeEl.textContent = state.isolatedFileId
+      ? `${levelMeta.badge} · Archivo aislado`
+      : levelMeta.badge;
+  }
+  if (titleEl) {
+    titleEl.textContent = state.isolatedFileId
+      ? `Foco en ${state.isolatedFileId}`
+      : levelMeta.title;
+  }
+  if (hintEl) {
+    hintEl.textContent = levelMeta.hint;
+  }
+
+  if (statsEl) {
+    statsEl.innerHTML = "";
+    const counts = state.lastVisibleSummaryCounts || { modules: 0, files: 0, functions: 0, edges: 0 };
+    const pills = [];
+    if (counts.modules > 0) {
+      pills.push(`${counts.modules} mód.`);
+    }
+    if (counts.files > 0) {
+      pills.push(`${counts.files} arch.`);
+    }
+    if (counts.functions > 0) {
+      pills.push(`${counts.functions} fns`);
+    }
+    pills.push(`${counts.edges} conex.`);
+    for (const text of pills) {
+      const span = document.createElement("span");
+      span.className = "summary-stat-pill";
+      span.textContent = text;
+      statsEl.appendChild(span);
+    }
+  }
+
+  // 1. Puntos de entrada adaptados al nivel activo (archivos en N1/N2; funciones en N3/N3+).
+  const entriesBlock = document.getElementById("summary-entries-block");
+  const entriesList = document.getElementById("summary-entries-list");
+  if (entriesBlock && entriesList) {
+    entriesList.innerHTML = "";
+    const meta = state.rawGraph.meta || {};
+    const entryFiles = meta.main_entry_files || [];
+    const entryFns = meta.main_entry_functions || [];
+    let entryIds = state.activeLevel <= 2
+      ? (entryFiles.length > 0 ? entryFiles : entryFns)
+      : (entryFns.length > 0 ? entryFns : entryFiles);
+    entryIds = entryIds.filter((id) => state.nodesById.has(id)).slice(0, 6);
+
+    if (entryIds.length === 0) {
+      entriesBlock.classList.add("hidden");
+    } else {
+      for (const id of entryIds) {
+        const node = state.nodesById.get(id);
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "summary-item-btn";
+        const mainSpan = document.createElement("span");
+        mainSpan.className = "summary-item-main";
+        mainSpan.textContent = shortSummaryLabel(id);
+        mainSpan.title = id;
+        const metaSpan = document.createElement("span");
+        metaSpan.className = "summary-item-meta main";
+        metaSpan.textContent = node && node.type === "file"
+          ? (node.language === "html" ? "HTML" : "★ Entrada")
+          : "INICIO";
+        btn.appendChild(mainSpan);
+        btn.appendChild(metaSpan);
+        btn.addEventListener("click", () => navigateToNode(id));
+        li.appendChild(btn);
+        entriesList.appendChild(li);
+      }
+      entriesBlock.classList.remove("hidden");
+    }
+  }
+
+  // 2. Conexiones principales visibles (ordenadas por peso de llamadas y prioridad semántica).
+  const connBlock = document.getElementById("summary-connections-block");
+  const connList = document.getElementById("summary-connections-list");
+  if (connBlock && connList) {
+    connList.innerHTML = "";
+    const topEdges = [...(state.lastProjectedEdges || [])]
+      .sort((a, b) => {
+        const countDiff = (b.call_count || 1) - (a.call_count || 1);
+        if (countDiff !== 0) {
+          return countDiff;
+        }
+        const prioA = EDGE_TYPE_PRIORITY[a.edgeType] || 99;
+        const prioB = EDGE_TYPE_PRIORITY[b.edgeType] || 99;
+        return prioA - prioB;
+      })
+      .slice(0, 6);
+
+    if (topEdges.length === 0) {
+      connBlock.classList.add("hidden");
+    } else {
+      for (const edge of topEdges) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "summary-item-btn";
+        const srcName = shortSummaryLabel(edge.source);
+        const tgtName = shortSummaryLabel(edge.target);
+        const mainSpan = document.createElement("span");
+        mainSpan.className = "summary-item-main";
+        mainSpan.textContent = `${srcName} → ${tgtName}`;
+        mainSpan.title = `${edge.source} → ${edge.target}`;
+
+        const metaSpan = document.createElement("span");
+        metaSpan.className = "summary-item-meta conn";
+        const edgeMeta = EDGE_TYPE_META[edge.edgeType] || { icon: "→" };
+        const badgeParts = [];
+        if (edge.edgeType && edge.edgeType !== "direct_call") {
+          badgeParts.push(edgeMeta.icon);
+        }
+        if ((edge.call_count || 1) > 1) {
+          badgeParts.push(`×${edge.call_count}`);
+        }
+        metaSpan.textContent = badgeParts.length > 0 ? badgeParts.join(" ") : "→";
+
+        btn.appendChild(mainSpan);
+        btn.appendChild(metaSpan);
+        btn.addEventListener("click", () => navigateToNode(edge.source));
+        li.appendChild(btn);
+        connList.appendChild(li);
+      }
+      connBlock.classList.remove("hidden");
+    }
+  }
+
+  // 3. Hilos de ejecución clicables (se ocultan si #active-flow-panel ya está activo arriba).
+  const flowsBlock = document.getElementById("summary-flows-block");
+  const flowsList = document.getElementById("summary-flows-list");
+  if (flowsBlock && flowsList) {
+    flowsList.innerHTML = "";
+    const allFlows = (state.rawGraph.execution_flows || []);
+    if (state.activeFlowId || allFlows.length === 0) {
+      flowsBlock.classList.add("hidden");
+    } else {
+      const mainFlows = allFlows.filter((f) => f.kind === "main");
+      const featureFlows = allFlows.filter((f) => f.kind !== "main").slice(0, 6);
+      const selectedFlows = [...mainFlows, ...featureFlows];
+      for (const flow of selectedFlows) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "summary-item-btn";
+        const mainSpan = document.createElement("span");
+        mainSpan.className = "summary-item-main";
+        mainSpan.textContent = flow.label;
+        mainSpan.title = flow.label;
+        const metaSpan = document.createElement("span");
+        const isMain = flow.kind === "main";
+        metaSpan.className = `summary-item-meta ${isMain ? "main" : "feature"}`;
+        metaSpan.textContent = `${(flow.steps || []).length} pasos`;
+        btn.appendChild(mainSpan);
+        btn.appendChild(metaSpan);
+        btn.addEventListener("click", () => applyExecutionFlow(flow.id));
+        li.appendChild(btn);
+        flowsList.appendChild(li);
+      }
+      flowsBlock.classList.remove("hidden");
+    }
+  }
+}
+
 function clearSelectionPanel() {
   state.selectedNodeId = null;
   state.activeFlowStepId = null;
   syncFlowStepHighlight(null, null);
   document.getElementById("details-empty").classList.remove("hidden");
   document.getElementById("details-content").classList.add("hidden");
+  renderEmptyInspectorSummary();
 }
 
 function selectNode(nodeId, stepId = undefined) {
@@ -2455,6 +2872,7 @@ function selectNode(nodeId, stepId = undefined) {
   updatePinButton(isPinnedInCurrentContext(noteEntry));
   updateToggleButton(node);
   updateFloatingOpenButton(node);
+  updateIsolateFileButton(node);
   updateRoleSelector(node, noteEntry);
 
   document.getElementById("detail-note-input").value = noteEntry.note || "";
@@ -3994,6 +4412,15 @@ function bindControls() {
     });
   }
 
+  const isolateFileBtn = document.getElementById("btn-isolate-file");
+  if (isolateFileBtn) {
+    isolateFileBtn.addEventListener("click", () => toggleIsolateSelectedFile());
+  }
+  const exitIsolateFileBtn = document.getElementById("btn-exit-file-isolation");
+  if (exitIsolateFileBtn) {
+    exitIsolateFileBtn.addEventListener("click", () => exitFileIsolation());
+  }
+
   window.addEventListener("resize", () => {
     scheduleBridgeRender();
   });
@@ -4003,16 +4430,20 @@ function bindControls() {
       return;
     }
     const contextKey = getCurrentLayoutContextKey();
+    const legacyKey = LEGACY_PIN_FALLBACK_KEY[contextKey];
     const entry = getNoteEntry(state.selectedNodeId);
     const cyNode = state.cy.getElementById(state.selectedNodeId);
     if (isPinnedInCurrentContext(entry)) {
       const nextPositions = { ...(entry.pinned_positions || {}) };
       delete nextPositions[contextKey];
+      if (legacyKey) {
+        delete nextPositions[legacyKey];
+      }
       const stillHasOtherPins = Object.keys(nextPositions).length > 0;
       await saveNotePatch(state.selectedNodeId, {
         pinned: stillHasOtherPins,
-        x: contextKey === "level_2" ? null : entry.x,
-        y: contextKey === "level_2" ? null : entry.y,
+        x: contextKey === "functions" ? null : entry.x,
+        y: contextKey === "functions" ? null : entry.y,
         pinned_positions: nextPositions,
       });
       refreshCyNodeMetadata(state.selectedNodeId);
@@ -4028,8 +4459,8 @@ function bindControls() {
       };
       await saveNotePatch(state.selectedNodeId, {
         pinned: true,
-        x: contextKey === "level_2" ? x : entry.x,
-        y: contextKey === "level_2" ? y : entry.y,
+        x: contextKey === "functions" ? x : entry.x,
+        y: contextKey === "functions" ? y : entry.y,
         pinned_positions: nextPositions,
       });
       refreshCyNodeMetadata(state.selectedNodeId);
@@ -4182,6 +4613,10 @@ function bindGlobalShortcuts() {
         toggleTraceMode();
         return;
       }
+      if (state.isolatedFileId) {
+        exitFileIsolation();
+        return;
+      }
       if (state.activeFlowId) {
         applyExecutionFlow(null);
         return;
@@ -4212,7 +4647,14 @@ function bindGlobalShortcuts() {
     }
 
     const key = event.key.toLowerCase();
-    if (key === "r" && !event.ctrlKey && !event.metaKey) {
+    if (
+      (event.key === "1" || event.key === "2" || event.key === "3" || event.key === "4")
+      && !event.ctrlKey
+      && !event.metaKey
+      && !event.altKey
+    ) {
+      applyLevel(Number(event.key));
+    } else if (key === "r" && !event.ctrlKey && !event.metaKey) {
       refreshGraphView({ fit: false });
     } else if (key === "t" && !event.ctrlKey && !event.metaKey) {
       toggleTraceMode();

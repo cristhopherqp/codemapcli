@@ -22,7 +22,24 @@ ALLOWED_NODE_FIELDS = (
     "custom_role",
     "last_fingerprint",
 )
-VALID_LAYOUT_LEVELS = frozenset({"level_1", "level_2", "level_3", "level_4"})
+VALID_LAYOUT_LEVELS = frozenset(
+    {
+        # Claves semánticas por escala (y modo Capas de Flujo)
+        "modules",
+        "files",
+        "functions",
+        "intra",
+        "layers_modules",
+        "layers_files",
+        "layers_functions",
+        "layers_intra",
+        # Retrocompatibilidad con notes.json previos
+        "level_1",
+        "level_2",
+        "level_3",
+        "level_4",
+    }
+)
 
 
 def notes_path(target_path: str) -> Path:

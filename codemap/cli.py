@@ -29,7 +29,12 @@ from codemap.storage import (
     write_graph,
 )
 
-LEVEL_NAMES = {1: "1 (Arquitectura)", 2: "2 (Interconexión)", 3: "3 (Flujo de Archivo)", 4: "3+ (Intra-función)"}
+LEVEL_NAMES = {
+    1: "1 (Módulos)",
+    2: "2 (Archivos)",
+    3: "3 (Funciones)",
+    4: "3+ (Intra-función)",
+}
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
