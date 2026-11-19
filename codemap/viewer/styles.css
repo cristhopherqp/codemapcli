@@ -1953,6 +1953,45 @@ kbd {
   font-size: 11.5px;
 }
 
+/* Etapa 3: Aislamiento real de subgrafo en Hilos / Modo Foco */
+.isolate-context-btn {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+
+.isolate-context-btn:hover {
+  border-color: var(--accent);
+  color: #e0f2fe;
+}
+
+.isolate-context-btn.active {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: var(--entry);
+  color: #a7f3d0;
+}
+
+.active-flow-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.active-flow-actions .call-action-btn.active,
+.trace-hud-btn.active {
+  background: rgba(16, 185, 129, 0.22);
+  border-color: var(--entry);
+  color: #a7f3d0;
+}
+
 .floating-windows-layer {
   position: absolute;
   inset: 0;

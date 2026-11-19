@@ -18,8 +18,12 @@ const ELK_LAYOUT_OPTIONS = {
   "elk.algorithm": "layered",
   "elk.direction": "DOWN",
   "elk.hierarchyHandling": "INCLUDE_CHILDREN",
+  "elk.edgeRouting": "ORTHOGONAL",
   "elk.layered.spacing.nodeNodeBetweenLayers": "48",
+  "elk.layered.spacing.edgeNodeBetweenLayers": "22",
   "elk.spacing.nodeNode": "32",
+  "elk.spacing.edgeNode": "20",
+  "elk.spacing.edgeEdge": "12",
   "elk.padding": "[top=38,left=20,bottom=20,right=20]",
   "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
   "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
@@ -103,6 +107,9 @@ const state = {
   flowsById: new Map(),
   activeFlowId: null,
   preFlowCollapsedContainers: null,
+  isolateActiveContext: false,
+  onDemandEdges: false,
+  hoveredNodeId: null,
   isolatedFileId: null,
   preIsolateCollapsedContainers: null,
   lastProjectedEdges: [],
@@ -527,11 +534,15 @@ async function applyExecutionFlow(flowId, { fit = true } = {}) {
 
   if (!cleanId) {
     state.activeFlowId = null;
+    if (!state.traceMode) {
+      state.isolateActiveContext = false;
+    }
     if (state.preFlowCollapsedContainers) {
       state.collapsedContainers = new Set(state.preFlowCollapsedContainers);
       state.preFlowCollapsedContainers = null;
     }
     populateFlowSelector();
+    updateIsolateContextButtons();
     renderActiveFlowPanel();
     await refreshGraphView({ fit });
     return;
@@ -553,10 +564,11 @@ async function applyExecutionFlow(flowId, { fit = true } = {}) {
   }
 
   populateFlowSelector();
-  await refreshGraphView({ fit: false });
+  updateIsolateContextButtons();
+  await refreshGraphView({ fit: state.isolateActiveContext });
   renderActiveFlowPanel();
 
-  if (fit && state.cy) {
+  if (fit && !state.isolateActiveContext && state.cy) {
     const activeEles = state.cy.elements(".flow-active, .flow-root, .flow-active-edge");
     if (activeEles.length > 0) {
       state.cy.animate({ fit: { eles: activeEles, padding: 54 }, duration: 220 });
@@ -1071,6 +1083,152 @@ function buildDisplayLabel(
   return tags.length > 0 ? `${label} [${tags.join(" · ")}]` : label;
 }
 
+function addNodeWithAncestors(targetSet, nodeId) {
+  let cursor = state.nodesById.get(nodeId);
+  const guard = new Set();
+  while (cursor && !guard.has(cursor.id)) {
+    guard.add(cursor.id);
+    targetSet.add(cursor.id);
+    cursor = cursor.parent ? state.nodesById.get(cursor.parent) : null;
+  }
+}
+
+function addVisibleDescendants(targetSet, containerId) {
+  if (state.collapsedContainers.has(containerId)) {
+    return;
+  }
+  const stack = [...(state.childrenByParent.get(containerId) || [])];
+  while (stack.length > 0) {
+    const child = stack.pop();
+    targetSet.add(child.id);
+    if (!state.collapsedContainers.has(child.id)) {
+      const grandChildren = state.childrenByParent.get(child.id) || [];
+      stack.push(...grandChildren);
+    }
+  }
+}
+
+function resolveEndpointByCollapse(nodeId) {
+  let cursor = state.nodesById.get(nodeId);
+  if (!cursor) {
+    return null;
+  }
+  const chain = [];
+  const seen = new Set();
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    chain.push(cursor.id);
+    cursor = cursor.parent ? state.nodesById.get(cursor.parent) : null;
+  }
+  // El ancestro colapsado más externo representa al nodo en la vista actual.
+  for (let idx = chain.length - 1; idx >= 0; idx -= 1) {
+    if (state.collapsedContainers.has(chain[idx])) {
+      return chain[idx];
+    }
+  }
+  return nodeId;
+}
+
+function computeSubgraphFilter() {
+  if (!state.rawGraph || !state.isolateActiveContext) {
+    return null;
+  }
+
+  if (state.traceMode && state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    const focusId = resolveEndpointByCollapse(state.selectedNodeId) || state.selectedNodeId;
+    const allowedNodeIds = new Set();
+    addNodeWithAncestors(allowedNodeIds, focusId);
+    addVisibleDescendants(allowedNodeIds, focusId);
+
+    const activeFlow = getActiveFlow();
+    const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
+
+    for (const edge of state.rawGraph.edges) {
+      if (
+        isUtilityNodeHidden(edge.source, activeFlowNodeSet)
+        || isUtilityNodeHidden(edge.target, activeFlowNodeSet)
+      ) {
+        continue;
+      }
+      const resolvedSrc = resolveEndpointByCollapse(edge.source);
+      const resolvedTgt = resolveEndpointByCollapse(edge.target);
+      if (!resolvedSrc || !resolvedTgt || resolvedSrc === resolvedTgt) {
+        continue;
+      }
+      if (resolvedSrc === focusId || allowedNodeIds.has(resolvedSrc)) {
+        addNodeWithAncestors(allowedNodeIds, resolvedTgt);
+      }
+      if (resolvedTgt === focusId || allowedNodeIds.has(resolvedTgt)) {
+        addNodeWithAncestors(allowedNodeIds, resolvedSrc);
+      }
+    }
+    return { allowedNodeIds, allowedRawEdgeIds: null, reason: "trace" };
+  }
+
+  if (state.activeFlowId) {
+    const flow = getActiveFlow();
+    if (!flow) {
+      return null;
+    }
+    const allowedNodeIds = new Set();
+    for (const nodeId of flow.node_ids || []) {
+      addNodeWithAncestors(allowedNodeIds, nodeId);
+    }
+    const allowedRawEdgeIds = new Set(flow.edge_ids || []);
+    return { allowedNodeIds, allowedRawEdgeIds, reason: "flow" };
+  }
+
+  return null;
+}
+
+function updateIsolateContextButtons() {
+  const hasContext = Boolean(state.traceMode || state.activeFlowId);
+  const isActive = hasContext && state.isolateActiveContext;
+
+  const toolbarBtn = document.getElementById("btn-isolate-context");
+  if (toolbarBtn) {
+    toolbarBtn.classList.toggle("hidden", !hasContext);
+    toolbarBtn.classList.toggle("active", isActive);
+    toolbarBtn.textContent = isActive ? "✓ Aislado en lienzo" : "Aislar en lienzo";
+  }
+
+  const inspectorBtn = document.getElementById("btn-inspector-isolate-flow");
+  if (inspectorBtn) {
+    inspectorBtn.classList.toggle("active", Boolean(state.activeFlowId && state.isolateActiveContext));
+    inspectorBtn.textContent = state.activeFlowId && state.isolateActiveContext ? "✓ Aislado" : "Aislar";
+  }
+
+  const traceBtn = document.getElementById("btn-trace-isolate");
+  if (traceBtn) {
+    traceBtn.classList.toggle("active", Boolean(state.traceMode && state.isolateActiveContext));
+    traceBtn.textContent = state.traceMode && state.isolateActiveContext ? "✓ Aislado" : "Aislar";
+  }
+}
+
+async function toggleIsolateActiveContext() {
+  if (!state.traceMode && !state.activeFlowId) {
+    return;
+  }
+  state.isolateActiveContext = !state.isolateActiveContext;
+  updateIsolateContextButtons();
+  await refreshGraphView({ fit: true });
+  if (state.selectedNodeId && state.cy) {
+    const cyNode = state.cy.getElementById(state.selectedNodeId);
+    if (cyNode && cyNode.length > 0) {
+      cyNode.select();
+    }
+  }
+}
+
+function toggleOnDemandEdges() {
+  state.onDemandEdges = !state.onDemandEdges;
+  const btn = document.getElementById("btn-on-demand-edges");
+  if (btn) {
+    btn.classList.toggle("active", state.onDemandEdges);
+  }
+  applyCanvasHighlights();
+}
+
 function buildVisibleElements() {
   const visibleNodeIds = new Set();
   const hiddenNodeIds = new Set();
@@ -1078,8 +1236,12 @@ function buildVisibleElements() {
 
   const { flow: activeFlow, nodeOrder: flowNodeOrder, edgeOrder: flowEdgeOrder } = getActiveFlowStepMaps();
   const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
+  const subgraphFilter = computeSubgraphFilter();
 
   for (const rawNode of state.rawGraph.nodes) {
+    if (subgraphFilter && !subgraphFilter.allowedNodeIds.has(rawNode.id)) {
+      continue;
+    }
     if (hasCollapsedAncestor(rawNode)) {
       continue;
     }
@@ -1094,7 +1256,7 @@ function buildVisibleElements() {
     const isExpandedFn = rawNode.type === "function" && state.expandedFunctions.has(rawNode.id);
     const effectiveRole = noteEntry.custom_role || rawNode.role || rawNode.type;
     const stepOrder = flowNodeOrder.get(rawNode.id) || null;
-    const isPinnedHere = isPinnedInCurrentContext(noteEntry);
+    const isPinnedHere = !subgraphFilter && isPinnedInCurrentContext(noteEntry);
 
     nodes.push({
       data: {
@@ -1127,7 +1289,12 @@ function buildVisibleElements() {
     }
   }
 
-  const edges = projectEdges(visibleNodeIds, hiddenNodeIds, flowEdgeOrder);
+  const edges = projectEdges(
+    visibleNodeIds,
+    hiddenNodeIds,
+    flowEdgeOrder,
+    subgraphFilter ? subgraphFilter.allowedRawEdgeIds : null,
+  );
   appendInternalFlowEdges(nodes, edges, visibleNodeIds);
 
   return { nodes, edges };
@@ -1324,10 +1491,18 @@ function buildProjectedEdgeLabel(item, flowStepOrder) {
   return parts.join(" · ");
 }
 
-function projectEdges(visibleNodeIds, hiddenNodeIds = new Set(), flowEdgeOrder = new Map()) {
+function projectEdges(
+  visibleNodeIds,
+  hiddenNodeIds = new Set(),
+  flowEdgeOrder = new Map(),
+  allowedRawEdgeIds = null,
+) {
   const grouped = new Map();
 
   for (const edge of state.rawGraph.edges) {
+    if (allowedRawEdgeIds && !allowedRawEdgeIds.has(edge.id)) {
+      continue;
+    }
     if (hiddenNodeIds.has(edge.source) || hiddenNodeIds.has(edge.target)) {
       continue;
     }
@@ -1416,7 +1591,7 @@ function initCytoscape() {
     maxZoom: 3,
   });
 
-  state.cy.on("tap", "node", (event) => {
+  state.cy.on("tap", "node", async (event) => {
     if (state.suppressNextTap) {
       return;
     }
@@ -1424,10 +1599,19 @@ function initCytoscape() {
     const data = event.target.data();
     const targetId = data.ownerFunctionId || data.id;
     const stepId = data.type === "flow" ? (data.stepId || null) : null;
+    const prevSelected = state.selectedNodeId;
     selectNode(targetId, stepId);
     if (state.traceMode) {
       state.traceDirection = "forward";
       state.traceBranchIndex = 0;
+      if (state.isolateActiveContext && prevSelected !== targetId) {
+        await refreshGraphView({ fit: true });
+        const reselected = state.cy.getElementById(targetId);
+        if (reselected && reselected.length > 0) {
+          reselected.select();
+        }
+        return;
+      }
     }
     applyCanvasHighlights();
   });
@@ -1443,8 +1627,28 @@ function initCytoscape() {
         state.cy.nodes().unselect();
         clearSelectionPanel();
       }
-      if (state.traceMode || state.activeFlowId) {
+      if (state.traceMode || state.activeFlowId || state.onDemandEdges) {
         applyCanvasHighlights();
+      }
+    }
+  });
+
+  state.cy.on("mouseover", "node", (event) => {
+    const data = event.target.data();
+    const anchorId = data.ownerFunctionId || data.id;
+    if (state.hoveredNodeId !== anchorId) {
+      state.hoveredNodeId = anchorId;
+      if (state.onDemandEdges) {
+        applyOnDemandEdgeHighlight();
+      }
+    }
+  });
+
+  state.cy.on("mouseout", "node", () => {
+    if (state.hoveredNodeId !== null) {
+      state.hoveredNodeId = null;
+      if (state.onDemandEdges) {
+        applyOnDemandEdgeHighlight();
       }
     }
   });
@@ -1550,6 +1754,11 @@ function bindEdgeTooltipEvents() {
 }
 
 async function handleNodeDragFree(cyNode) {
+  // Al arrastrar un nodo, sus aristas incidentes pasan a enrutamiento `taxi` dinámico
+  // para no conservar bendPoints antiguos de ELKjs.
+  const affectedNodes = cyNode.isParent() ? cyNode.union(cyNode.descendants()) : cyNode;
+  affectedNodes.connectedEdges().removeClass("elk-routed");
+
   const leafNodes = cyNode.isParent()
     ? cyNode.descendants().filter((item) => !item.isParent() && item.data("type") !== "flow")
     : [cyNode];
@@ -1843,7 +2052,7 @@ function buildStylesheet() {
       selector: "node:selected",
       style: { "border-width": 3.5, "border-color": "#38bdf8" },
     },
-    // Aristas
+    // Aristas (enrutamiento ortogonal ELKjs -> segments, con fallback taxi y bezier para auto-lazos)
     {
       selector: "edge",
       style: {
@@ -1851,13 +2060,39 @@ function buildStylesheet() {
         "line-color": "#64748b",
         "target-arrow-color": "#64748b",
         "target-arrow-shape": "triangle",
-        "curve-style": "bezier",
+        "curve-style": "taxi",
+        "taxi-direction": "downward",
+        "taxi-turn": "50%",
+        "taxi-turn-min-distance": 14,
+        "taxi-radius": 6,
         "label": "data(label)",
         "font-size": 10,
         "color": "#cbd5e1",
         "text-background-color": "#0f141b",
         "text-background-opacity": 0.85,
         "text-background-padding": 2,
+      },
+    },
+    {
+      selector: 'edge[taxiDir = "rightward"]',
+      style: {
+        "taxi-direction": "rightward",
+      },
+    },
+    {
+      selector: "edge.elk-routed",
+      style: {
+        "curve-style": "segments",
+        "edge-distances": "node-position",
+        "segment-weights": "data(segWeights)",
+        "segment-distances": "data(segDistances)",
+        "segment-radii": 6,
+      },
+    },
+    {
+      selector: "edge:loop",
+      style: {
+        "curve-style": "bezier",
       },
     },
     {
@@ -1972,6 +2207,48 @@ function buildStylesheet() {
       selector: ".dimmed",
       style: { "opacity": 0.15 },
     },
+    // Etapa 3: Modo "Aristas bajo demanda" (Hover / Selection Reveal)
+    {
+      selector: 'edge[kind = "call"].edge-muted',
+      style: {
+        "opacity": 0.1,
+        "text-opacity": 0,
+        "z-index": 1,
+      },
+    },
+    {
+      selector: 'edge[kind = "call"].edge-reveal-in',
+      style: {
+        "opacity": 1,
+        "text-opacity": 1,
+        "width": 2.8,
+        "line-color": "#22d3ee",
+        "target-arrow-color": "#22d3ee",
+        "color": "#cffafe",
+        "z-index": 35,
+      },
+    },
+    {
+      selector: 'edge[kind = "call"].edge-reveal-out',
+      style: {
+        "opacity": 1,
+        "text-opacity": 1,
+        "width": 2.8,
+        "line-color": "#f59e0b",
+        "target-arrow-color": "#f59e0b",
+        "color": "#fde68a",
+        "z-index": 35,
+      },
+    },
+    {
+      selector: 'edge[kind = "call"].edge-reveal-internal',
+      style: {
+        "opacity": 0.9,
+        "text-opacity": 1,
+        "width": 2.4,
+        "z-index": 25,
+      },
+    },
     {
       selector: ".export-hidden",
       style: { "display": "none" },
@@ -2076,6 +2353,7 @@ function buildStylesheet() {
 
 async function refreshGraphView({ fit = true } = {}) {
   hideEdgeTooltip();
+  state.hoveredNodeId = null;
   const { nodes, edges } = buildVisibleElements();
   const callEdges = edges.filter((e) => e.data && e.data.kind === "call");
   state.lastProjectedEdges = callEdges.map((e) => e.data);
@@ -2104,28 +2382,33 @@ async function runElkLayout(visibleNodes, visibleEdges) {
   const layouted = await state.elk.layout(elkGraph);
 
   const elkPositions = new Map();
-  collectAbsolutePositions(layouted, 0, 0, elkPositions);
+  const containerOffsets = new Map([["root", { x: 0, y: 0 }]]);
+  collectAbsolutePositions(layouted, 0, 0, elkPositions, containerOffsets);
 
   const contextKey = getCurrentLayoutContextKey();
+  const ignorePins = Boolean(computeSubgraphFilter());
+  const pinnedNodeIds = new Set();
 
   state.cy.batch(() => {
     state.cy.nodes().forEach((cyNode) => {
       if (cyNode.isParent()) {
         return;
       }
-      // Restauramos únicamente coordenadas pinned del nivel/contexto activo
-      // para evitar que anclajes de Nivel 2 distorsionen contenedores en Nivel 3+.
-      const noteEntry = getNoteEntry(cyNode.id());
-      const pinnedPos = getPinnedPositionForContext(noteEntry, contextKey);
-      if (pinnedPos) {
-        cyNode.position(pinnedPos);
-        return;
+      if (!ignorePins) {
+        const noteEntry = getNoteEntry(cyNode.id());
+        const pinnedPos = getPinnedPositionForContext(noteEntry, contextKey);
+        if (pinnedPos) {
+          cyNode.position(pinnedPos);
+          pinnedNodeIds.add(cyNode.id());
+          return;
+        }
       }
       const pos = elkPositions.get(cyNode.id());
       if (pos) {
         cyNode.position(pos);
       }
     });
+    applyElkEdgeRoutes(state.cy, layouted, elkPositions, containerOffsets, pinnedNodeIds, "downward");
   });
 }
 
@@ -2283,7 +2566,7 @@ function estimateNodeSize(data) {
   return { width, height };
 }
 
-function collectAbsolutePositions(elkNode, offsetX, offsetY, outMap) {
+function collectAbsolutePositions(elkNode, offsetX, offsetY, outMap, containerOffsets = null) {
   if (!elkNode.children) {
     return;
   }
@@ -2291,13 +2574,146 @@ function collectAbsolutePositions(elkNode, offsetX, offsetY, outMap) {
     const absX = offsetX + (child.x || 0);
     const absY = offsetY + (child.y || 0);
     if (child.children && child.children.length > 0) {
-      collectAbsolutePositions(child, absX, absY, outMap);
+      if (containerOffsets) {
+        containerOffsets.set(child.id, { x: absX, y: absY });
+      }
+      collectAbsolutePositions(child, absX, absY, outMap, containerOffsets);
     } else {
       outMap.set(child.id, {
         x: absX + (child.width || 125) / 2,
         y: absY + (child.height || 44) / 2,
       });
     }
+  }
+}
+
+function convertElkPointsToCytoscapeSegments(points, srcPos, tgtPos) {
+  const dx = tgtPos.x - srcPos.x;
+  const dy = tgtPos.y - srcPos.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 4) {
+    return null;
+  }
+  const len = Math.sqrt(lenSq);
+  const weights = [];
+  const distances = [];
+  let prev = null;
+
+  for (const pt of points) {
+    if (!pt || typeof pt.x !== "number" || typeof pt.y !== "number") {
+      continue;
+    }
+    if (prev && Math.hypot(pt.x - prev.x, pt.y - prev.y) < 1.5) {
+      continue;
+    }
+    const vx = pt.x - srcPos.x;
+    const vy = pt.y - srcPos.y;
+    const w = (vx * dx + vy * dy) / lenSq;
+    // Inversa exacta del vector normal en Cytoscape (`vectorNormInverse = { x: -dy/len, y: dx/len }`).
+    const d = (vx * (-dy) + vy * dx) / len;
+    if (!Number.isFinite(w) || !Number.isFinite(d)) {
+      continue;
+    }
+    weights.push(Math.round(w * 10000) / 10000);
+    distances.push(Math.round(d * 100) / 100);
+    prev = pt;
+    if (weights.length >= 16) {
+      break;
+    }
+  }
+  if (weights.length === 0) {
+    return null;
+  }
+  return { weights, distances };
+}
+
+function collectAllLayoutedEdges(elkNode, outList) {
+  if (Array.isArray(elkNode.edges)) {
+    for (const edge of elkNode.edges) {
+      outList.push(edge);
+    }
+  }
+  if (Array.isArray(elkNode.children)) {
+    for (const child of elkNode.children) {
+      collectAllLayoutedEdges(child, outList);
+    }
+  }
+}
+
+function applyElkEdgeRoutes(
+  cy,
+  layouted,
+  elkPositions,
+  containerOffsets,
+  pinnedNodeIds = new Set(),
+  defaultDirection = "downward",
+) {
+  if (!cy || !layouted) {
+    return;
+  }
+  const allElkEdges = [];
+  collectAllLayoutedEdges(layouted, allElkEdges);
+
+  for (const elkEdge of allElkEdges) {
+    const cyEdge = cy.getElementById(elkEdge.id);
+    if (!cyEdge || cyEdge.length === 0) {
+      continue;
+    }
+    cyEdge.data("taxiDir", defaultDirection);
+    if (cyEdge.isLoop()) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
+
+    const srcNode = cyEdge.source();
+    const tgtNode = cyEdge.target();
+    const srcId = srcNode.id();
+    const tgtId = tgtNode.id();
+
+    if (
+      srcNode.isParent()
+      || tgtNode.isParent()
+      || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
+    ) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
+
+    const section = Array.isArray(elkEdge.sections) ? elkEdge.sections[0] : null;
+    const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
+    if (!section || rawBends.length === 0) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
+
+    const srcPos = elkPositions.get(srcId);
+    const tgtPos = elkPositions.get(tgtId);
+    if (!srcPos || !tgtPos) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
+
+    const offset = (containerOffsets && containerOffsets.get(elkEdge.container || "root")) || { x: 0, y: 0 };
+    const absPoints = [];
+    if (section.startPoint) {
+      absPoints.push({ x: section.startPoint.x + offset.x, y: section.startPoint.y + offset.y });
+    }
+    for (const bp of rawBends) {
+      absPoints.push({ x: bp.x + offset.x, y: bp.y + offset.y });
+    }
+    if (section.endPoint) {
+      absPoints.push({ x: section.endPoint.x + offset.x, y: section.endPoint.y + offset.y });
+    }
+
+    const segments = convertElkPointsToCytoscapeSegments(absPoints, srcPos, tgtPos);
+    if (!segments) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
+
+    cyEdge.data("segWeights", segments.weights);
+    cyEdge.data("segDistances", segments.distances);
+    cyEdge.addClass("elk-routed");
   }
 }
 
@@ -2312,8 +2728,10 @@ function applyCanvasHighlights() {
   }
   const all = state.cy.elements();
   all.removeClass(
-    "dimmed trace-focus trace-caller trace-callee trace-branch-active flow-active flow-root flow-active-edge",
+    "dimmed trace-focus trace-caller trace-callee trace-branch-active flow-active flow-root flow-active-edge edge-muted edge-reveal-in edge-reveal-out edge-reveal-internal",
   );
+
+  updateIsolateContextButtons();
 
   if (state.traceMode) {
     applyTraceHighlight();
@@ -2323,6 +2741,61 @@ function applyCanvasHighlights() {
   if (state.activeFlowId) {
     applyExecutionFlowHighlight();
   }
+  if (state.onDemandEdges) {
+    applyOnDemandEdgeHighlight();
+  }
+}
+
+function applyOnDemandEdgeHighlight() {
+  if (!state.cy) {
+    return;
+  }
+  const callEdges = state.cy.edges('edge[kind = "call"]');
+  callEdges.removeClass("edge-muted edge-reveal-in edge-reveal-out edge-reveal-internal");
+  if (!state.onDemandEdges || state.traceMode) {
+    return;
+  }
+
+  // Atenuar aristas no prioritarias (respetando las de un hilo activo si lo hay).
+  callEdges.forEach((edge) => {
+    if (!edge.hasClass("flow-active-edge")) {
+      edge.addClass("edge-muted");
+    }
+  });
+
+  const anchorIds = [];
+  if (state.selectedNodeId) {
+    anchorIds.push(state.selectedNodeId);
+  }
+  if (state.hoveredNodeId && state.hoveredNodeId !== state.selectedNodeId) {
+    anchorIds.push(state.hoveredNodeId);
+  }
+
+  for (const anchorId of anchorIds) {
+    const anchor = state.cy.getElementById(anchorId);
+    if (!anchor || anchor.length === 0) {
+      continue;
+    }
+    const scope = anchor.isParent() ? anchor.union(anchor.descendants()) : anchor;
+    const scopeIds = new Set();
+    scope.forEach((n) => scopeIds.add(n.id()));
+
+    scope.connectedEdges('edge[kind = "call"]').forEach((edge) => {
+      const srcIn = scopeIds.has(edge.source().id());
+      const tgtIn = scopeIds.has(edge.target().id());
+      edge.removeClass("edge-muted");
+      if (!state.activeFlowId) {
+        edge.removeClass("dimmed");
+      }
+      if (srcIn && tgtIn) {
+        edge.addClass("edge-reveal-internal");
+      } else if (tgtIn) {
+        edge.addClass("edge-reveal-in");
+      } else if (srcIn) {
+        edge.addClass("edge-reveal-out");
+      }
+    });
+  }
 }
 
 function applyExecutionFlowHighlight() {
@@ -2330,10 +2803,13 @@ function applyExecutionFlowHighlight() {
   if (!flow || !state.cy) {
     return;
   }
+  const isIsolated = Boolean(state.isolateActiveContext);
   const flowNodeSet = new Set(flow.node_ids || []);
   const flowEdgeSet = new Set(flow.edge_ids || []);
   const all = state.cy.elements();
-  all.addClass("dimmed");
+  if (!isIsolated) {
+    all.addClass("dimmed");
+  }
 
   for (const nodeId of flowNodeSet) {
     const cyNode = state.cy.getElementById(nodeId);
@@ -2356,13 +2832,17 @@ function applyExecutionFlowHighlight() {
   });
 }
 
-function toggleTraceMode() {
+async function toggleTraceMode() {
+  const wasIsolated = state.isolateActiveContext;
   state.traceMode = !state.traceMode;
   state.traceDirection = "forward";
   state.traceBranchIndex = 0;
   if (!state.traceMode) {
     state.traceHistory = [];
     state.traceBranchCandidates = [];
+    if (!state.activeFlowId) {
+      state.isolateActiveContext = false;
+    }
   }
   document.getElementById("btn-trace").classList.toggle("active", state.traceMode);
 
@@ -2375,10 +2855,25 @@ function toggleTraceMode() {
     if (!fallback || fallback.length === 0) {
       fallback = state.cy.nodes('node[type = "function"]').first();
     }
+    if (!fallback || fallback.length === 0) {
+      fallback = state.cy.nodes('node[type = "file"]').first();
+    }
     if (fallback && fallback.length > 0) {
       fallback.select();
       selectNode(fallback.id());
     }
+  }
+
+  updateIsolateContextButtons();
+  if (wasIsolated || state.isolateActiveContext) {
+    await refreshGraphView({ fit: true });
+    if (state.selectedNodeId && state.cy) {
+      const sel = state.cy.getElementById(state.selectedNodeId);
+      if (sel && sel.length > 0) {
+        sel.select();
+      }
+    }
+    return;
   }
 
   applyCanvasHighlights();
@@ -2511,7 +3006,9 @@ function applyTraceHighlight() {
   const outEdges = focus.outgoers('edge[kind = "call"]');
   const callees = outEdges.targets();
 
-  all.addClass("dimmed");
+  if (!state.isolateActiveContext) {
+    all.addClass("dimmed");
+  }
   focus.removeClass("dimmed").addClass("trace-focus");
   inEdges.removeClass("dimmed").addClass("trace-caller");
   callers.removeClass("dimmed").addClass("trace-caller");
@@ -2542,8 +3039,11 @@ function cycleTraceBranch(delta) {
   applyTraceCandidateHighlight();
 }
 
-function jumpTraceToNode(targetNode, pushHistory) {
-  if (!targetNode || targetNode.length === 0) {
+async function jumpTraceToNode(targetNodeOrId, pushHistory) {
+  const targetId = typeof targetNodeOrId === "string"
+    ? targetNodeOrId
+    : (targetNodeOrId && targetNodeOrId.length > 0 ? targetNodeOrId.id() : null);
+  if (!targetId || !state.nodesById.has(targetId)) {
     return;
   }
   if (pushHistory && state.selectedNodeId) {
@@ -2551,14 +3051,28 @@ function jumpTraceToNode(targetNode, pushHistory) {
   }
   state.traceDirection = "forward";
   state.traceBranchIndex = 0;
+  selectNode(targetId);
+
+  if (state.isolateActiveContext) {
+    await refreshGraphView({ fit: true });
+    const isolatedTarget = state.cy.getElementById(targetId);
+    if (isolatedTarget && isolatedTarget.length > 0) {
+      isolatedTarget.select();
+    }
+    return;
+  }
+
+  const targetNode = state.cy.getElementById(targetId);
+  if (!targetNode || targetNode.length === 0) {
+    return;
+  }
   state.cy.nodes().unselect();
   targetNode.select();
-  selectNode(targetNode.id());
   applyCanvasHighlights();
   state.cy.animate({ center: { eles: targetNode }, duration: 180 });
 }
 
-function confirmTraceBranch() {
+async function confirmTraceBranch() {
   if (!state.traceMode || !state.selectedNodeId) {
     return;
   }
@@ -2566,11 +3080,10 @@ function confirmTraceBranch() {
   if (!picked) {
     return;
   }
-  const target = state.cy.getElementById(picked.nodeId);
-  jumpTraceToNode(target, state.traceDirection === "forward");
+  await jumpTraceToNode(picked.nodeId, state.traceDirection === "forward");
 }
 
-function stepTrace(direction) {
+async function stepTrace(direction) {
   if (!state.traceMode || !state.selectedNodeId) {
     return;
   }
@@ -2585,26 +3098,25 @@ function stepTrace(direction) {
       state.traceBranchIndex = 0;
       applyTraceHighlight();
     }
-    confirmTraceBranch();
+    await confirmTraceBranch();
     return;
   }
 
   if (direction === "backward") {
     if (state.traceDirection === "backward" && state.traceBranchCandidates.length > 0) {
-      confirmTraceBranch();
+      await confirmTraceBranch();
       return;
     }
     if (state.traceHistory.length > 0) {
       const prevId = state.traceHistory.pop();
-      const candidate = state.cy.getElementById(prevId);
-      if (candidate && candidate.length > 0) {
-        jumpTraceToNode(candidate, false);
+      if (prevId && state.nodesById.has(prevId)) {
+        await jumpTraceToNode(prevId, false);
         return;
       }
     }
     const callers = collectTraceCandidates(focus, "backward");
     if (callers.length === 1) {
-      jumpTraceToNode(state.cy.getElementById(callers[0].nodeId), false);
+      await jumpTraceToNode(callers[0].nodeId, false);
     } else if (callers.length > 1) {
       state.traceDirection = "backward";
       state.traceBranchIndex = 0;
@@ -3851,7 +4363,10 @@ function hasActiveFocusOrFlow() {
   if (!state.cy) {
     return false;
   }
-  return Boolean(state.traceMode || state.activeFlowId) && state.cy.elements(".dimmed").length > 0;
+  if (!state.traceMode && !state.activeFlowId) {
+    return false;
+  }
+  return Boolean(computeSubgraphFilter()) || state.cy.elements(".dimmed").length > 0;
 }
 
 function openExportModal() {
@@ -4331,6 +4846,22 @@ function bindControls() {
   document.getElementById("btn-fit").addEventListener("click", fitGraphToScreen);
   document.getElementById("btn-trace").addEventListener("click", toggleTraceMode);
   document.getElementById("btn-hide-utilities").addEventListener("click", toggleHideUtilities);
+  const onDemandBtn = document.getElementById("btn-on-demand-edges");
+  if (onDemandBtn) {
+    onDemandBtn.addEventListener("click", toggleOnDemandEdges);
+  }
+  const isolateContextBtn = document.getElementById("btn-isolate-context");
+  if (isolateContextBtn) {
+    isolateContextBtn.addEventListener("click", toggleIsolateActiveContext);
+  }
+  const inspectorIsolateFlowBtn = document.getElementById("btn-inspector-isolate-flow");
+  if (inspectorIsolateFlowBtn) {
+    inspectorIsolateFlowBtn.addEventListener("click", toggleIsolateActiveContext);
+  }
+  const traceIsolateBtn = document.getElementById("btn-trace-isolate");
+  if (traceIsolateBtn) {
+    traceIsolateBtn.addEventListener("click", toggleIsolateActiveContext);
+  }
   document.getElementById("btn-search").addEventListener("click", openSearchModal);
   document.getElementById("btn-orphans").addEventListener("click", openOrphansModal);
   document.getElementById("btn-close-orphans").addEventListener("click", closeOrphansModal);
@@ -5146,7 +5677,8 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
 
   const layouted = await state.elk.layout(elkGraph);
   const elkPositions = new Map();
-  collectAbsolutePositions(layouted, 0, 0, elkPositions);
+  const containerOffsets = new Map([["root", { x: 0, y: 0 }]]);
+  collectAbsolutePositions(layouted, 0, 0, elkPositions, containerOffsets);
 
   subCy.batch(() => {
     subCy.nodes().forEach((cyNode) => {
@@ -5158,6 +5690,14 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
         cyNode.position(pos);
       }
     });
+    applyElkEdgeRoutes(
+      subCy,
+      layouted,
+      elkPositions,
+      containerOffsets,
+      null,
+      isFunctionFlow ? "downward" : "rightward",
+    );
   });
   subCy.resize();
   subCy.fit(undefined, 22);

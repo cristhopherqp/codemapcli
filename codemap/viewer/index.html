@@ -29,6 +29,7 @@
         <select id="flow-select" class="flow-select" title="Seleccionar hilo de ejecución (Arranque o Feature)">
           <option value="">Hilo: Todos</option>
         </select>
+        <button id="btn-isolate-context" class="isolate-context-btn hidden" type="button" title="Aislar únicamente el hilo o foco activo en el lienzo">Aislar en lienzo</button>
         <button id="btn-clear-flow" class="flow-clear-btn hidden" type="button" title="Volver a mostrar todos los hilos">×</button>
       </div>
 
@@ -59,6 +60,10 @@
           <span class="tool-icon" aria-hidden="true">🧹</span>
           <span id="utilities-label-text" class="tool-label">Ocultar utilitarios (0)</span>
           <span id="utilities-count-badge" class="tool-badge hidden">0</span>
+        </button>
+        <button id="btn-on-demand-edges" class="action-btn sidebar-btn" type="button" title="Aristas bajo demanda: atenúa conexiones y revela entrantes (cian) / salientes (ámbar) al pasar el cursor o seleccionar">
+          <span class="tool-icon" aria-hidden="true">〰️</span>
+          <span class="tool-label">Aristas bajo demanda</span>
         </button>
         <button id="btn-search" class="action-btn sidebar-btn" type="button" title="Buscar nodo o nota (Ctrl+K)">
           <span class="tool-icon" aria-hidden="true">🔍</span>
@@ -103,6 +108,7 @@
           <button id="btn-trace-prev" class="trace-hud-btn" type="button" title="Rama anterior (↑)">↑</button>
           <button id="btn-trace-next" class="trace-hud-btn" type="button" title="Siguiente rama (↓)">↓</button>
           <button id="btn-trace-go" class="trace-hud-btn primary" type="button" title="Saltar a la rama seleccionada (→ o Enter)">Ir →</button>
+          <button id="btn-trace-isolate" class="trace-hud-btn" type="button" title="Aislar el foco y sus conexiones en el lienzo">Aislar</button>
         </div>
       </div>
       <div id="file-isolation-hud" class="file-isolation-hud hidden" role="status" aria-live="polite">
@@ -164,7 +170,10 @@
             <span id="active-flow-kind-badge" class="flow-badge"></span>
             <h3 id="active-flow-title" class="active-flow-title"></h3>
           </div>
-          <button id="btn-inspector-clear-flow" class="call-action-btn" type="button" title="Volver a Todos">Todos</button>
+          <div class="active-flow-actions">
+            <button id="btn-inspector-isolate-flow" class="call-action-btn" type="button" title="Aislar únicamente este hilo en el lienzo">Aislar</button>
+            <button id="btn-inspector-clear-flow" class="call-action-btn" type="button" title="Volver a Todos">Todos</button>
+          </div>
         </div>
         <p id="active-flow-sub" class="active-flow-sub"></p>
         <ol id="active-flow-steps" class="active-flow-steps"></ol>
