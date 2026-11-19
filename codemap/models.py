@@ -49,7 +49,7 @@ class FlowStep:
     code: str = ""
     parent_id: str | None = None
     is_container: bool = False
-    kind: str = "step"  # "step" | "loop" | "merge" | "except"
+    kind: str = "step"  # "step" | "loop" | "event" | "merge" | "except"
     edges: list[FlowEdge] = field(default_factory=list)
 
 

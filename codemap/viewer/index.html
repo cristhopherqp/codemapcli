@@ -74,9 +74,9 @@
           <span id="apis-label-text" class="tool-label">APIs (0 pendientes / 0 aprendidas)</span>
           <span id="apis-count-badge" class="tool-badge">0/0</span>
         </button>
-        <button id="btn-export-image" class="action-btn sidebar-btn" type="button" title="Exportar captura del grafo (PNG / JPG)">
+        <button id="btn-export-image" class="action-btn sidebar-btn" type="button" title="Exportar captura (PNG / JPG) o contexto compacto para IA">
           <span class="tool-icon" aria-hidden="true">📷</span>
-          <span class="tool-label">Exportar imagen</span>
+          <span class="tool-label">Exportar (Imagen / IA)</span>
         </button>
         <button id="btn-relayout" class="action-btn sidebar-btn" type="button" title="Reordenar nodos no fijados (Tecla R)">
           <span class="tool-icon" aria-hidden="true">✨</span>
@@ -124,6 +124,7 @@
             <span class="legend-item"><span class="shape shape-io"></span>I/O</span>
             <span class="legend-item"><span class="shape shape-html"></span>HTML</span>
             <span class="legend-item"><span class="shape shape-loop"></span>🔁 Bucle / Callback</span>
+            <span class="legend-item"><span class="shape shape-event-flow"></span>⚡ Evento / Listener</span>
           </div>
           <div class="legend-section">
             <span class="legend-title">Aristas</span>
@@ -318,11 +319,11 @@
     </div>
   </div>
 
-  <!-- Modal de Exportación de Capturas (PNG / JPG) -->
-  <div id="export-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Exportar imagen del grafo">
+  <!-- Modal de Exportación (Capturas PNG/JPG y Contexto para IA) -->
+  <div id="export-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Exportar grafo">
     <div class="modal-card modal-card-compact">
       <div class="modal-titlebar">
-        <h2>Exportar Captura del Grafo</h2>
+        <h2>Exportar Grafo (Imagen / IA)</h2>
         <button id="btn-close-export" type="button">Cerrar</button>
       </div>
       <div class="export-modal-body">
@@ -358,6 +359,35 @@
           <div class="export-option-actions">
             <button id="btn-export-focus-png" type="button" class="call-action-btn" disabled>PNG</button>
             <button id="btn-export-focus-jpg" type="button" class="call-action-btn" disabled>JPG</button>
+          </div>
+        </div>
+
+        <div class="export-section-divider">
+          <span>Contexto compacto para IA</span>
+          <label class="export-checkbox-label" title="Incluye pasos intra-función (Nivel 3+) en la exportación para IA">
+            <input id="export-ai-include-flow" type="checkbox" />
+            Incluir flujo interno (3+)
+          </label>
+        </div>
+
+        <div class="export-option-row">
+          <div class="export-option-info">
+            <strong>JSON minificado para IA</strong>
+            <span>Grafo podado sin claves neutras ni URLs redundantes (<code>.ai.json</code>).</span>
+          </div>
+          <div class="export-option-actions">
+            <button id="btn-export-ai-json" type="button" class="call-action-btn">Exportar JSON para IA</button>
+          </div>
+        </div>
+
+        <div class="export-option-row">
+          <div class="export-option-info">
+            <strong>Resumen IA (Markdown)</strong>
+            <span>Diagrama Mermaid, puntos de entrada, hilos y firmas por archivo.</span>
+          </div>
+          <div class="export-option-actions">
+            <button id="btn-copy-ai-md" type="button" class="call-action-btn">Copiar Markdown</button>
+            <button id="btn-export-ai-md" type="button" class="call-action-btn">.md</button>
           </div>
         </div>
 

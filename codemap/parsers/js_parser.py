@@ -68,6 +68,7 @@ from codemap.roles import (
     is_reactive_registrar,
     is_route_registrar,
     is_server_call,
+    is_startup_hook_call,
     is_static_mount_call,
     looks_like_event_handler_name,
     looks_like_main_entry_name,
@@ -241,6 +242,8 @@ class FunctionNode:
     callback_kind: str | None = None  # "main" | "route_handler" | "event_handler" | None
     callback_event: str = ""
     callback_via: str = ""
+    callback_hook_label: str = ""
+    callback_hook_code: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +322,69 @@ def _extract_first_string_arg(call: Node, source: bytes) -> str:
     return ""
 
 
+def _extract_short_non_fn_args(
+    call: Node,
+    source: bytes,
+    *,
+    max_args: int = 2,
+    max_arg_chars: int = 20,
+    include_strings: bool = False,
+) -> list[str]:
+    """Extrae argumentos cortos no-función que aportan contexto (ej. PORT, 3000, config.port)."""
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None:
+        return []
+    extracted: list[str] = []
+    for arg in arguments.named_children:
+        if arg.type in FUNCTION_VALUE_TYPES:
+            continue
+        raw = ""
+        if arg.type in ("identifier", "number"):
+            raw = node_text(arg, source).strip()
+        elif arg.type == "member_expression":
+            raw = normalize_callee(node_text(arg, source))
+        elif include_strings and arg.type == "string":
+            raw = collapse_whitespace(node_text(arg, source))
+        elif include_strings and arg.type == "template_string" and not any(
+            c.type == "template_substitution" for c in arg.named_children
+        ):
+            raw = collapse_whitespace(node_text(arg, source))
+        if not raw or raw in IGNORED_CALLBACK_REFS or len(raw) > max_arg_chars:
+            continue
+        extracted.append(raw)
+        if len(extracted) >= max_args:
+            break
+    return extracted
+
+
+def _format_callback_hook(call: Node, callee: Node, callback: Node, source: bytes) -> tuple[str, str]:
+    """Construye la etiqueta y código del paso disparador `⚡ Hook: ...` para callbacks de módulo."""
+    ctx = normalize_callee(node_text(callee, source))
+    arguments = call.child_by_field_name("arguments")
+    arg_parts: list[str] = []
+    cb_key = node_key(callback)
+    if arguments is not None:
+        for arg in arguments.named_children:
+            if node_key(arg) == cb_key:
+                arg_parts.append("<callback>")
+            elif arg.type in FUNCTION_VALUE_TYPES:
+                arg_parts.append("<fn>")
+            else:
+                text = collapse_whitespace(node_text(arg, source))
+                if len(text) > 24:
+                    text = text[:23].rstrip() + "…"
+                arg_parts.append(text)
+    call_sig = f"{ctx}({', '.join(arg_parts)})"
+    label = flow_label(f"⚡ Hook: {call_sig}")
+    return label, call_sig
+
+
 def collect_module_callbacks(
     root: Node, source: bytes, language: str, functions: dict[NodeKey, FunctionNode]
 ) -> None:
     """Registra callbacks anónimos de nivel de módulo, nombrados por contexto y línea:
-    app.get('/users', (req, res) => ...)  ->  "app.get[/users]@L12".
+    app.get('/users', (req, res) => ...)  ->  "app.get[/users]@L12"
+    server.listen(PORT, () => ...)        ->  "server.listen(PORT)@L94".
     Se procesan en orden de aparición, así un callback dentro de otro ya
     registrado queda como parte del exterior."""
     matches = run_matches(language, CALLBACK_QUERY, root)
@@ -340,15 +401,16 @@ def collect_module_callbacks(
         first_str = _extract_first_string_arg(call, source)
         cb_kind: str | None = None
         cb_event = first_str
-        if is_boot_event_name(first_str):
+        if is_boot_event_name(first_str) or is_startup_hook_call(outer_callee):
             cb_kind = ENTRY_KIND_MAIN
         elif is_route_registrar(outer_callee, first_str):
             cb_kind = ENTRY_KIND_ROUTE
             if not cb_event and outer_callee.rsplit(".", 1)[-1] == "createServer":
                 cb_event = "http:request"
-        elif is_event_registrar(outer_callee, first_str):
+        elif is_event_registrar(outer_callee, first_str) or is_reactive_registrar(outer_callee):
             cb_kind = ENTRY_KIND_EVENT
         name = callback_name(call, callee, callback, source)
+        hook_label, hook_code = _format_callback_hook(call, callee, callback, source)
         functions[node_key(callback)] = FunctionNode(
             callback,
             name,
@@ -357,6 +419,8 @@ def collect_module_callbacks(
             callback_kind=cb_kind,
             callback_event=cb_event,
             callback_via=outer_callee,
+            callback_hook_label=hook_label,
+            callback_hook_code=hook_code,
         )
 
 
@@ -365,6 +429,13 @@ def callback_name(call: Node, callee: Node, callback: Node, source: bytes) -> st
     route = _extract_first_string_arg(call, source)
     if route:
         context += f"[{route}]"
+    else:
+        short_args = _extract_short_non_fn_args(call, source, max_args=2, max_arg_chars=18)
+        if short_args:
+            joined = ", ".join(short_args)
+            if len(joined) > 24:
+                joined = short_args[0]
+            context += f"({joined})"
     return f"{context}@L{line_of(callback)}"
 
 
@@ -475,7 +546,14 @@ def build_function(
         docstring=extract_jsdoc(candidate.anchor, source),
         param_count=len(params),
         calls=calls,
-        internal_flow=build_flow(params, body, source, functions),
+        internal_flow=build_flow(
+            params,
+            body,
+            source,
+            functions,
+            hook_label=candidate.callback_hook_label if candidate.is_callback else "",
+            hook_code=candidate.callback_hook_code if candidate.is_callback else "",
+        ),
         branch_count=metrics.branch_count,
         return_count=metrics.return_count,
         has_io=has_io,
@@ -834,11 +912,23 @@ def build_flow(
     body: Node | None,
     source: bytes,
     functions: dict[NodeKey, FunctionNode],
+    *,
+    hook_label: str = "",
+    hook_code: str = "",
 ) -> list[FlowStep]:
     builder = FlowGraphBuilder(FLOW_MAX_STEPS)
+    pending: list[PendingExit] = []
+    if hook_label:
+        _, pending = builder.emit_sequential(
+            pending,
+            ROLE_ENTRY,
+            flow_label(hook_label),
+            code=hook_code or hook_label,
+            kind="event",
+        )
     param_summary = ", ".join(params) or "∅"
     _, pending = builder.emit_sequential(
-        [], ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+        pending, ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
     )
     if body is None:
         return builder.steps
@@ -1329,6 +1419,40 @@ def shallow_call_role(call_node: Node, source: bytes) -> str:
     return ROLE_TRANSFORM
 
 
+def _extract_dom_or_receiver_target(call_node: Node, source: bytes) -> str:
+    """Extrae un objetivo legible del receptor de un listener/evento.
+
+    Ejemplos:
+      - `document.getElementById('viewGalleryBtn')?.addEventListener(...)` -> `#viewGalleryBtn`
+      - `document.querySelector('.filter-btn')?.addEventListener(...)`     -> `.filter-btn`
+      - `dropZone.addEventListener(...)`                                   -> `dropZone`
+    """
+    callee = call_node.child_by_field_name("function")
+    if callee is None or callee.type != "member_expression":
+        return ""
+    obj = callee.child_by_field_name("object")
+    if obj is None:
+        return ""
+    if obj.type == "call_expression":
+        inner_fn = obj.child_by_field_name("function")
+        inner_name = normalize_callee(node_text(inner_fn, source)) if inner_fn is not None else ""
+        tail = inner_name.rsplit(".", 1)[-1]
+        selector = _extract_first_string_arg(obj, source)
+        if selector:
+            if tail == "getElementById":
+                return selector if selector.startswith("#") else f"#{selector}"
+            if tail in ("querySelector", "querySelectorAll", "closest"):
+                return selector
+            if tail == "getElementsByClassName":
+                return selector if selector.startswith(".") else f".{selector}"
+            if tail == "getElementsByTagName":
+                return f"<{selector}>"
+        if inner_name:
+            return f"{inner_name}()"
+        return ""
+    return normalize_callee(node_text(obj, source))
+
+
 def emit_callback_steps(
     stmt: Node,
     callbacks: list[tuple[Node, Node]],
@@ -1338,21 +1462,50 @@ def emit_callback_steps(
     pending: list[PendingExit],
     parent_id: str | None = None,
 ) -> list[PendingExit]:
-    """Emite un sub-contenedor 🔁 para cada callback y coloca dentro sus pasos limpios."""
+    """Emite un sub-contenedor `⚡` (eventos/suscripciones) o `🔁` (iteradores/callbacks)
+    y coloca dentro sus pasos limpios."""
     current = pending
     for idx, (call_node, cb_node) in enumerate(callbacks):
-        call_title = callback_call_title(call_node, source)
+        callee_node = call_node.child_by_field_name("function")
+        full_callee = normalize_callee(node_text(callee_node, source)) if callee_node is not None else "callback"
+        first_str = _extract_first_string_arg(call_node, source)
+        cb_kind, event_label = classify_callback_container(full_callee, first_str)
+        is_event_cb = (
+            cb_kind in (EDGE_EVENT_LISTENER, EDGE_REACTIVE_SUBSCRIBE)
+            or is_startup_hook_call(full_callee)
+        )
+
         cb_params_node = cb_node.child_by_field_name("parameters") or cb_node.child_by_field_name("parameter")
         cb_params = parameter_names(cb_params_node, source)
-        params_label = ", ".join(cb_params) or "∅"
+        params_suffix = f"({', '.join(cb_params)})" if cb_params else ""
 
-        lead = ""
-        if idx == 0 and stmt.type in ("return_statement", "throw_statement", *FLOW_DECLARATION_TYPES):
-            raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
-            if raw_lead and len(raw_lead) <= 40:
-                lead = f"{raw_lead} "
+        if is_event_cb:
+            target_label = _extract_dom_or_receiver_target(call_node, source)
+            if event_label and target_label:
+                header_label = flow_label(f"⚡ {event_label} · {target_label}{params_suffix}")
+            elif event_label:
+                call_title = callback_call_title(call_node, source)
+                header_label = flow_label(f"⚡ {event_label} · {call_title}{params_suffix}")
+            elif is_startup_hook_call(full_callee):
+                short_args = _extract_short_non_fn_args(call_node, source, max_args=2, max_arg_chars=18)
+                args_part = ", ".join(short_args) if short_args else ", ".join(cb_params)
+                header_label = flow_label(
+                    f"⚡ {full_callee}({args_part})" if args_part else f"⚡ {full_callee}"
+                )
+            else:
+                header_label = flow_label(f"⚡ {full_callee}{params_suffix}")
+            step_kind = "event"
+        else:
+            call_title = callback_call_title(call_node, source)
+            params_label = ", ".join(cb_params) or "∅"
+            lead = ""
+            if idx == 0 and stmt.type in ("return_statement", "throw_statement", *FLOW_DECLARATION_TYPES):
+                raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
+                if raw_lead and len(raw_lead) <= 40:
+                    lead = f"{raw_lead} "
+            header_label = flow_label(f"🔁 {lead}{call_title}({params_label})")
+            step_kind = "loop"
 
-        header_label = f"🔁 {lead}{call_title}({params_label})"
         code_node = stmt if (idx == 0 and len(callbacks) == 1) else call_node
         cb_step, current = builder.emit_sequential(
             current,
@@ -1361,7 +1514,7 @@ def emit_callback_steps(
             code=dedent_code(node_text(code_node, source)),
             parent_id=parent_id,
             is_container=True,
-            kind="loop",
+            kind=step_kind,
         )
         if cb_step is None:
             return current
@@ -1395,15 +1548,18 @@ def declares_only_functions(node: Node, functions: dict[NodeKey, FunctionNode]) 
 def header_text(node: Node, source: bytes) -> str:
     """Cabecera legible: 'if (x > 0)', 'for (const a of b)', 'case 1', 'catch (e)'."""
     if node.type == "switch_case":
-        return "case " + flow_label(node_text(node.child_by_field_name("value"), source))
+        return flow_label("case " + collapse_whitespace(node_text(node.child_by_field_name("value"), source)))
     if node.type == "switch_default":
         return "default"
     if node.type == "do_statement":
-        return "do … while " + flow_label(node_text(node.child_by_field_name("condition"), source))
+        return flow_label(
+            "do … while " + collapse_whitespace(node_text(node.child_by_field_name("condition"), source))
+        )
     body = node.child_by_field_name("body") or node.child_by_field_name("consequence")
     raw = text_between(source, node, body) if body is not None else node_text(node, source)
-    cleaned = flow_label(raw).rstrip("{").rstrip(":").strip()
-    return re.sub(r"\s+\)", ")", cleaned)
+    cleaned = collapse_whitespace(raw).rstrip("{").rstrip(":").strip()
+    cleaned = re.sub(r"\s+\)", ")", cleaned)
+    return flow_label(cleaned)
 
 
 def step_role(node: Node, source: bytes, functions: dict[NodeKey, FunctionNode]) -> str:

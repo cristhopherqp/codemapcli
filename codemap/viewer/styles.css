@@ -379,6 +379,13 @@ button:hover {
   background: rgba(56, 189, 248, 0.14);
 }
 
+.shape-event-flow {
+  border-style: dashed;
+  border-radius: 3px;
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.16);
+}
+
 .edge-branch-tag {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -713,6 +720,11 @@ button:hover {
   background: rgba(56, 189, 248, 0.08);
   font-weight: 600;
 }
+.flow-step.kind-event {
+  border-left-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+  font-weight: 600;
+}
 .flow-step.kind-except { border-left-color: #f43f5e; }
 
 .flow-step-entry-tag {
@@ -722,6 +734,15 @@ button:hover {
   letter-spacing: 0.5px;
   text-transform: uppercase;
   color: #6ee7b7;
+}
+
+.flow-step-hook-tag {
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #fcd34d;
 }
 
 .flow-step-text {
@@ -1693,6 +1714,38 @@ kbd {
 .export-option-actions button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+.export-section-divider {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.export-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.export-checkbox-label input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .export-status {

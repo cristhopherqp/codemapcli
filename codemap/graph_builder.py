@@ -233,6 +233,22 @@ PYTHON_SET_METHODS = frozenset(
 
 AMBIGUOUS_RECEIVERS = frozenset({"app", "router", "server", "route", "client", "api", "http", "https", "axios", "request", "req", "ws"})
 AMBIGUOUS_METHODS = frozenset({"get", "set", "delete", "add", "clear", "update", "pop", "remove"})
+CANVAS_2D_RECEIVERS = frozenset({"ctx", "context", "ctx2d", "c2d", "context2d"})
+CANVAS_2D_METHODS = frozenset(
+    {
+        "fill", "stroke", "beginPath", "closePath", "moveTo", "lineTo",
+        "arc", "arcTo", "ellipse", "rect", "roundRect",
+        "fillRect", "strokeRect", "clearRect",
+        "fillText", "strokeText", "measureText",
+        "drawImage", "getImageData", "putImageData", "createImageData",
+        "save", "restore", "translate", "rotate", "scale", "transform",
+        "setTransform", "resetTransform", "clip", "isPointInPath",
+        "quadraticCurveTo", "bezierCurveTo",
+        "setLineDash", "getLineDash",
+        "createLinearGradient", "createRadialGradient", "createConicGradient", "createPattern",
+    }
+)
+HTML_CANVAS_METHODS = frozenset({"getContext", "toDataURL", "toBlob", "transferControlToOffscreen"})
 SELF_RECEIVER_PREFIXES = ("self.", "cls.", "this.")
 PYTHON_BUILTINS = frozenset(name for name in dir(builtins) if not name.startswith("_"))
 
@@ -504,6 +520,16 @@ def _is_ambiguous_receiver(obj: str, member: str) -> bool:
     return receiver_tail in AMBIGUOUS_RECEIVERS
 
 
+def _is_canvas_context_receiver(obj: str) -> bool:
+    receiver_tail = obj.rsplit(".", 1)[-1].split("[", 1)[0].split("(", 1)[0].lower()
+    return receiver_tail in CANVAS_2D_RECEIVERS or receiver_tail.endswith(("ctx", "ctx2d", "context2d"))
+
+
+def _is_canvas_element_receiver(obj: str) -> bool:
+    receiver_tail = obj.rsplit(".", 1)[-1].split("[", 1)[0].split("(", 1)[0].lower()
+    return receiver_tail == "canvas" or receiver_tail.endswith("canvas")
+
+
 def classify_python_external(call: CallSite, analysis: FileAnalysis, index: ProjectIndex) -> dict | None:
     """Resolve an unresolved Python call to stdlib, PyPI, builtins, or std method docs."""
     binding = match_import_binding(analysis, call.callee)
@@ -666,6 +692,37 @@ def classify_js_external(call: CallSite, analysis: FileAnalysis, index: ProjectI
                 "docs_url": f"https://developer.mozilla.org/en-US/search?q={quote(symbol)}",
                 "line": call.line,
             }
+
+        if _is_canvas_context_receiver(obj):
+            if member in CANVAS_2D_METHODS:
+                symbol = f"CanvasRenderingContext2D.{member}"
+                return {
+                    "api_id": f"js:{symbol}",
+                    "symbol": symbol,
+                    "call_expr": call.callee,
+                    "module": "Canvas 2D",
+                    "kind": "method",
+                    "docs_url": f"https://developer.mozilla.org/en-US/search?q={quote(symbol)}",
+                    "line": call.line,
+                }
+            # Evitar falsas clasificaciones (p. ej. ctx.fill / ctx.clear como Array o Map).
+            if member in ("fill", "clear", "at", "keys", "values", "entries", "set", "get"):
+                return None
+
+        if _is_canvas_element_receiver(obj):
+            if member in HTML_CANVAS_METHODS:
+                symbol = f"HTMLCanvasElement.{member}"
+                return {
+                    "api_id": f"js:{symbol}",
+                    "symbol": symbol,
+                    "call_expr": call.callee,
+                    "module": "Canvas 2D",
+                    "kind": "method",
+                    "docs_url": f"https://developer.mozilla.org/en-US/search?q={quote(symbol)}",
+                    "line": call.line,
+                }
+            if member in ("fill", "clear"):
+                return None
 
         if _is_ambiguous_receiver(obj, member):
             return None
@@ -842,7 +899,18 @@ def _classify_entries(
             )
             _register_feature(mc.target_id, is_route, trig, mc.file_id)
 
-    # 2. Listeners y rutas registrados desde dentro de funciones.
+    # 2. Listeners y rutas registrados desde dentro de funciones (en dos pasadas
+    # para no marcar como `event_handler` helpers locales o invocados directamente).
+    fn_info_by_id: dict[str, FunctionInfo] = {}
+    for path, analysis in index.files.items():
+        if analysis.language == "html":
+            continue
+        fid_prefix = index.file_ids[path]
+        for fn in analysis.functions:
+            fid = function_id(fid_prefix, fn.qualname)
+            if fid in visible_ids:
+                fn_info_by_id[fid] = fn
+
     direct_caller_targets: set[str] = set()
     has_callers_ids: set[str] = set()
     for call in fn_calls + reactive_triggers:
@@ -852,21 +920,34 @@ def _classify_entries(
             has_callers_ids.add(call.target_id)
             if call.edge_type == EDGE_DIRECT_CALL:
                 direct_caller_targets.add(call.target_id)
-        if call.edge_type == EDGE_EVENT_LISTENER:
-            if is_boot_event_name(call.event):
-                module_entry_ids.add(call.target_id)
-                module_entry_triggers.setdefault(call.target_id, f"event:{call.event}")
-            else:
-                is_route = is_route_registrar(call.via, call.event)
-                trig = (
-                    f"route:{call.event}"
-                    if (is_route and call.event)
-                    else ("route" if is_route else (f"event:{call.event}" if call.event else "event"))
-                )
-                _register_feature(call.target_id, is_route, trig, call.source_id)
+
+    for call in fn_calls + reactive_triggers:
+        if call.source_id not in visible_ids or call.target_id not in visible_ids:
+            continue
+        if call.edge_type != EDGE_EVENT_LISTENER:
+            continue
+        if is_boot_event_name(call.event):
+            module_entry_ids.add(call.target_id)
+            module_entry_triggers.setdefault(call.target_id, f"event:{call.event}")
+            continue
+        target_fn = fn_info_by_id.get(call.target_id)
+        is_nested_helper = target_fn is not None and target_fn.container is not None
+        if call.is_invocation:
+            if call.target_id in direct_caller_targets or is_nested_helper:
+                continue
+        elif is_nested_helper and call.target_id in direct_caller_targets:
+            continue
+        is_route = is_route_registrar(call.via, call.event)
+        trig = (
+            f"route:{call.event}"
+            if (is_route and call.event)
+            else ("route" if is_route else (f"event:{call.event}" if call.event else "event"))
+        )
+        _register_feature(call.target_id, is_route, trig, call.source_id)
 
     # 3. Pistas sintácticas de los parsers (`main`, decoradores, callbacks de módulo).
     main_hint_ids: set[str] = set()
+    module_callback_ids: set[str] = set()
     for path, analysis in index.files.items():
         if analysis.language == "html":
             continue
@@ -875,6 +956,8 @@ def _classify_entries(
             fid = function_id(file_id, fn.qualname)
             if fid not in visible_ids:
                 continue
+            if fn.callback_via:
+                module_callback_ids.add(fid)
             if fn.entry_kind_hint == ENTRY_KIND_MAIN:
                 main_hint_ids.add(fid)
                 module_entry_triggers.setdefault(
@@ -886,6 +969,8 @@ def _classify_entries(
             elif fn.entry_kind_hint == ENTRY_KIND_EVENT:
                 if fn.event_trigger:
                     _register_feature(fid, False, f"event:{fn.event_trigger}", None)
+                elif fn.callback_via:
+                    _register_feature(fid, False, "event", None)
                 elif fid not in direct_caller_targets and fid not in has_callers_ids:
                     event_handler_ids.add(fid)
 
@@ -900,7 +985,11 @@ def _classify_entries(
             entry_kinds[fid] = ENTRY_KIND_ROUTE
         elif fid in event_handler_ids:
             entry_kinds[fid] = ENTRY_KIND_EVENT
-        elif fid not in has_callers_ids and fid not in module_called_ids:
+        elif (
+            fid not in has_callers_ids
+            and fid not in module_called_ids
+            and fid not in module_callback_ids
+        ):
             entry_kinds[fid] = ENTRY_KIND_UNREFERENCED
         else:
             entry_kinds[fid] = None

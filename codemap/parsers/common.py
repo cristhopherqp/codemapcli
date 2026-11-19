@@ -21,6 +21,7 @@ from codemap.models import ROLE_TRANSFORM, FlowEdge, FlowStep
 NodeKey = tuple[int, int]
 
 LABEL_MAX_CHARS = 48
+FLOW_LABEL_MAX_CHARS = 120
 DOCSTRING_MAX_CHARS = 400
 CALLEE_MAX_CHARS = 80
 FLOW_MAX_STEPS = 96
@@ -89,9 +90,12 @@ def one_line(text: str, max_chars: int = LABEL_MAX_CHARS) -> str:
     return first
 
 
-def flow_label(text: str) -> str:
-    """Etiqueta completa en una línea para pasos de flujo, sin truncamiento rígido."""
-    return collapse_whitespace(text)
+def flow_label(text: str, max_chars: int = FLOW_LABEL_MAX_CHARS) -> str:
+    """Etiqueta en una línea para pasos de flujo, truncada con '…' si excede `max_chars`."""
+    cleaned = collapse_whitespace(text)
+    if max_chars > 0 and len(cleaned) > max_chars:
+        return cleaned[: max_chars - 1].rstrip() + "…"
+    return cleaned
 
 
 def dedent_code(text: str) -> str:

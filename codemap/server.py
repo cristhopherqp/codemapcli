@@ -1,11 +1,13 @@
 """Servidor HTTP + WebSocket unificado con aiohttp (puerto dinámico 127.0.0.1).
 
 Sirve:
-  /            -> index.html y estáticos de codemap/viewer/
-  /graph.json  -> grafo estructural vigente en memoria / disco
-  /notes.json  -> GET carga notes.json; POST aplica cambios parciales
-  /known-apis  -> GET carga ~/.codemap/known_apis.json; POST marca/desmarca APIs
-  /ws          -> WebSocket bidireccional (push de recarga en vivo + guardado)
+  /               -> index.html y estáticos de codemap/viewer/
+  /graph.json     -> grafo estructural vigente en memoria / disco
+  /export.ai.json -> grafo minificado/podado para modelos de IA (?include_flow=0|1)
+  /export.ai.md   -> resumen estructurado Markdown con Mermaid (?include_flow=0|1)
+  /notes.json     -> GET carga notes.json; POST aplica cambios parciales
+  /known-apis     -> GET carga ~/.codemap/known_apis.json; POST marca/desmarca APIs
+  /ws             -> WebSocket bidireccional (push de recarga en vivo + guardado)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
+from codemap.exporter import build_ai_markdown, serialize_ai_graph
 from codemap.known_apis_storage import load_known_apis, update_known_apis
 from codemap.notes_storage import load_notes, update_notes
 from codemap.watcher import start_watcher
@@ -47,6 +50,8 @@ def create_app(
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/graph.json", handle_get_graph)
+    app.router.add_get("/export.ai.json", handle_export_ai_json)
+    app.router.add_get("/export.ai.md", handle_export_ai_markdown)
     app.router.add_get("/notes.json", handle_get_notes)
     app.router.add_post("/notes.json", handle_post_notes)
     app.router.add_get("/known-apis", handle_get_known_apis)
@@ -63,6 +68,40 @@ async def handle_index(_request: web.Request) -> web.FileResponse:
 
 async def handle_get_graph(request: web.Request) -> web.Response:
     return web.json_response(request.app[APP_GRAPH], headers=NO_STORE_HEADERS)
+
+
+def _parse_bool_query(request: web.Request, name: str) -> bool:
+    raw = request.query.get(name, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+async def handle_export_ai_json(request: web.Request) -> web.Response:
+    include_flow = _parse_bool_query(request, "include_flow")
+    graph = request.app[APP_GRAPH]
+    payload = serialize_ai_graph(graph, include_flow=include_flow)
+    raw_bytes = len(json.dumps(graph, indent=2, ensure_ascii=False).encode("utf-8"))
+    headers = {
+        **NO_STORE_HEADERS,
+        "X-CodeMap-Raw-Bytes": str(raw_bytes),
+    }
+    return web.Response(
+        text=payload,
+        content_type="application/json",
+        charset="utf-8",
+        headers=headers,
+    )
+
+
+async def handle_export_ai_markdown(request: web.Request) -> web.Response:
+    include_flow = _parse_bool_query(request, "include_flow")
+    graph = request.app[APP_GRAPH]
+    markdown = build_ai_markdown(graph, include_flow=include_flow)
+    return web.Response(
+        text=markdown,
+        content_type="text/markdown",
+        charset="utf-8",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 async def handle_get_notes(request: web.Request) -> web.Response:

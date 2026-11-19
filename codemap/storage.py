@@ -41,6 +41,14 @@ def write_graph(target_path: str, graph: dict) -> Path:
     return graph_path
 
 
+def write_ai_export(target_path: str, content: str, ext: str) -> Path:
+    """Escribe ~/.codemap/<hash>/graph.ai.<ext> sin tocar el repositorio analizado."""
+    clean_ext = ext.lstrip(".").lower() or "json"
+    export_path = project_storage_dir(target_path) / f"graph.ai.{clean_ext}"
+    export_path.write_text(content, encoding="utf-8")
+    return export_path
+
+
 def register_project(target_path: str, meta: dict) -> None:
     """Registra o actualiza un proyecto mapeado en ~/.codemap/index.json."""
     index = _read_index()

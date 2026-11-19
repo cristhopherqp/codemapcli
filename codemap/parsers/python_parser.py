@@ -644,12 +644,24 @@ def build_flow(
     body: Node | None,
     source: bytes,
     function_nodes: dict[NodeKey, Node],
+    *,
+    hook_label: str = "",
+    hook_code: str = "",
 ) -> list[FlowStep]:
     """Construye el grafo intra-función con sub-contenedores, ramas Sí/No y try/except."""
     builder = FlowGraphBuilder(FLOW_MAX_STEPS)
+    pending: list[PendingExit] = []
+    if hook_label:
+        _, pending = builder.emit_sequential(
+            pending,
+            ROLE_ENTRY,
+            flow_label(hook_label),
+            code=hook_code or hook_label,
+            kind="event",
+        )
     param_summary = ", ".join(params) or "∅"
     _, pending = builder.emit_sequential(
-        [], ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+        pending, ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
     )
     if body is not None:
         pending = walk_flow_block(body, source, function_nodes, builder, pending, parent_id=None)
@@ -806,16 +818,30 @@ def emit_lambda_steps(
     for idx, (call_node, lambda_node) in enumerate(lambdas):
         callee_node = call_node.child_by_field_name("function")
         callee_name = normalize_callee(node_text(callee_node, source)) if callee_node else "lambda"
+        first_str = _extract_first_string_arg(call_node, source)
+        cb_kind, event_label = classify_callback_container(callee_name, first_str)
+        is_event_cb = cb_kind in (EDGE_EVENT_LISTENER, EDGE_REACTIVE_SUBSCRIBE)
+
         lam_params = parameter_names(lambda_node.child_by_field_name("parameters"), source)
-        params_label = ", ".join(lam_params) or "∅"
 
-        lead = ""
-        if idx == 0 and stmt is not call_node:
-            raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
-            if raw_lead and len(raw_lead) <= 40:
-                lead = f"{raw_lead} "
+        if is_event_cb:
+            params_suffix = f"({', '.join(lam_params)})" if lam_params else ""
+            target_part = callee_name.rsplit(".", 1)[0] if "." in callee_name else callee_name
+            if event_label and target_part:
+                header_label = flow_label(f"⚡ {event_label} · {target_part}{params_suffix}")
+            else:
+                header_label = flow_label(f"⚡ {callee_name}{params_suffix}")
+            step_kind = "event"
+        else:
+            params_label = ", ".join(lam_params) or "∅"
+            lead = ""
+            if idx == 0 and stmt is not call_node:
+                raw_lead = collapse_whitespace(text_between(source, stmt, call_node))
+                if raw_lead and len(raw_lead) <= 40:
+                    lead = f"{raw_lead} "
+            header_label = flow_label(f"🔁 {lead}{callee_name}({params_label})")
+            step_kind = "loop"
 
-        header_label = f"🔁 {lead}{callee_name}({params_label})"
         code_node = stmt if (idx == 0 and len(lambdas) == 1) else call_node
         lam_step, current = builder.emit_sequential(
             current,
@@ -824,7 +850,7 @@ def emit_lambda_steps(
             code=dedent_code(node_text(code_node, source)),
             parent_id=parent_id,
             is_container=True,
-            kind="loop",
+            kind=step_kind,
         )
         if lam_step is None:
             return current
@@ -1128,7 +1154,7 @@ def header_text(node: Node, source: bytes) -> str:
     """Cabecera de una sentencia compuesta: 'for v in reversed(topo)'."""
     block = next((c for c in node.named_children if c.type == "block"), None)
     raw = text_between(source, node, block) if block is not None else node_text(node, source)
-    return flow_label(raw).rstrip(":").rstrip()
+    return flow_label(collapse_whitespace(raw).rstrip(":").rstrip())
 
 
 def step_role(node: Node, source: bytes, function_nodes: dict[NodeKey, Node]) -> str:

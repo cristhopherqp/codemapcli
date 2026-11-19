@@ -211,6 +211,12 @@ def is_server_call(callee: str) -> bool:
     return False
 
 
+def is_startup_hook_call(callee: str) -> bool:
+    """True si la llamada registra un hook de arranque de servidor (p. ej. `server.listen`)."""
+    tail = callee.rsplit(".", 1)[-1]
+    return tail == "listen"
+
+
 def is_static_mount_call(callee: str) -> bool:
     tail = callee.rsplit(".", 1)[-1]
     if tail in STATIC_MOUNT_METHODS:

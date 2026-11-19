@@ -1590,6 +1590,24 @@ function buildStylesheet() {
       },
     },
     {
+      selector: 'node[type = "flow"][flowKind = "event"][flowContainer != "true"]',
+      style: {
+        "shape": "round-rectangle",
+        "background-color": "#291c0a",
+        "border-color": "#f59e0b",
+        "border-width": 2,
+        "color": "#fde68a",
+      },
+    },
+    {
+      selector: 'node[type = "flow"][flowKind = "event"][flowContainer = "true"]',
+      style: {
+        "background-color": "#23190b",
+        "border-color": "#f59e0b",
+        "color": "#fcd34d",
+      },
+    },
+    {
       selector: 'node[type = "function"][entryKind = "route_handler"]',
       style: { "border-color": "#2dd4bf", "border-width": 2.5 },
     },
@@ -2644,8 +2662,8 @@ function updateFlowBlock(node) {
     }
     if (step.role === "entry") {
       const tag = document.createElement("span");
-      tag.className = "flow-step-entry-tag";
-      tag.textContent = "ENTRADA";
+      tag.className = stepKind === "event" ? "flow-step-hook-tag" : "flow-step-entry-tag";
+      tag.textContent = stepKind === "event" ? "DISPARADOR" : "ENTRADA";
       li.appendChild(tag);
     }
     const text = document.createElement("span");
@@ -3530,6 +3548,132 @@ function exportGraphImage(scope, format) {
   return { filename, dataUrl };
 }
 
+function setExportStatus(message) {
+  const statusEl = document.getElementById("export-status");
+  if (!statusEl) {
+    return;
+  }
+  statusEl.textContent = message;
+  statusEl.classList.remove("hidden");
+}
+
+function getAiExportIncludeFlow() {
+  const checkbox = document.getElementById("export-ai-include-flow");
+  return Boolean(checkbox && checkbox.checked);
+}
+
+function triggerTextDownload(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      // Fallback con textarea temporal en contextos no HTTPS.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (_error) {
+    copied = false;
+  }
+  document.body.removeChild(textarea);
+  return copied;
+}
+
+function formatByteSize(bytes) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+async function exportAiGraphJson() {
+  const includeFlow = getAiExportIncludeFlow();
+  const query = includeFlow ? "?include_flow=1" : "";
+  setExportStatus("Generando JSON compacto para IA…");
+  try {
+    const response = await fetch(`/export.ai.json${query}`, { cache: "no-store" });
+    if (!response.ok) {
+      setExportStatus(`Error al exportar JSON IA (HTTP ${response.status}).`);
+      return null;
+    }
+    const text = await response.text();
+    const rawBytes = Number(response.headers.get("X-CodeMap-Raw-Bytes") || "0");
+    const exportBytes = new TextEncoder().encode(text).length;
+    const projectSlug = sanitizeFilenameSegment(
+      state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.project_name
+    );
+    const filename = `${projectSlug}.ai.json`;
+    triggerTextDownload(text, filename, "application/json;charset=utf-8");
+
+    const pct = rawBytes > 0 ? Math.max(0, (1 - exportBytes / rawBytes) * 100).toFixed(1) : null;
+    const reductionText = pct !== null ? `, -${pct}%` : "";
+    setExportStatus(`✓ Descargado: ${filename} (${formatByteSize(exportBytes)}${reductionText})`);
+    return { filename, bytes: exportBytes };
+  } catch (error) {
+    setExportStatus(`Error al exportar JSON IA: ${error.message || error}`);
+    return null;
+  }
+}
+
+async function exportAiMarkdown(mode = "copy") {
+  const includeFlow = getAiExportIncludeFlow();
+  const query = includeFlow ? "?include_flow=1" : "";
+  setExportStatus("Generando resumen Markdown para IA…");
+  try {
+    const response = await fetch(`/export.ai.md${query}`, { cache: "no-store" });
+    if (!response.ok) {
+      setExportStatus(`Error al generar Markdown IA (HTTP ${response.status}).`);
+      return null;
+    }
+    const markdown = await response.text();
+    const bytes = new TextEncoder().encode(markdown).length;
+    const projectSlug = sanitizeFilenameSegment(
+      state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.project_name
+    );
+
+    if (mode === "download") {
+      const filename = `${projectSlug}.ai.md`;
+      triggerTextDownload(markdown, filename, "text/markdown;charset=utf-8");
+      setExportStatus(`✓ Descargado: ${filename} (${formatByteSize(bytes)})`);
+      return { filename, bytes };
+    }
+
+    const copied = await copyTextToClipboard(markdown);
+    if (copied) {
+      setExportStatus(`✓ Resumen Markdown copiado al portapapeles (${formatByteSize(bytes)})`);
+    } else {
+      const filename = `${projectSlug}.ai.md`;
+      triggerTextDownload(markdown, filename, "text/markdown;charset=utf-8");
+      setExportStatus(`Portapapeles no disponible; descargado como ${filename} (${formatByteSize(bytes)})`);
+    }
+    return { copied, bytes };
+  } catch (error) {
+    setExportStatus(`Error al generar Markdown IA: ${error.message || error}`);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Navegación ergonómica (Modo Mano, Zoom, Ajustar) y panel colapsable
 // ---------------------------------------------------------------------------
@@ -3815,6 +3959,18 @@ function bindControls() {
   document.getElementById("btn-export-view-jpg").addEventListener("click", () => exportGraphImage("view", "jpg"));
   document.getElementById("btn-export-focus-png").addEventListener("click", () => exportGraphImage("focus", "png"));
   document.getElementById("btn-export-focus-jpg").addEventListener("click", () => exportGraphImage("focus", "jpg"));
+  const exportAiJsonBtn = document.getElementById("btn-export-ai-json");
+  if (exportAiJsonBtn) {
+    exportAiJsonBtn.addEventListener("click", () => exportAiGraphJson());
+  }
+  const copyAiMdBtn = document.getElementById("btn-copy-ai-md");
+  if (copyAiMdBtn) {
+    copyAiMdBtn.addEventListener("click", () => exportAiMarkdown("copy"));
+  }
+  const downloadAiMdBtn = document.getElementById("btn-export-ai-md");
+  if (downloadAiMdBtn) {
+    downloadAiMdBtn.addEventListener("click", () => exportAiMarkdown("download"));
+  }
 
   document.getElementById("tab-apis-pending").addEventListener("click", () => switchApisTab("pending"));
   document.getElementById("tab-apis-known").addEventListener("click", () => switchApisTab("known"));
