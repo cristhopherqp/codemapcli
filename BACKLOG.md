@@ -4,8 +4,9 @@
 
 ## Estado de Fases
 
-- **Fase 1 (Parser AST, Resolver y Graph Builder):** ✅ Completada — todos los ítems de análisis estático, resolución de alias/callbacks/top-level/HTML, semántica de aristas, cálculo determinista de `execution_flows` y compactación/límite de `FlowGraphBuilder` (Nivel 3+) están implementados y verificados con pruebas unitarias (`tests/test_phase1.py`).
-- **Fase 2 (Visor Web, Layout y UX):** Pendiente — consumo visual de `edge_type`, `entry_kind`, `execution_flows`, filtro anti-maraña, navegación en Modo Foco, ventanas flotantes y exportación de capturas.
+- **Fase 1 (Parser AST, Resolver y Graph Builder):** ✅ Completada — análisis estático, resolución de alias/callbacks/top-level/HTML, semántica de aristas, cálculo determinista de `execution_flows` y compactación/límite de `FlowGraphBuilder` (Nivel 3+) verificados con `tests/test_phase1.py`.
+- **Fase 2 (Visor Web, Hilos de Ejecución y Reducción de Ruido):** ✅ Completada — selector visual de `execution_flows`, estilos semánticos por `edge_type`/`entry_kind`/HTML + tooltip + leyenda, filtro anti-maraña con chips en inspector, Modo Foco multi-rama con `↑`/`↓`/`→`/`Enter`, aislamiento espacial de `pinned_positions` por nivel (`tests/test_phase2.py`) y exportación de capturas PNG/JPG verificados en navegador sin errores.
+- **Fase 3 (UX Avanzada — Ventanas Flotantes Anidadas):** ✅ Completada — gestor de ventanas flotantes arrastrables y redimensionables con instancias Cytoscape+ELK aisladas, puertos de frontera (`⇠`/`⇢`), líneas puente SVG Bézier sincronizadas en tiempo real, bloqueo de cierre padre-hijo (`🔒` / `Cerrar cadena` / `Esc` por hojas), sincronización con el Inspector y reconciliación en recarga WebSocket, verificado extremo a extremo en navegador sin errores.
 
 ---
 
@@ -42,12 +43,14 @@
   - `codemap/roles.py` y `codemap/graph_builder.py`: se eliminó la regla genérica `not has_callers -> ROLE_ENTRY` y se introdujo clasificación semántica explícita mediante `entry_kind` (`"main"`, `"route_handler"`, `"event_handler"`, `"unreferenced"`, `null`) junto a los flags `is_main_entry`, `is_event_handler`, `is_unreferenced` e `is_module_entry`.
   - Se mantienen los 4 roles visuales estándar (`entry`, `transform`, `decision`, `io`) en `node.role` para retrocompatibilidad total con el visor actual: solo las entradas reales de arranque (`main`, top-level, `__main__`, `DOMContentLoaded`/`load`, CLI) y rutas HTTP explícitas de nivel superior reciben `ROLE_ENTRY`. Handlers secundarios y funciones huérfanas conservan su rol conductual (`io`, `decision`, `transform`).
 
-### 1.5. [✅ Backend Fase 1 / ⏳ UI Fase 2] Semántica de aristas y flujos invertidos (Patrón Observer / Pub-Sub)
-- **Resuelto en Fase 1 (`models.py`, `resolver.py`, `graph_builder.py`):**
+### 1.5. [✅ Resuelto — Fase 1 y Fase 2] Semántica de aristas y flujos invertidos (Patrón Observer / Pub-Sub)
+- **Backend (Fase 1 — `models.py`, `resolver.py`, `graph_builder.py`):**
   - Todas las aristas en `graph.json` preservan los campos actuales (`id`, `source`, `target`, `confidence`, `call_count`, `line`) y añaden `edge_type` (`"direct_call"`, `"event_listener"`, `"callback_ref"`, `"reactive_subscribe"`, `"reactive_trigger"`, `"loads_script"`, `"serves_html"`), más `event` (evento/ruta) y `edge_types` cuando coexisten múltiples semánticas entre el mismo par.
   - `resolve_reactive_triggers()` deduce automáticamente la dirección reactiva de disparo (`notificador -> suscriptor`, `edge_type: "reactive_trigger"`, `confidence: "inferred"`) tanto para referencias directas (`subscribeState(updateUI)`) como para callbacks inline (`subscribeState(() => updateUI())`).
-- **Pendiente para Fase 2 (`codemap/viewer/app.js`):**
-  - Mostrar en el visor (mediante icono, estilo de línea o color de flecha) la semántica de `edge_type` y la etiqueta `event`.
+- **Visor Web (Fase 2 — `viewer/app.js`, `viewer/index.html`, `viewer/styles.css`):**
+  - `projectEdges()` conserva `edgeType`, `edgeEvent`, `rawEdgeIds` y `line`; Cytoscape aplica estilos diferenciados para cada categoría (sólida cian directa, discontinua ámbar `event_listener`, punteada violeta `callback_ref`, diamante magenta `reactive_subscribe`, trazo pulso rosa `reactive_trigger` y conector estructural verde `serves_html`/`loads_script`).
+  - Diferenciación visual de archivos `.html` (`🌐`, borde naranja, forma `cut-rectangle`), archivos gestores (`★`, borde verde) y `entry_kind` (`main`, `route_handler`, `event_handler`, `unreferenced` con borde discontinuo atenuado).
+  - Tooltip semántico flotante `#edge-tooltip` al pasar sobre aristas, píldoras de tipo en "Llamadas internas" del inspector y leyenda `#graph-legend` actualizada.
 
 ### 1.6. [✅ Resuelto — Fase 1] Falsos paquetes npm en alias de rutas (`@/...`) y `.gitignore` anidados
 - **Resolución de alias JS/TS (`resolver.py`, `graph_builder.py`):**
@@ -60,49 +63,51 @@
 
 ---
 
-## 2. Visualización de Hilos de Datos y Reducción de la "Maraña" (Viewer & Layout)
+## 2. Visualización de Hilos de Datos y Reducción de la "Maraña" (Viewer & Layout) — ✅ Fase 2 Completada
 
-### 2.1. [✅ Cálculo en `graph.json` Fase 1 / ⏳ Selector UI Fase 2] Selector de Hilo Principal, Hilos Secundarios e Hilos por Feature
-- **Resuelto en Fase 1 (`codemap/graph_builder.py`):**
-  - Se precalcula determinísticamente la sección `execution_flows` en `graph.json` mediante DFS ordenado por línea y resistente a ciclos:
-    1. **Hilos Principales (`kind: "main"`):** árboles de arranque desde servidor/HTML/lanzador/`main`/top-level (poda raíces subsumidas y evita engullir handlers de eventos de usuario o suscriptores diferidos).
-    2. **Hilos por Feature / Evento / Ruta (`kind: "feature"`):** un hilo por cada handler de evento o ruta HTTP registrada, siguiendo `direct_call`, `callback_ref` y `reactive_trigger` (permitiendo trazar cambios de estado hasta el re-render de UI), con `steps` numerados `1 → 2 → 3` y `registered_by`.
-- **Pendiente para Fase 2 (`codemap/viewer/app.js`, `codemap/viewer/index.html`):**
-  - Añadir un desplegable **"Hilos de Ejecución"** en la barra superior del visor que permita iluminar el Hilo Principal o aislar cualquier Hilo por Feature (atenuando el resto del grafo y numerando el orden de ejecución `1 → 2 → 3`).
+### 2.1. [✅ Resuelto — Fase 1 y Fase 2] Selector de Hilo Principal, Hilos Secundarios e Hilos por Feature
+- **Backend (Fase 1 — `codemap/graph_builder.py`):**
+  - Precalcula determinísticamente `execution_flows` en `graph.json` mediante DFS ordenado por línea y resistente a ciclos (`kind: "main"` de arranque y `kind: "feature"` por evento/ruta con `steps` numerados `1 → 2 → 3`).
+- **Visor Web (Fase 2 — `viewer/app.js`, `viewer/index.html`, `viewer/styles.css`):**
+  - Selector `#flow-select` en la barra superior agrupado en *Hilos Principales (Arranque)* e *Hilos por Feature / Evento / Ruta*, con botón rápido de reseteo (`#btn-clear-flow`) y soporte de `Esc`.
+  - Al seleccionar un hilo: expande automáticamente los contenedores ancestros necesarios (guardando el estado previo para restaurarlo al volver a *Todos*), atenúa el resto del grafo (`.dimmed`), etiqueta los nodos/aristas activos con el orden secuencial (`[1]`, `[2]`, `[3]` / `#2`) y muestra la lista navegable de pasos en `#active-flow-panel` dentro del inspector.
 
-### 2.2. [Pendiente — Fase 2] Filtro Anti-Maraña para Nodos Utilitarios (Alto Fan-In / Leaf Helpers)
-- **Problema:** Al expandir los archivos en Nivel 2, funciones utilitarias o de acceso a estado llamadas desde todas partes (`showToast`, `getImages`, `scheduleSaveSession`) generan decenas de flechas cruzadas que vuelven ilegible la gráfica.
-- **Archivos a modificar:** `codemap/viewer/app.js`, `codemap/viewer/index.html`.
-- **Solución técnica:**
-  - Detectar automáticamente como **"Nodos Utilitarios / Transversales"** a las funciones hoja (`is_terminal: true` o sin salidas complejas) que reciban llamadas desde $\ge 3$ archivos o $\ge 5$ funciones distintas.
-  - Añadir un botón toggle en el visor (**"Ocultar utilitarios / Reducir ruido"**) que oculte las aristas globales hacia esos nodos y, en su lugar, los muestre como una pequeña insignia dentro de las funciones que los usan.
+### 2.2. [✅ Resuelto — Fase 2] Filtro Anti-Maraña para Nodos Utilitarios (Alto Fan-In / Leaf Helpers)
+- **Implementación y decisiones de diseño (`viewer/app.js`, `viewer/index.html`, `viewer/styles.css`):**
+  - `computeUtilityNodes()` detecta dinámicamente nodos hoja/utilitarios excluyendo puntos de entrada: umbral estricto ($\ge 3$ archivos o $\ge 5$ funciones llamadoras y $\le 1$ salida interna), con respaldo adaptativo para proyectos compactos ($\le 25$ funciones, hoja transversal llamada desde $\ge 2$ archivos) cuando el criterio estricto devuelve 0.
+  - Interruptor `#btn-hide-utilities` en la barra lateral con contador dinámico. Al activarse, oculta dichos nodos y **todas** las aristas incidentes (con guarda explícita `hiddenNodeIds` en `projectEdges()` para evitar que `resolveVisibleEndpoint()` redirija aristas al archivo padre), muestra insignia `⚙×N` en los llamadores y lista chips interactivos en `#detail-hidden-utilities` dentro de "Llamadas internas" para inspeccionarlos al instante. Los utilitarios pertenecientes a un hilo de ejecución activo se mantienen visibles mientras ese hilo está seleccionado.
 
-### 2.3. [Pendiente — Fase 2] Navegación por teclado entre múltiples ramas en Modo Foco (`T`) y nodos `pinned`
-- **Problema 1:** En `viewer/app.js`, `stepTrace("forward")` ordena `callees` alfabéticamente y salta siempre a `callees[0]`, impidiendo elegir con el teclado a cuál de las funciones llamadas entrar.
-- **Problema 2:** En `runElkLayout()`, restaurar coordenadas absolutas `(x, y)` de nodos `pinned` de Nivel 2 rompe las cajas cuando se pasa a Nivel 3+.
-- **Archivos a modificar:** `codemap/viewer/app.js`.
-- **Solución técnica:**
-  - En Modo Foco (`T`), permitir que `↑` / `↓` cambien la selección previa entre las distintas funciones llamadas (o llamadoras) resaltando la arista candidata, y que `→` / `Enter` confirme el salto hacia esa rama.
-  - Guardar coordenadas `pinned` por nivel (`pinned_positions: { level_1, level_2 }`) o ignorar el anclaje de Nivel 2 cuando hay funciones expandidas en Nivel 3+.
+### 2.3. [✅ Resuelto — Fase 2] Navegación por teclado entre múltiples ramas en Modo Foco (`T`) y nodos `pinned`
+- **Modo Foco multi-rama (`viewer/app.js`, `viewer/index.html`, `viewer/styles.css`):**
+  - En Modo Foco (`T`), `↑` / `↓` ciclan entre ramas candidatas ordenadas por línea de llamada resaltando la arista y el destino candidato (`.trace-branch-active`) y actualizando el indicador flotante `#trace-branch-hud` (`Rama 1/N: nombreFuncion()`). `→` o `Enter` confirman el salto; `←` retrocede en el historial o permite elegir entre múltiples llamadores cuando el historial está vacío.
+- **Aislamiento de coordenadas `pinned` por nivel (`codemap/notes_storage.py`, `viewer/app.js`, `tests/test_phase2.py`):**
+  - `notes.json` incorpora el mapa opcional `pinned_positions` (`level_1`..`level_4`), manteniendo retrocompatibilidad con `x`/`y` planos (que aplican únicamente en `level_2` sin funciones expandidas).
+  - `runElkLayout()`, `handleNodeDragFree()` y `#btn-pin-node` operan estrictamente sobre el contexto de nivel activo (`getCurrentLayoutContextKey()`), evitando que anclajes de Nivel 2 distorsionen los contenedores expandidos en Nivel 3+.
 
 ---
 
-## 3. Nuevas Funcionalidades de Exploración y Exportación (UX Avanzada)
+## 3. Nuevas Funcionalidades de Exploración y Exportación (UX Avanzada) — ✅ Fase 3 Completada
 
-### 3.1. [Pendiente — Fase 2/3] Expansión en Ventanas Flotantes Anidadas (Modales de Lienzo) con Puertos y Bloqueo Padre-Hijo
-- **Problema:** Expandir un archivo (`state.js`) o el flujo interno de una función directamente sobre el grafo principal recalcula todo el layout con ELKjs y destruye la distribución visual que el usuario ya había comprendido.
-- **Archivos a modificar:** `codemap/viewer/app.js`, `codemap/viewer/index.html`, `codemap/viewer/styles.css`.
-- **Solución técnica:**
-  - Permitir elegir (mediante clic derecho, botón en el inspector o `Alt + Doble clic`) **"Expandir en ventana flotante"** frente a **"Expandir en el lienzo"**.
-  - Crear un gestor de ventanas flotantes arrastrables y redimensionables dentro del contenedor del visor, donde cada ventana renderiza su propio sub-grafo Cytoscape + ELKjs aislado (para un archivo o para el flujo Nivel 3+ de una función).
-  - **Puertos de Frontera (Cross-Modal Connectors):** Cuando una función dentro de la ventana flotante de `state.js` llama a una función externa (ej. `storage.js::scheduleSaveSession`), dibujar dentro del modal un nodo conector compacto (`⇢ storage.js::scheduleSaveSession`). Al hacer clic en ese conector, abrir (o enfocar) la ventana flotante hija de `storage.js` resaltando el conector de entrada correspondiente (`⇠ state.js::notifyStateChange`).
-  - **Jerarquía Padre → Hijo:** Registrar qué ventana flotante abrió a cuál (`parentModalId` / `childModalIds`). Bloquear el cierre individual de una ventana padre mientras tenga ventanas hijas abiertas (mostrando un aviso o un botón para cerrar la cadena hija en orden).
+### 3.1. [✅ Resuelto — Fase 3] Expansión en Ventanas Flotantes Anidadas (Modales de Lienzo) con Puertos y Bloqueo Padre-Hijo
+- **Problema:** Expandir un archivo (`state.js`) o el flujo interno de una función directamente sobre el grafo principal recalculaba todo el layout con ELKjs y rompía la distribución visual que el usuario ya había comprendido.
+- **Arquitectura e implementación (`codemap/viewer/index.html`, `codemap/viewer/styles.css`, `codemap/viewer/app.js`):**
+  - **Gestor de Ventanas Flotantes (`openFloatingWindow`, `buildFloatingSubgraph`, `runSubElkLayout`):**
+    - Apertura desde el Inspector (`#btn-open-floating`) y mediante `Alt + Doble clic` en el grafo principal (o doble clic sobre funciones/sub-contenedores dentro de otra ventana flotante) para nodos `module`, `file` y `function` con `internal_flow`, sin tocar el layout ni las posiciones del grafo principal.
+    - Cada ventana vive dentro de `#floating-windows-layer` (`position: absolute` en `#canvas-area`) con barra arrastrable, redimensionamiento (`resize: both` sincronizado mediante `ResizeObserver` con `subCy.resize()`), enfoque dinámico (`z-index`), botón centrar (`⛶`) y su propia instancia aislada de Cytoscape.js + ELKjs (reutilizando `buildStylesheet`, `buildElkInput`, `collectAbsolutePositions`, `appendInternalFlowElements` y `appendInternalFlowEdges`).
+    - Los sub-grafos de archivos/módulos se distribuyen con ELK en dirección `RIGHT` (puertos `⇠` a la izquierda, internos al centro, puertos `⇢` a la derecha) y los flujos Nivel 3+ de funciones en dirección `DOWN` sin caja contenedora redundante.
+  - **Puertos de Frontera y Líneas Puente SVG (`handlePortClick`, `renderFloatingBridges`):**
+    - Calcula automáticamente las aristas de `state.rawGraph.edges` que cruzan la frontera del módulo/archivo para crear píldoras compactas deduplicadas `.port-in` (`⇠ archivo :: fn()`) y `.port-out` (`⇢ archivo :: fn()`), preservando los endpoints reales (`rawSource`/`rawTarget`) en `#edge-tooltip`. Si el propio archivo participa en aristas directas (p. ej. `loads_script` HTML o llamadas top-level), añade automáticamente su nodo ancla raíz.
+    - Al hacer clic en un puerto se abre (o enfoca, evitando ciclos padre-hijo si ya está abierta) la ventana del archivo/módulo conectado, resaltando en dorado (`.port-linked-highlight`) el puerto recíproco y la función destino.
+    - Capa SVG `#floating-bridges-svg` (`pointer-events: none`, sincronizada vía `requestAnimationFrame`) que dibuja curvas Bézier discontinuas por tipo semántico de arista entre puertos conectados y curvas `.bridge-parent_child` entre un nodo función/archivo padre y su ventana hija anidada, actualizándose en vivo al arrastrar, redimensionar o hacer pan/zoom.
+  - **Jerarquía Padre → Hijo, Bloqueo de Cierre y Ciclo de Vida (`closeFloatingWindow`, `closeMostRecentLeafFloatingWindow`, `reconcileFloatingWindowsOnLiveUpdate`):**
+    - Cada ventana rastrea `parentWindowId` y `childWindowIds` (infiriendo automáticamente la ventana padre cuando se abre una función desde el Inspector estando su ventana contenedora activa).
+    - Mientras `childWindowIds.size > 0`, el botón de cierre cambia a estado bloqueado (`🔒` / `.locked`), rechaza el cierre individual mostrando `.fw-lock-notice` y haciendo pulsar (`.pulse-child`) a las ventanas descendientes, y muestra el botón secundario explícito **"Cerrar cadena"** para cerrar el sub-árbol en orden hoja → raíz.
+    - La tecla `Esc` cierra únicamente la ventana flotante **hoja** más recientemente activa antes de salir del Modo Foco o deseleccionar nodos.
+    - Clicar cualquier nodo o paso de flujo dentro de una ventana flotante actualiza el Inspector derecho (`selectNode`, `syncFlowStepHighlight`, notas, roles y enlaces VS Code). Al cerrarse, se destruye `win.cy.destroy()`, se desconecta `ResizeObserver` y se limpian timers/referencias; ante actualizaciones WebSocket (`applyLiveUpdate`), las ventanas sobrevivientes se re-renderizan y las eliminadas se cierran limpiamente re-parentando hijas aún válidas.
 
-### 3.2. [Pendiente — Fase 2/3] Exportación de Capturas del Grafo (PNG / JPG / SVG)
-- **Problema:** No existe una opción directa en la interfaz para exportar como imagen el mapa completo o únicamente el subgrafo que está en Modo Foco.
-- **Archivos a modificar:** `codemap/viewer/app.js`, `codemap/viewer/index.html`.
-- **Solución técnica:**
-  - Aprovechar los métodos nativos de Cytoscape (`state.cy.png({ full, scale: 2, bg: '#0f141b' })` y `state.cy.jpg(...)`) para agregar un menú de exportación en la barra lateral: **"Exportar vista actual (PNG/JPG)"**, **"Exportar grafo completo"** y **"Exportar solo nodos en Foco"**.
+### 3.2. [✅ Resuelto — Fase 2] Exportación de Capturas del Grafo (PNG / JPG)
+- **Implementación y decisiones de diseño (`viewer/app.js`, `viewer/index.html`, `viewer/styles.css`):**
+  - Botón `#btn-export-image` en la barra lateral que abre `#export-modal` con descarga directa en **PNG** y **JPG** (escala `2×`, fondo `#0f141b`) para tres alcances: **Grafo completo** (`full: true`), **Vista actual** (`full: false`) y **Solo Foco / Hilo activo** (oculta temporalmente los elementos `.dimmed` mediante la clase `.export-hidden` durante la captura de Cytoscape y los restaura inmediatamente en `finally`).
 
 ### 3.3. [✅ Resuelto — Fase 1] Límite configurable o plegado en `FlowGraphBuilder` (Nivel 3+)
 - **Problema:** `FLOW_MAX_STEPS = 40` truncaba funciones orquestadoras largas con `… (límite de pasos alcanzado)`, ocultando pasos críticos al final de la función.

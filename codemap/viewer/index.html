@@ -25,6 +25,13 @@
         <button id="level-4" class="level-btn" data-level="4" title="Desglose interno de funciones">Nivel 3+: Intra-función</button>
       </nav>
 
+      <div class="flow-selector-wrap" aria-label="Selector de hilos de ejecución">
+        <select id="flow-select" class="flow-select" title="Seleccionar hilo de ejecución (Arranque o Feature)">
+          <option value="">Hilo: Todos</option>
+        </select>
+        <button id="btn-clear-flow" class="flow-clear-btn hidden" type="button" title="Volver a mostrar todos los hilos">×</button>
+      </div>
+
       <div class="zoom-controls" aria-label="Control de zoom">
         <button id="btn-zoom-out" class="zoom-step-btn" type="button" title="Alejar (-)">−</button>
         <button id="zoom-indicator" class="zoom-indicator" type="button" title="Ajustar grafo a la pantalla (F o Ctrl+0)">100%</button>
@@ -48,6 +55,11 @@
           <span class="tool-icon" aria-hidden="true">🎯</span>
           <span class="tool-label">Modo Foco (T)</span>
         </button>
+        <button id="btn-hide-utilities" class="action-btn sidebar-btn" type="button" title="Ocultar nodos utilitarios de alto fan-in para reducir ruido">
+          <span class="tool-icon" aria-hidden="true">🧹</span>
+          <span id="utilities-label-text" class="tool-label">Ocultar utilitarios (0)</span>
+          <span id="utilities-count-badge" class="tool-badge hidden">0</span>
+        </button>
         <button id="btn-search" class="action-btn sidebar-btn" type="button" title="Buscar nodo o nota (Ctrl+K)">
           <span class="tool-icon" aria-hidden="true">🔍</span>
           <span class="tool-label">Buscar (Ctrl+K)</span>
@@ -61,6 +73,10 @@
           <span class="tool-icon" aria-hidden="true">📚</span>
           <span id="apis-label-text" class="tool-label">APIs (0 pendientes / 0 aprendidas)</span>
           <span id="apis-count-badge" class="tool-badge">0/0</span>
+        </button>
+        <button id="btn-export-image" class="action-btn sidebar-btn" type="button" title="Exportar captura del grafo (PNG / JPG)">
+          <span class="tool-icon" aria-hidden="true">📷</span>
+          <span class="tool-label">Exportar imagen</span>
         </button>
         <button id="btn-relayout" class="action-btn sidebar-btn" type="button" title="Reordenar nodos no fijados (Tecla R)">
           <span class="tool-icon" aria-hidden="true">✨</span>
@@ -79,6 +95,17 @@
 
     <section class="canvas-area" id="canvas-area">
       <div id="cy" aria-label="Grafo interactivo de arquitectura"></div>
+      <div id="floating-windows-layer" class="floating-windows-layer" aria-label="Ventanas flotantes"></div>
+      <svg id="floating-bridges-svg" class="floating-bridges-svg" aria-hidden="true"></svg>
+      <div id="trace-branch-hud" class="trace-branch-hud hidden" role="status" aria-live="polite">
+        <span id="trace-branch-label" class="trace-branch-label"></span>
+        <div class="trace-branch-controls">
+          <button id="btn-trace-prev" class="trace-hud-btn" type="button" title="Rama anterior (↑)">↑</button>
+          <button id="btn-trace-next" class="trace-hud-btn" type="button" title="Siguiente rama (↓)">↓</button>
+          <button id="btn-trace-go" class="trace-hud-btn primary" type="button" title="Saltar a la rama seleccionada (→ o Enter)">Ir →</button>
+        </div>
+      </div>
+      <div id="edge-tooltip" class="edge-tooltip hidden" role="tooltip"></div>
       <button id="btn-show-panel" class="floating-panel-toggle hidden" type="button" title="Mostrar inspector (] o Ctrl+\)">◀ Inspector</button>
 
       <aside id="graph-legend" class="legend" aria-label="Leyenda visual">
@@ -87,23 +114,35 @@
         </div>
         <div id="legend-body" class="legend-body">
           <div class="legend-section">
-            <span class="legend-title">Roles</span>
-            <span class="legend-item"><span class="shape shape-entry"></span>Entrada</span>
+            <span class="legend-title">Nodos</span>
+            <span class="legend-item"><span class="shape shape-entry"></span>Inicio (main)</span>
+            <span class="legend-item"><span class="shape shape-route"></span>Ruta</span>
+            <span class="legend-item"><span class="shape shape-event"></span>Evento</span>
+            <span class="legend-item"><span class="shape shape-unreferenced"></span>Sin ref.</span>
             <span class="legend-item"><span class="shape shape-transform"></span>Transformación</span>
             <span class="legend-item"><span class="shape shape-decision"></span>Decisión</span>
             <span class="legend-item"><span class="shape shape-io"></span>I/O</span>
+            <span class="legend-item"><span class="shape shape-html"></span>HTML</span>
             <span class="legend-item"><span class="shape shape-loop"></span>🔁 Bucle / Callback</span>
           </div>
           <div class="legend-section">
+            <span class="legend-title">Aristas</span>
+            <span class="legend-item"><span class="edge-sample direct"></span>Directa</span>
+            <span class="legend-item"><span class="edge-sample dashed"></span>Inferida</span>
+            <span class="legend-item"><span class="edge-sample event"></span>Evento</span>
+            <span class="legend-item"><span class="edge-sample callback"></span>Callback</span>
+            <span class="legend-item"><span class="edge-sample reactive-sub"></span>Suscripción</span>
+            <span class="legend-item"><span class="edge-sample reactive-trig"></span>Disparo reactivo</span>
+            <span class="legend-item"><span class="edge-sample html-bridge"></span>HTML / Script</span>
+          </div>
+          <div class="legend-section">
             <span class="legend-title">Flujo</span>
-            <span class="edge-sample solid"></span><span>Confirmada</span>
-            <span class="edge-sample dashed"></span><span>Inferida</span>
             <span class="legend-item"><span class="edge-branch-tag yes">Sí</span> / <span class="edge-branch-tag no">No</span></span>
             <span class="legend-item"><span class="edge-branch-tag exc">⚠️ except / catch</span></span>
             <span class="legend-item"><span class="trace-dot caller"></span>Quien llama</span>
             <span class="legend-item"><span class="trace-dot callee"></span>A quien llama</span>
           </div>
-          <div class="legend-hint">Espacio+Arrastrar / Clic central: Mover cámara · F: Ajustar · T: Foco · ] / Ctrl+\: Panel · ?: Atajos</div>
+          <div class="legend-hint">Espacio+Arrastrar: Cámara · Alt+Doble clic: Ventana flotante · T + ↑/↓/→: Foco · F: Ajustar · ?: Atajos</div>
         </div>
       </aside>
     </section>
@@ -113,6 +152,19 @@
         <span class="panel-topbar-title">Inspector</span>
         <button id="btn-collapse-panel" class="panel-collapse-btn" type="button" title="Ocultar inspector (] o Ctrl+\)">Ocultar ▶</button>
       </div>
+
+      <section id="active-flow-panel" class="active-flow-panel hidden" aria-label="Pasos del hilo de ejecución activo">
+        <div class="active-flow-header">
+          <div class="active-flow-meta">
+            <span id="active-flow-kind-badge" class="flow-badge"></span>
+            <h3 id="active-flow-title" class="active-flow-title"></h3>
+          </div>
+          <button id="btn-inspector-clear-flow" class="call-action-btn" type="button" title="Volver a Todos">Todos</button>
+        </div>
+        <p id="active-flow-sub" class="active-flow-sub"></p>
+        <ol id="active-flow-steps" class="active-flow-steps"></ol>
+      </section>
+
       <div class="details-empty" id="details-empty">
         <h2>Inspección de Nodo</h2>
         <p>Haz clic en un módulo, archivo o función para editar tu nota personal, cambiar su forma o anclar su posición.</p>
@@ -136,6 +188,14 @@
             <button id="btn-pin-node" class="pin-node-btn" type="button">Fijar posición</button>
             <button id="btn-toggle-node" class="toggle-node-btn hidden" type="button"></button>
           </div>
+          <button
+            id="btn-open-floating"
+            class="floating-open-btn hidden"
+            type="button"
+            title="Expandir en ventana flotante sin alterar el grafo principal (Alt + Doble clic)"
+          >
+            ↗ Abrir en ventana flotante
+          </button>
         </div>
 
         <div id="detail-role-block" class="detail-block hidden">
@@ -174,6 +234,10 @@
 
         <div id="detail-internal-calls-block" class="detail-block hidden">
           <h3>Llamadas internas</h3>
+          <div id="detail-hidden-utilities" class="hidden-utilities-box hidden">
+            <span class="hidden-utilities-title">Utilitarios ocultos en el lienzo:</span>
+            <div id="detail-hidden-utilities-chips" class="utility-chips"></div>
+          </div>
           <ul id="detail-internal-calls-list" class="calls-list"></ul>
         </div>
 
@@ -254,6 +318,54 @@
     </div>
   </div>
 
+  <!-- Modal de Exportación de Capturas (PNG / JPG) -->
+  <div id="export-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Exportar imagen del grafo">
+    <div class="modal-card modal-card-compact">
+      <div class="modal-titlebar">
+        <h2>Exportar Captura del Grafo</h2>
+        <button id="btn-close-export" type="button">Cerrar</button>
+      </div>
+      <div class="export-modal-body">
+        <p class="export-intro">Descarga el mapa en alta resolución (escala 2×, fondo <code>#0f141b</code>).</p>
+
+        <div class="export-option-row">
+          <div class="export-option-info">
+            <strong>Grafo completo</strong>
+            <span>Incluye todos los nodos y aristas visibles del lienzo completo.</span>
+          </div>
+          <div class="export-option-actions">
+            <button id="btn-export-full-png" type="button" class="call-action-btn">PNG</button>
+            <button id="btn-export-full-jpg" type="button" class="call-action-btn">JPG</button>
+          </div>
+        </div>
+
+        <div class="export-option-row">
+          <div class="export-option-info">
+            <strong>Vista actual</strong>
+            <span>Captura únicamente el encuadre y zoom actual en pantalla.</span>
+          </div>
+          <div class="export-option-actions">
+            <button id="btn-export-view-png" type="button" class="call-action-btn">PNG</button>
+            <button id="btn-export-view-jpg" type="button" class="call-action-btn">JPG</button>
+          </div>
+        </div>
+
+        <div class="export-option-row" id="export-focus-row">
+          <div class="export-option-info">
+            <strong>Solo Foco / Hilo activo</strong>
+            <span id="export-focus-hint">Activa Modo Foco (T) o selecciona un Hilo de Ejecución para aislarlo.</span>
+          </div>
+          <div class="export-option-actions">
+            <button id="btn-export-focus-png" type="button" class="call-action-btn" disabled>PNG</button>
+            <button id="btn-export-focus-jpg" type="button" class="call-action-btn" disabled>JPG</button>
+          </div>
+        </div>
+
+        <p id="export-status" class="export-status hidden" role="status"></p>
+      </div>
+    </div>
+  </div>
+
   <!-- Modal de Atajos de Teclado y Navegación (?) -->
   <div id="help-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Atajos de navegación">
     <div class="modal-card modal-card-compact">
@@ -266,12 +378,14 @@
         <li><span>Clic central + Arrastrar</span><span>Paneo libre en cualquier momento sin mover nodos</span></li>
         <li><span>Rueda / <kbd>+</kbd> / <kbd>-</kbd></span><span>Acercar o alejar zoom centrado</span></li>
         <li><span><kbd>F</kbd> o <kbd>Ctrl</kbd>+<kbd>0</kbd></span><span>Ajustar todo el grafo a la pantalla</span></li>
-        <li><span><kbd>T</kbd> y <kbd>←</kbd> / <kbd>→</kbd></span><span>Activar Modo Foco y avanzar entre llamadas</span></li>
+        <li><span><kbd>T</kbd> + <kbd>↑</kbd>/<kbd>↓</kbd> + <kbd>→</kbd>/<kbd>Enter</kbd></span><span>Modo Foco: elegir rama candidata y saltar</span></li>
+        <li><span><kbd>←</kbd> en Modo Foco</span><span>Retroceder en historial o elegir llamador</span></li>
         <li><span><kbd>Ctrl</kbd>+<kbd>K</kbd></span><span>Abrir buscador instantáneo</span></li>
         <li><span><kbd>R</kbd></span><span>Re-ordenar nodos no fijados (ELKjs)</span></li>
         <li><span><kbd>]</kbd> o <kbd>Ctrl</kbd>+<kbd>\</kbd></span><span>Ocultar o desplegar panel lateral inspector</span></li>
-        <li><span><kbd>Esc</kbd></span><span>Cerrar modales / salir de Foco / deseleccionar nodo</span></li>
+        <li><span><kbd>Esc</kbd></span><span>Cerrar modales / ventana flotante hoja / salir de Foco / limpiar Hilo</span></li>
         <li><span>Doble clic en nodo</span><span>Colapsar / expandir contenedor o flujo interno</span></li>
+        <li><span><kbd>Alt</kbd> + Doble clic</span><span>Abrir módulo, archivo o función en ventana flotante aislada</span></li>
       </ul>
     </div>
   </div>

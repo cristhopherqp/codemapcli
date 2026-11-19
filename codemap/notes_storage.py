@@ -13,7 +13,16 @@ from pathlib import Path
 from codemap.paths import project_storage_dir
 
 NOTES_FILE_NAME = "notes.json"
-ALLOWED_NODE_FIELDS = ("note", "pinned", "x", "y", "custom_role", "last_fingerprint")
+ALLOWED_NODE_FIELDS = (
+    "note",
+    "pinned",
+    "x",
+    "y",
+    "pinned_positions",
+    "custom_role",
+    "last_fingerprint",
+)
+VALID_LAYOUT_LEVELS = frozenset({"level_1", "level_2", "level_3", "level_4"})
 
 
 def notes_path(target_path: str) -> Path:
@@ -27,13 +36,28 @@ def default_node_entry(fingerprint: str = "") -> dict:
         "pinned": False,
         "x": None,
         "y": None,
+        "pinned_positions": {},
         "custom_role": None,
         "last_fingerprint": fingerprint,
     }
 
 
+def _normalize_pinned_positions(raw_positions: object) -> dict[str, dict[str, float]]:
+    if not isinstance(raw_positions, dict):
+        return {}
+    clean: dict[str, dict[str, float]] = {}
+    for level_key, coords in raw_positions.items():
+        if level_key not in VALID_LAYOUT_LEVELS or not isinstance(coords, dict):
+            continue
+        x = coords.get("x")
+        y = coords.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            clean[level_key] = {"x": float(x), "y": float(y)}
+    return clean
+
+
 def normalize_node_entry(raw: dict | None, fingerprint: str = "") -> dict:
-    """Garantiza exactamente las 6 claves del esquema de notes.json."""
+    """Normaliza una entrada de notes.json preservando retrocompatibilidad con x/y."""
     entry = default_node_entry(fingerprint)
     if not isinstance(raw, dict):
         return entry
@@ -41,6 +65,7 @@ def normalize_node_entry(raw: dict | None, fingerprint: str = "") -> dict:
     entry["pinned"] = bool(raw.get("pinned", False))
     entry["x"] = raw.get("x") if isinstance(raw.get("x"), (int, float)) else None
     entry["y"] = raw.get("y") if isinstance(raw.get("y"), (int, float)) else None
+    entry["pinned_positions"] = _normalize_pinned_positions(raw.get("pinned_positions"))
     custom_role = raw.get("custom_role")
     entry["custom_role"] = str(custom_role) if custom_role else None
     entry["last_fingerprint"] = str(raw.get("last_fingerprint") or fingerprint or "")
@@ -49,7 +74,12 @@ def normalize_node_entry(raw: dict | None, fingerprint: str = "") -> dict:
 
 def has_user_content(entry: dict) -> bool:
     """True si la entrada contiene información humana que merece persistir."""
-    return bool(entry.get("note", "").strip()) or bool(entry.get("pinned")) or bool(entry.get("custom_role"))
+    return (
+        bool(entry.get("note", "").strip())
+        or bool(entry.get("pinned"))
+        or bool(entry.get("pinned_positions"))
+        or bool(entry.get("custom_role"))
+    )
 
 
 def load_notes(target_path: str) -> dict:
