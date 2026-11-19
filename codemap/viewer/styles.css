@@ -1992,6 +1992,92 @@ kbd {
   color: #a7f3d0;
 }
 
+/* Etapa 4: Conmutador Carpetas / Capas de Flujo y HUD N-hops */
+.grouping-switcher {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.group-btn {
+  padding: 4px 9px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
+}
+
+.group-btn:hover {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.group-btn.active {
+  color: #e9d5ff;
+  background: rgba(168, 85, 247, 0.2);
+  border-color: rgba(168, 85, 247, 0.65);
+}
+
+.nhops-hud {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 23;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: min(760px, calc(100% - 28px));
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid #38bdf8;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+  font-size: 12px;
+  color: #e0f2fe;
+}
+
+.nhops-label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.nhops-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.nhops-open-btn {
+  width: 100%;
+  font-weight: 600;
+  color: #bae6fd;
+  background: rgba(14, 116, 144, 0.2);
+  border: 1px solid rgba(56, 189, 248, 0.55);
+  padding: 6px 10px;
+}
+
+.nhops-open-btn:hover {
+  background: rgba(14, 116, 144, 0.36);
+  border-color: #7dd3fc;
+}
+
+.nhops-open-btn.active {
+  color: #e0f2fe;
+  background: rgba(56, 189, 248, 0.25);
+  border-color: #38bdf8;
+}
+
 .floating-windows-layer {
   position: absolute;
   inset: 0;

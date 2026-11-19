@@ -26,6 +26,7 @@ from codemap.models import (
     ENTRY_KIND_MAIN,
     ENTRY_KIND_ROUTE,
     ENTRY_KIND_UNREFERENCED,
+    ROLE_IO,
     CallSite,
     FileAnalysis,
     FunctionInfo,
@@ -266,6 +267,15 @@ LEVEL_FILE_FLOW = LEVEL_FUNCTIONS
 LARGE_PROJECT_FUNCTIONS = 25
 TINY_FILE_FUNCTIONS = 2
 
+ARCHITECTURAL_LAYERS: tuple[dict, ...] = (
+    {"index": 0, "id": "layer::0", "key": "entries", "label": "Entradas / UI"},
+    {"index": 1, "id": "layer::1", "key": "orchestrators", "label": "Orquestadores"},
+    {"index": 2, "id": "layer::2", "key": "services", "label": "Servicios / Estado"},
+    {"index": 3, "id": "layer::3", "key": "utilities", "label": "Utilidades / Persistencia"},
+)
+
+STATE_SERVICE_HINTS = frozenset({"state", "store", "service", "services", "model", "models", "repo", "repository"})
+
 ENTRY_FILE_STEMS = frozenset({"main", "index", "app", "server", "cli", "__main__"})
 FALLBACK_ENTRY_FN_NAMES = frozenset({"bootstrap", "init", "initApp", "start", "startApp", "run", "setup"})
 
@@ -384,6 +394,13 @@ def build_graph(
         server_html_links=server_html_links,
     )
 
+    compute_architectural_layers(
+        file_nodes=file_nodes,
+        function_nodes=function_nodes,
+        edges=edges,
+        execution_flows=execution_flows,
+    )
+
     total_functions = len(function_nodes)
     return {
         "meta": {
@@ -391,6 +408,7 @@ def build_graph(
             "root_path": target_path,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "total_functions": total_functions,
+            "large_project_threshold": LARGE_PROJECT_FUNCTIONS,
             "recommended_level": recommended_level(
                 total_functions,
                 is_single_file,
@@ -398,6 +416,7 @@ def build_graph(
             ),
             "main_entry_files": sorted(entry_meta["main_entry_files"]),
             "main_entry_functions": sorted(entry_meta["main_entry_fn_ids"]),
+            "architectural_layers": [dict(layer) for layer in ARCHITECTURAL_LAYERS],
         },
         "nodes": module_nodes + file_nodes + function_nodes,
         "edges": edges,
@@ -1512,3 +1531,261 @@ def build_execution_flows(
         )
 
     return flows
+
+
+# ---------------------------------------------------------------------------
+# Capas topológicas automáticas (Tarjan SCC + DAG condensado)
+# ---------------------------------------------------------------------------
+
+def _tarjan_scc(node_ids: list[str], adj: dict[str, set[str]]) -> list[list[str]]:
+    """Algoritmo iterativo de Tarjan para componentes fuertemente conexas (SCC)."""
+    index_counter = 0
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    tarjan_stack: list[str] = []
+    components: list[list[str]] = []
+
+    for start in sorted(node_ids):
+        if start in indices:
+            continue
+        call_stack: list[tuple[str, list[str], int]] = [
+            (start, sorted(adj.get(start, set())), 0)
+        ]
+        indices[start] = index_counter
+        lowlink[start] = index_counter
+        index_counter += 1
+        tarjan_stack.append(start)
+        on_stack.add(start)
+
+        while call_stack:
+            v, neighbors, idx = call_stack[-1]
+            if idx < len(neighbors):
+                call_stack[-1] = (v, neighbors, idx + 1)
+                w = neighbors[idx]
+                if w not in indices:
+                    indices[w] = index_counter
+                    lowlink[w] = index_counter
+                    index_counter += 1
+                    tarjan_stack.append(w)
+                    on_stack.add(w)
+                    call_stack.append((w, sorted(adj.get(w, set())), 0))
+                elif w in on_stack:
+                    if indices[w] < lowlink[v]:
+                        lowlink[v] = indices[w]
+            else:
+                call_stack.pop()
+                if call_stack:
+                    parent = call_stack[-1][0]
+                    if lowlink[v] < lowlink[parent]:
+                        lowlink[parent] = lowlink[v]
+                if lowlink[v] == indices[v]:
+                    comp: list[str] = []
+                    while True:
+                        member = tarjan_stack.pop()
+                        on_stack.discard(member)
+                        comp.append(member)
+                        if member == v:
+                            break
+                    components.append(sorted(comp))
+
+    return components
+
+
+def _condense_dag_depths(
+    node_ids: list[str],
+    adj: dict[str, set[str]],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Calcula `(dist_from_source, dist_to_sink)` para cada nodo sobre el DAG de SCCs."""
+    if not node_ids:
+        return {}, {}
+
+    sccs = _tarjan_scc(node_ids, adj)
+    comp_of: dict[str, int] = {}
+    for cid, members in enumerate(sccs):
+        for nid in members:
+            comp_of[nid] = cid
+
+    comp_count = len(sccs)
+    dag_out: dict[int, set[int]] = {cid: set() for cid in range(comp_count)}
+    dag_in: dict[int, set[int]] = {cid: set() for cid in range(comp_count)}
+
+    for u, targets in adj.items():
+        cu = comp_of.get(u)
+        if cu is None:
+            continue
+        for v in targets:
+            cv = comp_of.get(v)
+            if cv is not None and cv != cu:
+                dag_out[cu].add(cv)
+                dag_in[cv].add(cu)
+
+    # Orden topológico determinista (Kahn) sobre el DAG garantizado de SCCs.
+    in_deg = {cid: len(dag_in[cid]) for cid in range(comp_count)}
+    ready = sorted(cid for cid, deg in in_deg.items() if deg == 0)
+    topo: list[int] = []
+    while ready:
+        curr = ready.pop(0)
+        topo.append(curr)
+        for nxt in sorted(dag_out[curr]):
+            in_deg[nxt] -= 1
+            if in_deg[nxt] == 0:
+                ready.append(nxt)
+        ready.sort()
+
+    dist_src_comp = [0] * comp_count
+    for cid in topo:
+        if dag_in[cid]:
+            dist_src_comp[cid] = max(dist_src_comp[p] + 1 for p in dag_in[cid])
+
+    dist_sink_comp = [0] * comp_count
+    for cid in reversed(topo):
+        if dag_out[cid]:
+            dist_sink_comp[cid] = max(dist_sink_comp[nxt] + 1 for nxt in dag_out[cid])
+
+    dist_from_source = {nid: dist_src_comp[comp_of[nid]] for nid in node_ids}
+    dist_to_sink = {nid: dist_sink_comp[comp_of[nid]] for nid in node_ids}
+    return dist_from_source, dist_to_sink
+
+
+def _looks_like_state_or_service_path(node_id: str) -> bool:
+    file_part = node_id.split("::", 1)[0].lower()
+    tokens = set(file_part.replace(".", "/").replace("-", "_").replace("_", "/").split("/"))
+    return bool(tokens & STATE_SERVICE_HINTS)
+
+
+def compute_architectural_layers(
+    *,
+    file_nodes: list[dict],
+    function_nodes: list[dict],
+    edges: list[dict],
+    execution_flows: list[dict],
+) -> None:
+    """Asigna `arch_layer` (`0..3`) in-place a cada nodo de archivo y función.
+
+    Capas:
+      0 -> Entradas / UI
+      1 -> Orquestadores
+      2 -> Servicios / Estado
+      3 -> Utilidades / Persistencia
+    """
+    main_flow_roots = {f["root_id"] for f in execution_flows if f.get("kind") == "main"}
+    main_flow_root_files = {rid.split("::", 1)[0] for rid in main_flow_roots}
+
+    reactive_sub_targets: set[str] = set()
+    reactive_sub_files: set[str] = set()
+    for edge in edges:
+        if edge.get("edge_type") == EDGE_REACTIVE_SUBSCRIBE:
+            tgt = edge["target"]
+            reactive_sub_targets.add(tgt)
+            reactive_sub_files.add(tgt.split("::", 1)[0])
+
+    # 1. Grafo de funciones (excluye aristas inversas `reactive_trigger` para no crear falsos ciclos).
+    fn_ids = [n["id"] for n in function_nodes]
+    fn_id_set = set(fn_ids)
+    fn_adj: dict[str, set[str]] = {fid: set() for fid in fn_ids}
+    fn_in_count: dict[str, int] = {fid: 0 for fid in fn_ids}
+
+    for edge in edges:
+        if edge.get("edge_type") == EDGE_REACTIVE_TRIGGER:
+            continue
+        src = edge["source"]
+        tgt = edge["target"]
+        if src in fn_id_set and tgt in fn_id_set and src != tgt:
+            if tgt not in fn_adj[src]:
+                fn_adj[src].add(tgt)
+                fn_in_count[tgt] += 1
+
+    fn_dist_src, fn_dist_sink = _condense_dag_depths(fn_ids, fn_adj)
+
+    for node in function_nodes:
+        fid = node["id"]
+        d_src = fn_dist_src.get(fid, 0)
+        d_sink = fn_dist_sink.get(fid, 0)
+        in_deg = fn_in_count.get(fid, 0)
+        e_kind = node.get("entry_kind")
+        is_explicit_entry = (
+            bool(node.get("is_main_entry"))
+            or bool(node.get("is_module_entry"))
+            or e_kind in (ENTRY_KIND_MAIN, ENTRY_KIND_ROUTE, ENTRY_KIND_EVENT)
+            or fid in main_flow_roots
+        )
+        is_state_or_service = (
+            fid in reactive_sub_targets
+            or _looks_like_state_or_service_path(fid)
+        )
+
+        if is_explicit_entry or (d_src == 0 and d_sink > 0):
+            layer = 0
+        elif d_sink == 0:
+            if fid in reactive_sub_targets:
+                layer = 2
+            elif in_deg > 0 or node.get("is_terminal") or node.get("role") == ROLE_IO or e_kind == ENTRY_KIND_UNREFERENCED:
+                layer = 3
+            else:
+                layer = 2 if is_state_or_service else 3
+        else:
+            ratio = d_src / (d_src + d_sink)
+            if ratio > 0.5 or is_state_or_service or node.get("role") == ROLE_IO:
+                layer = 2
+            else:
+                layer = 1
+
+        node["arch_layer"] = layer
+
+    # 2. Grafo a nivel de archivos (DAG condensado de dependencias inter-archivo).
+    file_ids = [n["id"] for n in file_nodes]
+    file_id_set = set(file_ids)
+    file_adj: dict[str, set[str]] = {fid: set() for fid in file_ids}
+    file_in_count: dict[str, int] = {fid: 0 for fid in file_ids}
+
+    for edge in edges:
+        if edge.get("edge_type") == EDGE_REACTIVE_TRIGGER:
+            continue
+        src_file = edge["source"].split("::", 1)[0]
+        tgt_file = edge["target"].split("::", 1)[0]
+        if src_file in file_id_set and tgt_file in file_id_set and src_file != tgt_file:
+            if tgt_file not in file_adj[src_file]:
+                file_adj[src_file].add(tgt_file)
+                file_in_count[tgt_file] += 1
+
+    file_dist_src, file_dist_sink = _condense_dag_depths(file_ids, file_adj)
+
+    fns_by_file: dict[str, list[dict]] = {}
+    for fn in function_nodes:
+        fns_by_file.setdefault(fn["parent"], []).append(fn)
+
+    for fnode in file_nodes:
+        fid = fnode["id"]
+        d_src = file_dist_src.get(fid, 0)
+        d_sink = file_dist_sink.get(fid, 0)
+        in_deg = file_in_count.get(fid, 0)
+        is_file_entry = (
+            bool(fnode.get("is_main_entry"))
+            or fnode.get("language") == "html"
+            or fid in main_flow_root_files
+        )
+        is_state_service_file = fid in reactive_sub_files or _looks_like_state_or_service_path(fid)
+        file_fns = fns_by_file.get(fid, [])
+        has_non_terminal_internal_flow = any(
+            not fn.get("is_terminal") and fn.get("entry_kind") != ENTRY_KIND_UNREFERENCED
+            for fn in file_fns
+        )
+
+        if is_file_entry or (d_src == 0 and d_sink > 0):
+            layer = 0
+        elif d_sink == 0:
+            if is_state_service_file and (fid in reactive_sub_files or has_non_terminal_internal_flow):
+                layer = 2
+            elif in_deg > 0 or not file_fns:
+                layer = 3
+            else:
+                layer = 2 if is_state_service_file else 3
+        else:
+            ratio = d_src / (d_src + d_sink)
+            if ratio > 0.5 or is_state_service_file:
+                layer = 2
+            else:
+                layer = 1
+
+        fnode["arch_layer"] = layer

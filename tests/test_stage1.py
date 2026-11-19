@@ -375,7 +375,10 @@ class TestStage1AiExportAndCli(unittest.TestCase):
             self.assertNotIn("fingerprint", node)
             self.assertNotIn("internal_flow", node)
             for value in node.values():
-                self.assertNotIn(value, (None, "", False, []))
+                self.assertIsNot(value, None)
+                self.assertIsNot(value, False)
+                self.assertNotEqual(value, "")
+                self.assertNotEqual(value, [])
             for ext in node.get("external_calls", []):
                 self.assertNotIn("docs_url", ext)
                 self.assertNotIn("api_id", ext)

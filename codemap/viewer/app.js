@@ -69,6 +69,13 @@ const ENTRY_KIND_LABELS = {
 const NOTE_AUTOSAVE_MS = 500;
 const LARGE_PROJECT_FUNCTION_LIMIT = 25;
 
+const DEFAULT_ARCH_LAYERS = [
+  { index: 0, id: "layer::0", key: "entries", label: "Entradas / UI" },
+  { index: 1, id: "layer::1", key: "orchestrators", label: "Orquestadores" },
+  { index: 2, id: "layer::2", key: "services", label: "Servicios / Estado" },
+  { index: 3, id: "layer::3", key: "utilities", label: "Utilidades / Persistencia" },
+];
+
 const LEVEL_METADATA = {
   1: {
     badge: "Nivel 1 · Módulos",
@@ -110,6 +117,14 @@ const state = {
   isolateActiveContext: false,
   onDemandEdges: false,
   hoveredNodeId: null,
+  groupingMode: "folders",
+  nhops: {
+    active: false,
+    anchorIds: [],
+    forwardDepth: 1,
+    backwardDepth: 1,
+    autoTriggered: false,
+  },
   isolatedFileId: null,
   preIsolateCollapsedContainers: null,
   lastProjectedEdges: [],
@@ -283,6 +298,13 @@ function pruneStaleExpansionState() {
     state.isolatedFileId = null;
     state.preIsolateCollapsedContainers = null;
     updateFileIsolationHud();
+  }
+  if (state.nhops.active) {
+    state.nhops.anchorIds = state.nhops.anchorIds.filter((id) => state.nodesById.has(id));
+    if (state.nhops.anchorIds.length === 0) {
+      state.nhops.active = false;
+      updateNHopsHud();
+    }
   }
 }
 
@@ -524,6 +546,12 @@ async function applyExecutionFlow(flowId, { fit = true } = {}) {
     state.preIsolateCollapsedContainers = null;
     updateFileIsolationHud();
   }
+  if (cleanId && state.nhops.active) {
+    state.nhops.active = false;
+    state.nhops.anchorIds = [];
+    state.nhops.autoTriggered = false;
+    updateNHopsHud();
+  }
 
   if (cleanId && state.traceMode) {
     state.traceMode = false;
@@ -653,16 +681,15 @@ function renderHeader(meta, edgeCount) {
 // ---------------------------------------------------------------------------
 
 function getCurrentLayoutContextKey() {
+  let baseKey = "functions";
   if (state.expandedFunctions.size > 0 || state.activeLevel === 4) {
-    return "intra";
+    baseKey = "intra";
+  } else if (state.activeLevel === 1) {
+    baseKey = "modules";
+  } else if (state.activeLevel === 2) {
+    baseKey = "files";
   }
-  if (state.activeLevel === 1) {
-    return "modules";
-  }
-  if (state.activeLevel === 2) {
-    return "files";
-  }
-  return "functions";
+  return state.groupingMode === "layers" ? `layers_${baseKey}` : baseKey;
 }
 
 function getPinnedPositionForContext(noteEntry, contextKey = getCurrentLayoutContextKey()) {
@@ -757,7 +784,287 @@ async function saveOrphansList(orphans) {
 // y aislamiento puntual de archivo
 // ---------------------------------------------------------------------------
 
-async function applyLevel(level) {
+function isLayerContainerId(id) {
+  return typeof id === "string" && id.startsWith("layer::");
+}
+
+function getArchLayers() {
+  const fromMeta = state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.architectural_layers;
+  if (Array.isArray(fromMeta) && fromMeta.length > 0) {
+    return fromMeta;
+  }
+  return DEFAULT_ARCH_LAYERS;
+}
+
+function getNodeArchLayer(rawNode) {
+  if (rawNode && typeof rawNode.arch_layer === "number") {
+    return rawNode.arch_layer;
+  }
+  return 3;
+}
+
+function getLargeProjectThreshold() {
+  const fromMeta = state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.large_project_threshold;
+  return typeof fromMeta === "number" && fromMeta > 0 ? fromMeta : LARGE_PROJECT_FUNCTION_LIMIT;
+}
+
+function updateGroupingButtons() {
+  for (const btn of document.querySelectorAll(".group-btn")) {
+    btn.classList.toggle("active", btn.dataset.grouping === state.groupingMode);
+  }
+}
+
+async function setGroupingMode(mode) {
+  const cleanMode = mode === "layers" ? "layers" : "folders";
+  if (state.groupingMode === cleanMode) {
+    return;
+  }
+  state.groupingMode = cleanMode;
+  updateGroupingButtons();
+  await applyLevel(state.activeLevel, { preserveNHops: state.nhops.active });
+}
+
+function resolveDefaultNHopsAnchors() {
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    const sel = state.nodesById.get(state.selectedNodeId);
+    if (sel.type === "function") {
+      return [sel.id];
+    }
+    if (sel.type === "file") {
+      const fileFns = (state.childrenByParent.get(sel.id) || [])
+        .filter((n) => n.type === "function")
+        .map((n) => n.id);
+      if (fileFns.length > 0) {
+        return fileFns.slice(0, 4);
+      }
+      return [sel.id];
+    }
+  }
+  const meta = (state.rawGraph && state.rawGraph.meta) || {};
+  const mainFns = (meta.main_entry_functions || []).filter((id) => state.nodesById.has(id));
+  if (mainFns.length > 0) {
+    return mainFns.slice(0, 3);
+  }
+  const mainFlow = (state.rawGraph && state.rawGraph.execution_flows || []).find((f) => f.kind === "main");
+  if (mainFlow && mainFlow.root_id && state.nodesById.has(mainFlow.root_id)) {
+    return [mainFlow.root_id];
+  }
+  const firstFn = (state.rawGraph && state.rawGraph.nodes || []).find((n) => n.type === "function");
+  return firstFn ? [firstFn.id] : [];
+}
+
+function computeNHopsSubgraph() {
+  if (!state.rawGraph || !state.nhops.active || state.nhops.anchorIds.length === 0) {
+    return null;
+  }
+  const anchorSet = new Set(state.nhops.anchorIds.filter((id) => state.nodesById.has(id)));
+  if (anchorSet.size === 0) {
+    return null;
+  }
+
+  const activeFlow = getActiveFlow();
+  const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
+
+  const outAdj = new Map();
+  const inAdj = new Map();
+  for (const edge of state.rawGraph.edges) {
+    const src = edge.source;
+    const tgt = edge.target;
+    if (src === tgt) {
+      continue;
+    }
+    if (!anchorSet.has(src) && isUtilityNodeHidden(src, activeFlowNodeSet)) {
+      continue;
+    }
+    if (!anchorSet.has(tgt) && isUtilityNodeHidden(tgt, activeFlowNodeSet)) {
+      continue;
+    }
+    if (!outAdj.has(src)) outAdj.set(src, new Set());
+    if (!inAdj.has(tgt)) inAdj.set(tgt, new Set());
+    outAdj.get(src).add(tgt);
+    inAdj.get(tgt).add(src);
+  }
+
+  const reached = new Set(anchorSet);
+
+  // BFS hacia adelante (callees)
+  let frontier = [...anchorSet];
+  for (let step = 0; step < state.nhops.forwardDepth && frontier.length > 0; step += 1) {
+    const next = [];
+    for (const curr of frontier) {
+      for (const nb of outAdj.get(curr) || []) {
+        if (!reached.has(nb)) {
+          reached.add(nb);
+          next.push(nb);
+        }
+      }
+    }
+    frontier = next;
+  }
+
+  // BFS hacia atrás (callers)
+  frontier = [...anchorSet];
+  for (let step = 0; step < state.nhops.backwardDepth && frontier.length > 0; step += 1) {
+    const next = [];
+    for (const curr of frontier) {
+      for (const nb of inAdj.get(curr) || []) {
+        if (!reached.has(nb)) {
+          reached.add(nb);
+          next.push(nb);
+        }
+      }
+    }
+    frontier = next;
+  }
+
+  const allowedNodeIds = new Set();
+  for (const nid of reached) {
+    addNodeWithAncestors(allowedNodeIds, nid);
+  }
+
+  return { allowedNodeIds, allowedRawEdgeIds: null, reason: "nhops", reachedIds: reached };
+}
+
+function updateNHopsHud() {
+  const hud = document.getElementById("nhops-hud");
+  const label = document.getElementById("nhops-label");
+  const showAllBtn = document.getElementById("btn-nhops-show-all");
+  const btn1 = document.getElementById("btn-nhops-1");
+  const btn2 = document.getElementById("btn-nhops-2");
+  if (!hud || !label) {
+    return;
+  }
+  if (!state.nhops.active) {
+    hud.classList.add("hidden");
+    label.textContent = "";
+    return;
+  }
+  const totalFns = (state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.total_functions) || 0;
+  const shownFns = (state.lastVisibleSummaryCounts && state.lastVisibleSummaryCounts.functions) || 0;
+  const anchorTitle = state.nhops.anchorIds.length === 1
+    ? shortSummaryLabel(state.nhops.anchorIds[0])
+    : `${state.nhops.anchorIds.length} anclas`;
+  label.textContent = `🔭 Vecindad (${anchorTitle}) · ←${state.nhops.backwardDepth} / ${state.nhops.forwardDepth}→ · ${shownFns}/${totalFns} fns`;
+  if (showAllBtn) {
+    showAllBtn.textContent = `Mostrar todo (${totalFns})`;
+  }
+  if (btn1) {
+    btn1.classList.toggle("active", state.nhops.forwardDepth === 1 && state.nhops.backwardDepth === 1);
+  }
+  if (btn2) {
+    btn2.classList.toggle("active", state.nhops.forwardDepth === 2 && state.nhops.backwardDepth === 2);
+  }
+  hud.classList.remove("hidden");
+}
+
+function updateExploreNHopsButton(node) {
+  const btn = document.getElementById("btn-explore-nhops");
+  if (!btn) {
+    return;
+  }
+  if (!node || (node.type !== "function" && node.type !== "file")) {
+    btn.classList.add("hidden");
+    btn.classList.remove("active");
+    return;
+  }
+  const isAnchor = state.nhops.active && state.nhops.anchorIds.includes(node.id);
+  btn.textContent = isAnchor
+    ? "✕ Salir de vecindad N-hops"
+    : (state.nhops.active ? "🔭 Centrar vecindad aquí (1 hop)" : "🔭 Explorar vecindad (1 hop)");
+  btn.classList.toggle("active", isAnchor);
+  btn.classList.remove("hidden");
+}
+
+async function activateNHops(anchorIds, { forwardDepth = 1, backwardDepth = 1, autoTriggered = false } = {}) {
+  const validAnchors = (anchorIds || []).filter((id) => state.nodesById.has(id));
+  if (validAnchors.length === 0) {
+    return;
+  }
+  state.nhops = {
+    active: true,
+    anchorIds: validAnchors,
+    forwardDepth,
+    backwardDepth,
+    autoTriggered,
+  };
+  state.isolatedFileId = null;
+  state.preIsolateCollapsedContainers = null;
+  updateFileIsolationHud();
+
+  // Aseguramos nivel de funciones (contenedores abiertos) para explorar la vecindad real.
+  if (state.activeLevel < 3) {
+    state.activeLevel = 3;
+    updateLevelButtons(3);
+  }
+  state.collapsedContainers.clear();
+  await refreshGraphView({ fit: true });
+  updateNHopsHud();
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    updateExploreNHopsButton(state.nodesById.get(state.selectedNodeId));
+  }
+}
+
+async function exploreNHopsFromSelectedNode() {
+  if (!state.selectedNodeId || !state.nodesById.has(state.selectedNodeId)) {
+    return;
+  }
+  const node = state.nodesById.get(state.selectedNodeId);
+  if (state.nhops.active && state.nhops.anchorIds.includes(node.id)) {
+    await exitNHops();
+    return;
+  }
+  let anchors = [node.id];
+  if (node.type === "file") {
+    const childFns = (state.childrenByParent.get(node.id) || [])
+      .filter((n) => n.type === "function")
+      .map((n) => n.id);
+    if (childFns.length > 0) {
+      anchors = childFns.slice(0, 6);
+    }
+  }
+  await activateNHops(anchors, { forwardDepth: 1, backwardDepth: 1, autoTriggered: false });
+}
+
+async function adjustNHopsDepth(direction, delta) {
+  if (!state.nhops.active) {
+    return;
+  }
+  if (direction === "forward") {
+    state.nhops.forwardDepth = Math.max(0, Math.min(6, state.nhops.forwardDepth + delta));
+  } else {
+    state.nhops.backwardDepth = Math.max(0, Math.min(6, state.nhops.backwardDepth + delta));
+  }
+  await refreshGraphView({ fit: true });
+  updateNHopsHud();
+}
+
+async function setNHopsPreset(depth) {
+  if (!state.nhops.active) {
+    return;
+  }
+  state.nhops.forwardDepth = depth;
+  state.nhops.backwardDepth = depth;
+  await refreshGraphView({ fit: true });
+  updateNHopsHud();
+}
+
+async function exitNHops({ refresh = true } = {}) {
+  if (!state.nhops.active) {
+    return;
+  }
+  state.nhops.active = false;
+  state.nhops.anchorIds = [];
+  state.nhops.autoTriggered = false;
+  updateNHopsHud();
+  if (refresh) {
+    await refreshGraphView({ fit: true });
+  }
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    updateExploreNHopsButton(state.nodesById.get(state.selectedNodeId));
+  }
+}
+
+async function applyLevel(level, { forceShowAll = false, preserveNHops = false } = {}) {
   state.activeLevel = level;
   state.preFlowCollapsedContainers = null;
   state.isolatedFileId = null;
@@ -765,13 +1072,40 @@ async function applyLevel(level) {
   updateLevelButtons(level);
   updateFileIsolationHud();
 
+  if (!preserveNHops || level < 3) {
+    state.nhops.active = false;
+    state.nhops.anchorIds = [];
+    state.nhops.autoTriggered = false;
+  }
+
   state.collapsedContainers.clear();
   state.expandedFunctions.clear();
 
   if (level === 1) {
-    collapseTopContainers();
+    if (state.groupingMode === "layers") {
+      for (const layer of getArchLayers()) {
+        state.collapsedContainers.add(layer.id);
+      }
+    } else {
+      collapseTopContainers();
+    }
   } else if (level === 2) {
     collapseAllFiles();
+  } else if (level === 3 && !preserveNHops && !forceShowAll && !state.activeFlowId) {
+    const totalFns = (state.rawGraph && state.rawGraph.meta && state.rawGraph.meta.total_functions) || 0;
+    const largeLimit = getLargeProjectThreshold();
+    if (totalFns > largeLimit) {
+      const anchors = resolveDefaultNHopsAnchors();
+      if (anchors.length > 0) {
+        state.nhops = {
+          active: true,
+          anchorIds: anchors,
+          forwardDepth: 1,
+          backwardDepth: 1,
+          autoTriggered: true,
+        };
+      }
+    }
   } else if (level === 4) {
     expandFunctionFlowsSmart();
   }
@@ -789,8 +1123,11 @@ async function applyLevel(level) {
   }
 
   await refreshGraphView({ fit: true });
+  updateNHopsHud();
   if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
-    updateIsolateFileButton(state.nodesById.get(state.selectedNodeId));
+    const sel = state.nodesById.get(state.selectedNodeId);
+    updateIsolateFileButton(sel);
+    updateExploreNHopsButton(sel);
   }
 }
 
@@ -1130,11 +1467,11 @@ function resolveEndpointByCollapse(nodeId) {
 }
 
 function computeSubgraphFilter() {
-  if (!state.rawGraph || !state.isolateActiveContext) {
+  if (!state.rawGraph) {
     return null;
   }
 
-  if (state.traceMode && state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+  if (state.isolateActiveContext && state.traceMode && state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
     const focusId = resolveEndpointByCollapse(state.selectedNodeId) || state.selectedNodeId;
     const allowedNodeIds = new Set();
     addNodeWithAncestors(allowedNodeIds, focusId);
@@ -1165,7 +1502,7 @@ function computeSubgraphFilter() {
     return { allowedNodeIds, allowedRawEdgeIds: null, reason: "trace" };
   }
 
-  if (state.activeFlowId) {
+  if (state.isolateActiveContext && state.activeFlowId) {
     const flow = getActiveFlow();
     if (!flow) {
       return null;
@@ -1176,6 +1513,10 @@ function computeSubgraphFilter() {
     }
     const allowedRawEdgeIds = new Set(flow.edge_ids || []);
     return { allowedNodeIds, allowedRawEdgeIds, reason: "flow" };
+  }
+
+  if (state.nhops.active) {
+    return computeNHopsSubgraph();
   }
 
   return null;
@@ -1229,14 +1570,173 @@ function toggleOnDemandEdges() {
   applyCanvasHighlights();
 }
 
-function buildVisibleElements() {
+function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder, flowEdgeOrder) {
   const visibleNodeIds = new Set();
   const hiddenNodeIds = new Set();
   const nodes = [];
+  const layers = getArchLayers();
+  const layerMap = new Map(layers.map((l) => [l.index, l]));
+  const isFileTier = state.activeLevel <= 2;
 
+  const directEdgeFileIds = new Set();
+  for (const edge of state.rawGraph.edges) {
+    const srcNode = state.nodesById.get(edge.source);
+    const tgtNode = state.nodesById.get(edge.target);
+    if (srcNode && srcNode.type === "file") directEdgeFileIds.add(srcNode.id);
+    if (tgtNode && tgtNode.type === "file") directEdgeFileIds.add(tgtNode.id);
+  }
+
+  const membersByLayer = new Map();
+  const fnCountByLayer = new Map();
+  for (const layer of layers) {
+    membersByLayer.set(layer.index, []);
+    fnCountByLayer.set(layer.index, 0);
+  }
+
+  for (const rawNode of state.rawGraph.nodes) {
+    if (rawNode.type === "module") {
+      continue;
+    }
+    if (subgraphFilter && !subgraphFilter.allowedNodeIds.has(rawNode.id)) {
+      continue;
+    }
+    if (isUtilityNodeHidden(rawNode.id, activeFlowNodeSet)) {
+      hiddenNodeIds.add(rawNode.id);
+      continue;
+    }
+
+    const layerIdx = getNodeArchLayer(rawNode);
+    if (!membersByLayer.has(layerIdx)) {
+      membersByLayer.set(layerIdx, []);
+      fnCountByLayer.set(layerIdx, 0);
+    }
+
+    if (isFileTier) {
+      if (rawNode.type === "file") {
+        membersByLayer.get(layerIdx).push(rawNode);
+        fnCountByLayer.set(layerIdx, fnCountByLayer.get(layerIdx) + Math.max(1, countDescendantFunctions(rawNode.id)));
+      } else if (rawNode.type === "function") {
+        // Si el usuario expandió manualmente un archivo en N2, mostramos sus funciones dentro del archivo.
+        const parentFile = state.nodesById.get(rawNode.parent);
+        if (parentFile && !state.collapsedContainers.has(parentFile.id)) {
+          const parentLayer = getNodeArchLayer(parentFile);
+          membersByLayer.get(parentLayer).push(rawNode);
+        }
+      }
+    } else if (rawNode.type === "function" || (rawNode.type === "file" && directEdgeFileIds.has(rawNode.id))) {
+      membersByLayer.get(layerIdx).push(rawNode);
+      if (rawNode.type === "function") {
+        fnCountByLayer.set(layerIdx, fnCountByLayer.get(layerIdx) + 1);
+      }
+    }
+  }
+
+  for (const layer of layers) {
+    const members = membersByLayer.get(layer.index) || [];
+    if (members.length === 0) {
+      continue;
+    }
+    const isLayerCollapsed = state.collapsedContainers.has(layer.id);
+    const badgeCount = fnCountByLayer.get(layer.index) || members.length;
+    const layerLabel = isLayerCollapsed
+      ? `${layer.index} · ${layer.label} [+ ${badgeCount}]`
+      : `${layer.index} · ${layer.label}`;
+
+    visibleNodeIds.add(layer.id);
+    nodes.push({
+      data: {
+        id: layer.id,
+        parent: undefined,
+        label: layerLabel,
+        type: "layer",
+        role: "layer",
+        layerIndex: layer.index,
+        collapsed: isLayerCollapsed ? "true" : "false",
+        expandedFn: "false",
+        pinned: "false",
+        hasNote: "false",
+      },
+    });
+
+    if (isLayerCollapsed) {
+      continue;
+    }
+
+    for (const rawNode of members) {
+      const noteEntry = getNoteEntry(rawNode.id);
+      const isCollapsed = rawNode.type === "file" && state.collapsedContainers.has(rawNode.id);
+      const isExpandedFn = rawNode.type === "function" && state.expandedFunctions.has(rawNode.id);
+      const effectiveRole = noteEntry.custom_role || rawNode.role || rawNode.type;
+      const stepOrder = flowNodeOrder.get(rawNode.id) || null;
+      const isPinnedHere = !subgraphFilter && isPinnedInCurrentContext(noteEntry);
+
+      let parentId = layer.id;
+      if (isFileTier && rawNode.type === "function" && visibleNodeIds.has(rawNode.parent)) {
+        parentId = rawNode.parent;
+      }
+
+      let displayLabel = buildDisplayLabel(
+        rawNode,
+        isCollapsed,
+        noteEntry,
+        effectiveRole,
+        stepOrder,
+        activeFlowNodeSet,
+      );
+      if (!isFileTier && rawNode.type === "function" && rawNode.parent) {
+        const fileBase = rawNode.parent.split("/").pop() || rawNode.parent;
+        displayLabel = `${fileBase} :: ${displayLabel}`;
+      }
+
+      visibleNodeIds.add(rawNode.id);
+      nodes.push({
+        data: {
+          id: rawNode.id,
+          parent: parentId,
+          label: displayLabel,
+          type: rawNode.type,
+          role: effectiveRole,
+          entryKind: rawNode.entry_kind || "",
+          fileLang: rawNode.language || "",
+          mainEntry: rawNode.is_main_entry ? "true" : "false",
+          terminal: rawNode.type === "function" && rawNode.is_terminal ? "true" : "false",
+          pinned: isPinnedHere ? "true" : "false",
+          hasNote: noteEntry.note && noteEntry.note.trim() ? "true" : "false",
+          collapsed: isCollapsed ? "true" : "false",
+          expandedFn: isExpandedFn ? "true" : "false",
+          flowStepOrder: stepOrder || 0,
+        },
+      });
+
+      if (isExpandedFn) {
+        appendInternalFlowElements(rawNode, nodes, visibleNodeIds);
+      }
+    }
+  }
+
+  const edges = projectEdges(
+    visibleNodeIds,
+    hiddenNodeIds,
+    flowEdgeOrder,
+    subgraphFilter ? subgraphFilter.allowedRawEdgeIds : null,
+  );
+  appendInternalFlowEdges(nodes, edges, visibleNodeIds);
+
+  return { nodes, edges };
+}
+
+function buildVisibleElements() {
   const { flow: activeFlow, nodeOrder: flowNodeOrder, edgeOrder: flowEdgeOrder } = getActiveFlowStepMaps();
   const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
   const subgraphFilter = computeSubgraphFilter();
+
+  if (state.groupingMode === "layers") {
+    return buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder, flowEdgeOrder);
+  }
+
+  const visibleNodeIds = new Set();
+  const hiddenNodeIds = new Set();
+  const nodes = [];
 
   for (const rawNode of state.rawGraph.nodes) {
     if (subgraphFilter && !subgraphFilter.allowedNodeIds.has(rawNode.id)) {
@@ -1452,6 +1952,32 @@ function countDescendantFunctions(containerId) {
 }
 
 function resolveVisibleEndpoint(nodeId, visibleNodeIds) {
+  if (visibleNodeIds.has(nodeId)) {
+    return nodeId;
+  }
+  if (state.groupingMode === "layers") {
+    const raw = state.nodesById.get(nodeId);
+    if (!raw) {
+      return null;
+    }
+    if (raw.type === "function" && raw.parent && visibleNodeIds.has(raw.parent)) {
+      return raw.parent;
+    }
+    const ownLayerId = `layer::${getNodeArchLayer(raw)}`;
+    if (visibleNodeIds.has(ownLayerId)) {
+      return ownLayerId;
+    }
+    if (raw.type === "function" && raw.parent) {
+      const parentFile = state.nodesById.get(raw.parent);
+      if (parentFile) {
+        const parentLayerId = `layer::${getNodeArchLayer(parentFile)}`;
+        if (visibleNodeIds.has(parentLayerId)) {
+          return parentLayerId;
+        }
+      }
+    }
+    return null;
+  }
   let currentId = nodeId;
   while (currentId) {
     if (visibleNodeIds.has(currentId)) {
@@ -1851,6 +2377,42 @@ function buildStylesheet() {
         "border-color": "#526680",
         "background-color": "#111822",
       },
+    },
+    // Etapa 4: Contenedores de Capas Topológicas (Architectural Slicing)
+    {
+      selector: 'node[type = "layer"]',
+      style: {
+        "shape": "round-rectangle",
+        "background-color": "#131b26",
+        "background-opacity": 0.78,
+        "border-width": 2,
+        "border-style": "solid",
+        "border-color": "#64748b",
+        "padding": 22,
+        "label": "data(label)",
+        "color": "#e2e8f0",
+        "font-size": 12.5,
+        "font-weight": "bold",
+        "text-valign": "top",
+        "text-halign": "center",
+        "text-margin-y": -6,
+      },
+    },
+    {
+      selector: 'node[type = "layer"][layerIndex = 0]',
+      style: { "border-color": "#10b981", "background-color": "#0d221c", "color": "#a7f3d0" },
+    },
+    {
+      selector: 'node[type = "layer"][layerIndex = 1]',
+      style: { "border-color": "#38bdf8", "background-color": "#0e2030", "color": "#bae6fd" },
+    },
+    {
+      selector: 'node[type = "layer"][layerIndex = 2]',
+      style: { "border-color": "#a855f7", "background-color": "#1d142c", "color": "#e9d5ff" },
+    },
+    {
+      selector: 'node[type = "layer"][layerIndex = 3]',
+      style: { "border-color": "#f59e0b", "background-color": "#231a0d", "color": "#fde68a" },
     },
     {
       selector: 'node[type = "file"][mainEntry = "true"][fileLang != "html"]',
@@ -2358,6 +2920,7 @@ async function refreshGraphView({ fit = true } = {}) {
   const callEdges = edges.filter((e) => e.data && e.data.kind === "call");
   state.lastProjectedEdges = callEdges.map((e) => e.data);
   state.lastVisibleSummaryCounts = {
+    layers: nodes.filter((n) => n.data && n.data.type === "layer").length,
     modules: nodes.filter((n) => n.data && n.data.type === "module").length,
     files: nodes.filter((n) => n.data && n.data.type === "file").length,
     functions: nodes.filter((n) => n.data && n.data.type === "function").length,
@@ -2371,6 +2934,7 @@ async function refreshGraphView({ fit = true } = {}) {
     state.cy.fit(undefined, 36);
   }
   updateZoomIndicator();
+  updateNHopsHud();
   applyCanvasHighlights();
   if (!state.selectedNodeId) {
     renderEmptyInspectorSummary();
@@ -2415,25 +2979,36 @@ async function runElkLayout(visibleNodes, visibleEdges) {
 function buildElkInput(visibleNodes, visibleEdges) {
   const elkNodes = new Map();
   const dataById = new Map();
+  let hasLayerContainers = false;
+
   for (const item of visibleNodes) {
     dataById.set(item.data.id, item.data);
     const size = estimateNodeSize(item.data);
     const isFlowBox = item.data.expandedFn === "true" || item.data.flowContainer === "true";
+    const isLayerBox = item.data.type === "layer";
+    let nodeLayoutOptions = undefined;
+    if (isLayerBox) {
+      hasLayerContainers = true;
+      nodeLayoutOptions = {
+        "elk.partitioning.partition": String(item.data.layerIndex ?? 3),
+        "elk.padding": "[top=40,left=22,bottom=20,right=22]",
+      };
+    } else if (isFlowBox) {
+      nodeLayoutOptions = {
+        "elk.direction": "DOWN",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "30",
+        "elk.spacing.nodeNode": "26",
+        "elk.padding": item.data.flowContainer === "true"
+          ? "[top=38,left=24,bottom=22,right=24]"
+          : "[top=44,left=24,bottom=22,right=24]",
+      };
+    }
     elkNodes.set(item.data.id, {
       id: item.data.id,
       width: size.width,
       height: size.height,
       children: [],
-      layoutOptions: isFlowBox
-        ? {
-            "elk.direction": "DOWN",
-            "elk.layered.spacing.nodeNodeBetweenLayers": "30",
-            "elk.spacing.nodeNode": "26",
-            "elk.padding": item.data.flowContainer === "true"
-              ? "[top=38,left=24,bottom=22,right=24]"
-              : "[top=44,left=24,bottom=22,right=24]",
-          }
-        : undefined,
+      layoutOptions: nodeLayoutOptions,
     });
   }
 
@@ -2480,9 +3055,16 @@ function buildElkInput(visibleNodes, visibleEdges) {
     return elkEdge;
   });
 
+  const rootLayoutOptions = hasLayerContainers
+    ? {
+        ...ELK_LAYOUT_OPTIONS,
+        "elk.partitioning.activate": "true",
+      }
+    : ELK_LAYOUT_OPTIONS;
+
   return {
     id: "root",
-    layoutOptions: ELK_LAYOUT_OPTIONS,
+    layoutOptions: rootLayoutOptions,
     children: rootChildren,
     edges: elkEdges,
   };
@@ -3130,6 +3712,15 @@ async function stepTrace(direction) {
 // ---------------------------------------------------------------------------
 
 async function toggleNodeExpansion(nodeId) {
+  if (isLayerContainerId(nodeId)) {
+    if (state.collapsedContainers.has(nodeId)) {
+      state.collapsedContainers.delete(nodeId);
+    } else {
+      state.collapsedContainers.add(nodeId);
+    }
+    await refreshGraphView({ fit: true });
+    return;
+  }
   const node = state.nodesById.get(nodeId);
   if (!node) {
     return;
@@ -3179,23 +3770,28 @@ function renderEmptyInspectorSummary() {
   const statsEl = document.getElementById("summary-stats");
 
   if (badgeEl) {
-    badgeEl.textContent = state.isolatedFileId
-      ? `${levelMeta.badge} · Archivo aislado`
-      : levelMeta.badge;
+    const modeTag = state.groupingMode === "layers" ? " · Capas" : "";
+    const isoTag = state.isolatedFileId ? " · Archivo aislado" : (state.nhops.active ? " · N-hops" : "");
+    badgeEl.textContent = `${levelMeta.badge}${modeTag}${isoTag}`;
   }
   if (titleEl) {
     titleEl.textContent = state.isolatedFileId
       ? `Foco en ${state.isolatedFileId}`
-      : levelMeta.title;
+      : (state.groupingMode === "layers" ? `${levelMeta.title} (Capas de Flujo)` : levelMeta.title);
   }
   if (hintEl) {
-    hintEl.textContent = levelMeta.hint;
+    hintEl.textContent = state.groupingMode === "layers"
+      ? "Flujo estratificado de arriba hacia abajo: Entradas/UI → Orquestadores → Servicios/Estado → Utilidades."
+      : levelMeta.hint;
   }
 
   if (statsEl) {
     statsEl.innerHTML = "";
-    const counts = state.lastVisibleSummaryCounts || { modules: 0, files: 0, functions: 0, edges: 0 };
+    const counts = state.lastVisibleSummaryCounts || { layers: 0, modules: 0, files: 0, functions: 0, edges: 0 };
     const pills = [];
+    if (counts.layers > 0) {
+      pills.push(`${counts.layers} capas`);
+    }
     if (counts.modules > 0) {
       pills.push(`${counts.modules} mód.`);
     }
@@ -3385,6 +3981,7 @@ function selectNode(nodeId, stepId = undefined) {
   updateToggleButton(node);
   updateFloatingOpenButton(node);
   updateIsolateFileButton(node);
+  updateExploreNHopsButton(node);
   updateRoleSelector(node, noteEntry);
 
   document.getElementById("detail-note-input").value = noteEntry.note || "";
@@ -4809,6 +5406,9 @@ function bindControls() {
   for (const btn of document.querySelectorAll(".level-btn")) {
     btn.addEventListener("click", () => applyLevel(Number(btn.dataset.level)));
   }
+  for (const btn of document.querySelectorAll(".group-btn")) {
+    btn.addEventListener("click", () => setGroupingMode(btn.dataset.grouping));
+  }
 
   const toggleSidebarBtn = document.getElementById("btn-toggle-sidebar");
   if (toggleSidebarBtn) {
@@ -4950,6 +5550,30 @@ function bindControls() {
   const exitIsolateFileBtn = document.getElementById("btn-exit-file-isolation");
   if (exitIsolateFileBtn) {
     exitIsolateFileBtn.addEventListener("click", () => exitFileIsolation());
+  }
+  const exploreNHopsBtn = document.getElementById("btn-explore-nhops");
+  if (exploreNHopsBtn) {
+    exploreNHopsBtn.addEventListener("click", () => exploreNHopsFromSelectedNode());
+  }
+  const nhopsAddBackBtn = document.getElementById("btn-nhops-add-back");
+  if (nhopsAddBackBtn) {
+    nhopsAddBackBtn.addEventListener("click", () => adjustNHopsDepth("backward", 1));
+  }
+  const nhopsAddFwdBtn = document.getElementById("btn-nhops-add-fwd");
+  if (nhopsAddFwdBtn) {
+    nhopsAddFwdBtn.addEventListener("click", () => adjustNHopsDepth("forward", 1));
+  }
+  const nhops1Btn = document.getElementById("btn-nhops-1");
+  if (nhops1Btn) {
+    nhops1Btn.addEventListener("click", () => setNHopsPreset(1));
+  }
+  const nhops2Btn = document.getElementById("btn-nhops-2");
+  if (nhops2Btn) {
+    nhops2Btn.addEventListener("click", () => setNHopsPreset(2));
+  }
+  const nhopsShowAllBtn = document.getElementById("btn-nhops-show-all");
+  if (nhopsShowAllBtn) {
+    nhopsShowAllBtn.addEventListener("click", () => exitNHops());
   }
 
   window.addEventListener("resize", () => {
@@ -5146,6 +5770,10 @@ function bindGlobalShortcuts() {
       }
       if (state.isolatedFileId) {
         exitFileIsolation();
+        return;
+      }
+      if (state.nhops.active) {
+        exitNHops();
         return;
       }
       if (state.activeFlowId) {
