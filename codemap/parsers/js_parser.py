@@ -229,6 +229,16 @@ JS_TRIVIAL_DOM_LOOKUP_METHODS = frozenset(
     }
 )
 JS_CLASSLIST_METHODS = frozenset({"add", "remove", "toggle", "replace"})
+_JS_FILE_DOC_TAG_RE = re.compile(r"@(?:file|fileoverview|overview|module)\b", re.IGNORECASE)
+_JS_FILE_TAG_STRIP_RE = re.compile(r"^@(?:fileoverview|file|overview)\b[:\s-]*", re.IGNORECASE)
+_JS_PRAGMA_BLOCK_RE = re.compile(
+    r"^/\*+\s*(?:eslint|jshint|jslint|global|exported|istanbul|c8|v8|@ts-|@jsx|prettier-ignore|biome-ignore)\b",
+    re.IGNORECASE,
+)
+_JS_PRAGMA_LINE_RE = re.compile(
+    r"^//\s*(?:@ts-|eslint-|jshint|prettier-ignore|biome-ignore)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -262,13 +272,21 @@ def parse_js_file(path: str, source: bytes, language: str) -> FileAnalysis:
         )
     collect_module_callbacks(root, source, language, function_nodes)
     function_nodes = dict(sorted(function_nodes.items()))
+    file_docstring, file_doc_key = extract_file_docstring(root, source, function_nodes)
+    analysis.docstring = file_docstring
 
     calls_by_function, module_calls = collect_calls(root, source, language, function_nodes)
 
     used_names: set[str] = set()
     qualname_by_key: dict[NodeKey, str] = {}
     for key, candidate in function_nodes.items():
-        info = build_function(candidate, source, function_nodes, calls_by_function.get(key, []))
+        info = build_function(
+            candidate,
+            source,
+            function_nodes,
+            calls_by_function.get(key, []),
+            file_doc_key=file_doc_key,
+        )
         info.qualname = unique_qualname(info.qualname, info.line, used_names)
         qualname_by_key[key] = info.qualname
         analysis.functions.append(info)
@@ -507,6 +525,8 @@ def build_function(
     source: bytes,
     functions: dict[NodeKey, FunctionNode],
     calls: list[CallSite],
+    *,
+    file_doc_key: NodeKey | None = None,
 ) -> FunctionInfo:
     node = candidate.node
     scope_names, class_name, container = scope_chain(node, source, functions)
@@ -543,7 +563,7 @@ def build_function(
         container=container,
         line=line_of(node),
         signature=signature_text(source, candidate.anchor, body),
-        docstring=extract_jsdoc(candidate.anchor, source),
+        docstring=extract_jsdoc(candidate.anchor, source, file_doc_key=file_doc_key),
         param_count=len(params),
         calls=calls,
         internal_flow=build_flow(
@@ -580,7 +600,74 @@ def mutates_global(body: Node | None, source: bytes, functions: dict[NodeKey, Fu
     return False
 
 
-def extract_jsdoc(anchor: Node, source: bytes) -> str:
+def _node_declares_function_or_class(node: Node, function_nodes: dict[NodeKey, FunctionNode]) -> bool:
+    """True si la sentencia declara una función/clase a la que pertenecería un JSDoc contiguo."""
+    if node.type in ("function_declaration", "generator_function_declaration") or node.type in CLASS_TYPES:
+        return True
+    if node.type in ("export_statement", "lexical_declaration", "variable_declaration"):
+        start_b, end_b = node.start_byte, node.end_byte
+        for fn_start, fn_end in function_nodes:
+            if start_b <= fn_start and fn_end <= end_b:
+                return True
+        for child in node.named_children:
+            if child.type in CLASS_TYPES or child.type in ("function_declaration", "generator_function_declaration"):
+                return True
+    return False
+
+
+def extract_file_docstring(
+    root: Node | None,
+    source: bytes,
+    function_nodes: dict[NodeKey, FunctionNode],
+) -> tuple[str, NodeKey | None]:
+    """Extrae el docstring/comentario JSDoc o de cabecera de un archivo JS/TS sin robar JSDoc de funciones."""
+    if root is None or root.named_child_count == 0:
+        return "", None
+
+    candidate: Node | None = None
+    for child in root.named_children:
+        if child.type == "hash_bang_line":
+            continue
+        if child.type == "comment":
+            raw = node_text(child, source).strip()
+            if raw.startswith("//"):
+                if _JS_PRAGMA_LINE_RE.match(raw):
+                    continue
+                return "", None
+            if raw.startswith("/*") and raw.endswith("*/"):
+                if _JS_PRAGMA_BLOCK_RE.match(raw):
+                    continue
+                candidate = child
+                break
+            return "", None
+        break
+
+    if candidate is None:
+        return "", None
+
+    raw = node_text(candidate, source).strip()
+    has_file_tag = bool(_JS_FILE_DOC_TAG_RE.search(raw))
+    next_sib = candidate.next_named_sibling
+
+    if not has_file_tag and next_sib is not None:
+        line_gap = next_sib.start_point[0] - candidate.end_point[0]
+        if line_gap < 2 and _node_declares_function_or_class(next_sib, function_nodes):
+            return "", None
+
+    inner = raw[3:-2] if raw.startswith("/**") else raw[2:-2]
+    cleaned_lines: list[str] = []
+    for line in inner.splitlines():
+        text = line.strip().lstrip("*").strip()
+        text = _JS_FILE_TAG_STRIP_RE.sub("", text).strip()
+        if text:
+            cleaned_lines.append(text)
+    docstring = "\n".join(cleaned_lines).strip()[:DOCSTRING_MAX_CHARS]
+    if not docstring:
+        return "", None
+    return docstring, node_key(candidate)
+
+
+def extract_jsdoc(anchor: Node, source: bytes, *, file_doc_key: NodeKey | None = None) -> str:
     """Comentario /** ... */ inmediatamente anterior a la declaración."""
     target = anchor
     while target.parent is not None and target.parent.type in (
@@ -589,6 +676,8 @@ def extract_jsdoc(anchor: Node, source: bytes) -> str:
         target = target.parent
     previous = target.prev_named_sibling
     if previous is None or previous.type != "comment":
+        return ""
+    if file_doc_key is not None and node_key(previous) == file_doc_key:
         return ""
     raw = node_text(previous, source)
     if not raw.startswith("/**"):

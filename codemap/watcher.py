@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -35,13 +36,19 @@ class DebouncedRebuildHandler(FileSystemEventHandler):
         self.debounce_seconds = debounce_seconds
         self.gitignore = None if is_single_file else GitIgnoreMatcher(self.target)
         self._timer_handle: asyncio.TimerHandle | None = None
+        self._tasks: set[asyncio.Task] = set()
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory or event.event_type in READ_ONLY_EVENTS:
             return
         candidates = [getattr(event, "src_path", None), getattr(event, "dest_path", None)]
         if any(self._is_relevant_path(raw) for raw in candidates if raw):
-            self.loop.call_soon_threadsafe(self._schedule_debounce)
+            if self.loop.is_closed():
+                return
+            try:
+                self.loop.call_soon_threadsafe(self._schedule_debounce)
+            except RuntimeError:
+                return
 
     def _is_relevant_path(self, raw_path: str) -> bool:
         try:
@@ -83,7 +90,17 @@ class DebouncedRebuildHandler(FileSystemEventHandler):
 
     def _trigger_rebuild(self) -> None:
         self._timer_handle = None
-        self.loop.create_task(self.on_rebuild())
+        task = self.loop.create_task(self.on_rebuild())
+        self._tasks.add(task)
+        task.add_done_callback(self._on_rebuild_done)
+
+    def _on_rebuild_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"[CodeMap] Error inesperado en tarea de recarga: {exc}", file=sys.stderr)
 
 
 def start_watcher(

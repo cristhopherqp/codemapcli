@@ -7,12 +7,15 @@ Separa los datos humanos (notas, anclajes, roles manuales, huérfanas) del
 from __future__ import annotations
 
 import json
+import math
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from codemap.paths import project_storage_dir
+from codemap.paths import atomic_write_text, project_storage_dir
 
 NOTES_FILE_NAME = "notes.json"
+_NOTES_LOCK = threading.RLock()
 ALLOWED_NODE_FIELDS = (
     "note",
     "pinned",
@@ -24,7 +27,7 @@ ALLOWED_NODE_FIELDS = (
 )
 VALID_LAYOUT_LEVELS = frozenset(
     {
-        # Claves semánticas por escala (y modo Capas de Flujo)
+        # Claves semánticas por escala (modo Ejecución / Carpetas y Capas)
         "modules",
         "files",
         "functions",
@@ -33,6 +36,15 @@ VALID_LAYOUT_LEVELS = frozenset(
         "layers_files",
         "layers_functions",
         "layers_intra",
+        # Claves semánticas independientes para modo Orden de Creación (↑ Creación)
+        "creation_modules",
+        "creation_files",
+        "creation_functions",
+        "creation_intra",
+        "creation_layers_modules",
+        "creation_layers_files",
+        "creation_layers_functions",
+        "creation_layers_intra",
         # Retrocompatibilidad con notes.json previos
         "level_1",
         "level_2",
@@ -59,6 +71,14 @@ def default_node_entry(fingerprint: str = "") -> dict:
     }
 
 
+def _finite_float(value: object) -> float | None:
+    """Devuelve float finito o None (rechaza bool, NaN e Infinity)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    fval = float(value)
+    return fval if math.isfinite(fval) else None
+
+
 def _normalize_pinned_positions(raw_positions: object) -> dict[str, dict[str, float]]:
     if not isinstance(raw_positions, dict):
         return {}
@@ -66,10 +86,10 @@ def _normalize_pinned_positions(raw_positions: object) -> dict[str, dict[str, fl
     for level_key, coords in raw_positions.items():
         if level_key not in VALID_LAYOUT_LEVELS or not isinstance(coords, dict):
             continue
-        x = coords.get("x")
-        y = coords.get("y")
-        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-            clean[level_key] = {"x": float(x), "y": float(y)}
+        x = _finite_float(coords.get("x"))
+        y = _finite_float(coords.get("y"))
+        if x is not None and y is not None:
+            clean[level_key] = {"x": x, "y": y}
     return clean
 
 
@@ -80,8 +100,8 @@ def normalize_node_entry(raw: dict | None, fingerprint: str = "") -> dict:
         return entry
     entry["note"] = str(raw.get("note") or "")
     entry["pinned"] = bool(raw.get("pinned", False))
-    entry["x"] = raw.get("x") if isinstance(raw.get("x"), (int, float)) else None
-    entry["y"] = raw.get("y") if isinstance(raw.get("y"), (int, float)) else None
+    entry["x"] = _finite_float(raw.get("x"))
+    entry["y"] = _finite_float(raw.get("y"))
     entry["pinned_positions"] = _normalize_pinned_positions(raw.get("pinned_positions"))
     custom_role = raw.get("custom_role")
     entry["custom_role"] = str(custom_role) if custom_role else None
@@ -120,17 +140,18 @@ def load_notes(target_path: str) -> dict:
 
 
 def save_notes(target_path: str, notes: dict) -> Path:
-    """Escribe ~/.codemap/<hash>/notes.json."""
-    path = notes_path(target_path)
-    clean = {
-        "nodes": {
-            node_id: normalize_node_entry(entry)
-            for node_id, entry in notes.get("nodes", {}).items()
-        },
-        "orphans": list(notes.get("orphans", [])),
-    }
-    path.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
-    return path
+    """Escribe ~/.codemap/<hash>/notes.json de forma atómica."""
+    with _NOTES_LOCK:
+        path = notes_path(target_path)
+        clean = {
+            "nodes": {
+                node_id: normalize_node_entry(entry)
+                for node_id, entry in notes.get("nodes", {}).items()
+            },
+            "orphans": list(notes.get("orphans", [])),
+        }
+        atomic_write_text(path, json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
 
 
 def _utc_now_iso() -> str:
@@ -158,74 +179,76 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
       `fingerprint` AST, transfiere automáticamente nota, rol y coordenadas.
     - Si desaparece definitivamente y tenía contenido humano, la mueve a `orphans`.
     """
-    notes = load_notes(target_path)
-    nodes_map: dict[str, dict] = notes["nodes"]
-    graph_nodes = {node["id"]: node for node in graph.get("nodes", [])}
+    with _NOTES_LOCK:
+        notes = load_notes(target_path)
+        nodes_map: dict[str, dict] = notes["nodes"]
+        graph_nodes = {node["id"]: node for node in graph.get("nodes", [])}
 
-    for node_id, entry in nodes_map.items():
-        if node_id in graph_nodes:
-            fp = graph_nodes[node_id].get("fingerprint") or ""
-            if fp:
-                entry["last_fingerprint"] = fp
+        for node_id, entry in nodes_map.items():
+            if node_id in graph_nodes:
+                fp = graph_nodes[node_id].get("fingerprint") or ""
+                if fp:
+                    entry["last_fingerprint"] = fp
 
-    missing_ids = [node_id for node_id in list(nodes_map) if node_id not in graph_nodes]
-    if not missing_ids:
+        missing_ids = [node_id for node_id in list(nodes_map) if node_id not in graph_nodes]
+        if not missing_ids:
+            return notes
+
+        candidates = _new_functions_by_key(graph_nodes, set(nodes_map))
+        now_iso = _utc_now_iso()
+
+        for old_id in missing_ids:
+            entry = nodes_map.pop(old_id)
+            if not has_user_content(entry):
+                continue
+
+            old_file = old_id.split("::", 1)[0] if "::" in old_id else ""
+            fp = entry.get("last_fingerprint") or ""
+            pool = candidates.get((old_file, fp), []) if (old_file and fp) else []
+
+            if pool:
+                target_node = pool.pop(0)
+                entry["last_fingerprint"] = target_node.get("fingerprint") or fp
+                nodes_map[target_node["id"]] = entry
+            else:
+                notes["orphans"].append(
+                    {
+                        "old_id": old_id,
+                        "note": entry["note"],
+                        "custom_role": entry["custom_role"],
+                        "last_fingerprint": fp,
+                        "orphaned_at": now_iso,
+                    }
+                )
+
+        save_notes(target_path, notes)
         return notes
-
-    candidates = _new_functions_by_key(graph_nodes, set(nodes_map))
-    now_iso = _utc_now_iso()
-
-    for old_id in missing_ids:
-        entry = nodes_map.pop(old_id)
-        if not has_user_content(entry):
-            continue
-
-        old_file = old_id.split("::", 1)[0] if "::" in old_id else ""
-        fp = entry.get("last_fingerprint") or ""
-        pool = candidates.get((old_file, fp), []) if (old_file and fp) else []
-
-        if pool:
-            target_node = pool.pop(0)
-            entry["last_fingerprint"] = target_node.get("fingerprint") or fp
-            nodes_map[target_node["id"]] = entry
-        else:
-            notes["orphans"].append(
-                {
-                    "old_id": old_id,
-                    "note": entry["note"],
-                    "custom_role": entry["custom_role"],
-                    "last_fingerprint": fp,
-                    "orphaned_at": now_iso,
-                }
-            )
-
-    save_notes(target_path, notes)
-    return notes
 
 
 def update_notes(target_path: str, payload: dict, graph: dict) -> dict:
     """Aplica cambios parciales enviados desde el visor web y guarda notes.json."""
-    notes = load_notes(target_path)
-    nodes_map: dict[str, dict] = notes["nodes"]
-    graph_nodes = {node["id"]: node for node in graph.get("nodes", [])}
+    with _NOTES_LOCK:
+        notes = load_notes(target_path)
+        nodes_map: dict[str, dict] = notes["nodes"]
+        graph_nodes = {node["id"]: node for node in graph.get("nodes", [])}
 
-    if isinstance(payload.get("nodes"), dict):
-        for node_id, patch in payload["nodes"].items():
-            if not isinstance(patch, dict):
-                continue
-            graph_fp = graph_nodes.get(node_id, {}).get("fingerprint") or ""
-            current = normalize_node_entry(nodes_map.get(node_id), graph_fp)
-            for field in ALLOWED_NODE_FIELDS:
-                if field in patch:
-                    current[field] = patch[field]
-            normalized = normalize_node_entry(current, graph_fp)
-            if has_user_content(normalized):
-                nodes_map[node_id] = normalized
-            else:
-                nodes_map.pop(node_id, None)
+        if isinstance(payload.get("nodes"), dict):
+            for node_id, patch in payload["nodes"].items():
+                if not isinstance(patch, dict):
+                    continue
+                graph_fp = graph_nodes.get(node_id, {}).get("fingerprint") or ""
+                current = normalize_node_entry(nodes_map.get(node_id), graph_fp)
+                for field in ALLOWED_NODE_FIELDS:
+                    if field in patch:
+                        current[field] = patch[field]
+                normalized = normalize_node_entry(current, graph_fp)
+                if has_user_content(normalized):
+                    nodes_map[node_id] = normalized
+                else:
+                    nodes_map.pop(node_id, None)
 
-    if isinstance(payload.get("orphans"), list):
-        notes["orphans"] = payload["orphans"]
+        if isinstance(payload.get("orphans"), list):
+            notes["orphans"] = payload["orphans"]
 
-    save_notes(target_path, notes)
-    return notes
+        save_notes(target_path, notes)
+        return notes

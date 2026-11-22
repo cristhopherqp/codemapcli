@@ -137,6 +137,7 @@ class FileAnalysis:
 
     path: str                  # ruta absoluta POSIX
     language: str              # "python" | "javascript" | "typescript" | "tsx" | "html"
+    docstring: str = ""
     functions: list[FunctionInfo] = field(default_factory=list)
     imports: list[ImportBinding] = field(default_factory=list)
     class_names: set[str] = field(default_factory=set)

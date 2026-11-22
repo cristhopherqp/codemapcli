@@ -30,6 +30,17 @@
         <button id="btn-group-layers" class="group-btn" type="button" data-grouping="layers" title="Agrupar automáticamente por capas topológicas de flujo">Capas de Flujo</button>
       </div>
 
+      <button
+        id="btn-layout-order"
+        class="layout-order-btn"
+        type="button"
+        data-order="execution"
+        aria-pressed="false"
+        title="Orden de Ejecución activo (entradas arriba, destinos abajo). Clic para cambiar a ↑ Creación"
+      >
+        Orden: ↓ Ejecución
+      </button>
+
       <div class="flow-selector-wrap" aria-label="Selector de hilos de ejecución">
         <select id="flow-select" class="flow-select" title="Seleccionar hilo de ejecución (Arranque o Feature)">
           <option value="">Hilo: Todos</option>
@@ -97,6 +108,12 @@
           <span class="tool-label">Ayuda / Atajos (?)</span>
         </button>
       </nav>
+      <div class="sidebar-footer">
+        <button id="btn-toggle-legend" class="action-btn sidebar-btn active" type="button" aria-expanded="true" title="Ocultar leyenda visual">
+          <span class="tool-icon" aria-hidden="true">🗺️</span>
+          <span class="tool-label">Leyenda</span>
+        </button>
+      </div>
     </aside>
 
     <section class="canvas-area" id="canvas-area">
@@ -127,12 +144,10 @@
         </div>
       </div>
       <div id="edge-tooltip" class="edge-tooltip hidden" role="tooltip"></div>
+      <div id="node-tooltip" class="node-tooltip hidden" role="tooltip"></div>
       <button id="btn-show-panel" class="floating-panel-toggle hidden" type="button" title="Mostrar inspector (] o Ctrl+\)">◀ Inspector</button>
 
       <aside id="graph-legend" class="legend" aria-label="Leyenda visual">
-        <div class="legend-header">
-          <button id="btn-toggle-legend" class="legend-toggle-btn" type="button" aria-expanded="true" title="Mostrar u ocultar leyenda">Leyenda ▾</button>
-        </div>
         <div id="legend-body" class="legend-body">
           <div class="legend-section">
             <span class="legend-title">Nodos</span>
@@ -266,7 +281,7 @@
           </select>
         </div>
 
-        <div class="detail-block">
+        <div id="detail-note-block" class="detail-block">
           <div class="note-header">
             <h3>Nota Personal</h3>
             <span id="note-save-status" class="save-status"></span>
@@ -285,8 +300,15 @@
         </div>
 
         <div id="detail-docstring-block" class="detail-block hidden">
-          <h3>Docstring</h3>
+          <h3 id="detail-docstring-title">Docstring</h3>
           <p id="detail-docstring" class="docstring-text"></p>
+        </div>
+
+        <div id="detail-file-functions-block" class="detail-block hidden">
+          <h3 id="detail-file-functions-title">Funciones del archivo</h3>
+          <div class="file-functions-box">
+            <ol id="detail-file-functions-list" class="file-functions-list"></ol>
+          </div>
         </div>
 
         <div id="detail-internal-calls-block" class="detail-block hidden">
@@ -461,14 +483,15 @@
       </div>
       <ul class="shortcuts-list">
         <li><span><kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> / <kbd>4</kbd></span><span>Cambiar nivel: Módulos · Archivos · Funciones · Intra-función</span></li>
-        <li><span><kbd>Espacio</kbd> + Arrastrar</span><span>Modo Mano: mover cámara incluso encima de nodos</span></li>
-        <li><span>Clic central + Arrastrar</span><span>Paneo libre en cualquier momento sin mover nodos</span></li>
+        <li><span><kbd>Espacio</kbd> + Arrastrar</span><span>Modo Mano: mover cámara incluso encima de nodos (grafo y ventanas flotantes)</span></li>
+        <li><span>Clic derecho o central + Arrastrar</span><span>Paneo libre en el grafo principal y ventanas flotantes sin mover nodos</span></li>
         <li><span>Rueda / <kbd>+</kbd> / <kbd>-</kbd></span><span>Acercar o alejar zoom centrado</span></li>
         <li><span><kbd>F</kbd> o <kbd>Ctrl</kbd>+<kbd>0</kbd></span><span>Ajustar todo el grafo a la pantalla</span></li>
         <li><span><kbd>T</kbd> + <kbd>↑</kbd>/<kbd>↓</kbd> + <kbd>→</kbd>/<kbd>Enter</kbd></span><span>Modo Foco: elegir rama candidata y saltar</span></li>
         <li><span><kbd>←</kbd> en Modo Foco</span><span>Retroceder en historial o elegir llamador</span></li>
         <li><span><kbd>Ctrl</kbd>+<kbd>K</kbd></span><span>Abrir buscador instantáneo</span></li>
         <li><span><kbd>R</kbd></span><span>Re-ordenar nodos no fijados (ELKjs)</span></li>
+        <li><span>Botón <code>Orden: ↓ / ↑</code></span><span>Alternar entre orden de ejecución (entradas arriba) y orden de creación (helpers arriba con escalonamiento por línea)</span></li>
         <li><span><kbd>]</kbd> o <kbd>Ctrl</kbd>+<kbd>\</kbd></span><span>Ocultar o desplegar panel lateral inspector</span></li>
         <li><span><kbd>Esc</kbd></span><span>Cerrar modales / ventana flotante hoja / salir de Foco, aislamiento o Hilo / deseleccionar</span></li>
         <li><span>Doble clic en nodo</span><span>Colapsar / expandir contenedor o flujo interno</span></li>

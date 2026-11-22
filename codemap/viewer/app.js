@@ -27,7 +27,10 @@ const ELK_LAYOUT_OPTIONS = {
   "elk.padding": "[top=38,left=20,bottom=20,right=20]",
   "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
   "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+  "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
 };
+
+const CREATION_ROW_STAGGER_PX = 14;
 
 const ROLE_LABELS = {
   entry: "Entrada",
@@ -118,6 +121,7 @@ const state = {
   onDemandEdges: false,
   hoveredNodeId: null,
   groupingMode: "folders",
+  layoutOrderMode: "execution",
   nhops: {
     active: false,
     anchorIds: [],
@@ -144,6 +148,12 @@ const state = {
   panelCollapsed: false,
   spacePanning: false,
   suppressNextTap: false,
+  mainPanCleanup: null,
+  mainTooltipCleanup: null,
+  nodeTooltipTimer: null,
+  nodeTooltipTargetId: null,
+  nodeTooltipPos: null,
+  nodeTooltipContainerEl: null,
   traceMode: false,
   traceHistory: [],
   traceDirection: "forward",
@@ -191,14 +201,15 @@ async function initViewer() {
   updateUtilitiesButton();
   updateOrphansBadge();
   updateKnownApisButton();
+  updateLayoutOrderButton();
   initCytoscape();
   bindControls();
   connectWebSocket();
 
   const totalFuncs = (state.rawGraph.meta && state.rawGraph.meta.total_functions) || 0;
-  if (!state.legendUserToggled && (state.rawGraph.nodes.length > 25 || totalFuncs >= 20)) {
-    toggleLegend(true);
-  }
+  const shouldStartCollapsed = !state.legendUserToggled
+    && (state.rawGraph.nodes.length > 25 || totalFuncs >= 20);
+  toggleLegend(shouldStartCollapsed);
 
   const initialLevel = state.rawGraph.meta.recommended_level || 2;
   await applyLevel(initialLevel);
@@ -689,7 +700,8 @@ function getCurrentLayoutContextKey() {
   } else if (state.activeLevel === 2) {
     baseKey = "files";
   }
-  return state.groupingMode === "layers" ? `layers_${baseKey}` : baseKey;
+  const groupedKey = state.groupingMode === "layers" ? `layers_${baseKey}` : baseKey;
+  return state.layoutOrderMode === "creation" ? `creation_${groupedKey}` : groupedKey;
 }
 
 function getPinnedPositionForContext(noteEntry, contextKey = getCurrentLayoutContextKey()) {
@@ -1705,6 +1717,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
           collapsed: isCollapsed ? "true" : "false",
           expandedFn: isExpandedFn ? "true" : "false",
           flowStepOrder: stepOrder || 0,
+          line: rawNode.line || 0,
         },
       });
 
@@ -1781,6 +1794,7 @@ function buildVisibleElements() {
         collapsed: isCollapsed ? "true" : "false",
         expandedFn: isExpandedFn ? "true" : "false",
         flowStepOrder: stepOrder || 0,
+        line: rawNode.line || 0,
       },
     });
 
@@ -2149,6 +2163,7 @@ function initCytoscape() {
     if (event.target === state.cy) {
       clearActiveFloatingWindowFocus();
       hideEdgeTooltip();
+      hideNodeTooltip();
       if (!state.traceMode && state.selectedNodeId) {
         state.cy.nodes().unselect();
         clearSelectionPanel();
@@ -2196,8 +2211,164 @@ function initCytoscape() {
   });
 
   bindEdgeTooltipEvents();
+  state.mainTooltipCleanup = bindNodeDocstringTooltip(state.cy, document.getElementById("canvas-area"));
   bindCanvasPanControls();
   state.cy.on("zoom", updateZoomIndicator);
+}
+
+const NODE_TOOLTIP_DELAY_MS = 1000;
+
+function hideNodeTooltip() {
+  if (state.nodeTooltipTimer) {
+    clearTimeout(state.nodeTooltipTimer);
+    state.nodeTooltipTimer = null;
+  }
+  state.nodeTooltipTargetId = null;
+  state.nodeTooltipPos = null;
+  state.nodeTooltipContainerEl = null;
+  const tip = document.getElementById("node-tooltip");
+  if (tip) {
+    tip.classList.add("hidden");
+  }
+}
+
+function resolveTooltipNode(cyNode) {
+  if (!cyNode || typeof cyNode.data !== "function") {
+    return null;
+  }
+  const data = cyNode.data();
+  if (data.type !== "function" && data.type !== "file") {
+    return null;
+  }
+  const raw = state.nodesById.get(data.id);
+  if (!raw || (raw.type !== "function" && raw.type !== "file")) {
+    return null;
+  }
+  const doc = (raw.docstring || "").trim();
+  if (!doc) {
+    return null;
+  }
+  return raw;
+}
+
+function showNodeTooltip(rawNode, renderedPos, containerEl = null) {
+  const tip = document.getElementById("node-tooltip");
+  const area = document.getElementById("canvas-area");
+  if (!tip || !area || !rawNode) {
+    return;
+  }
+  const doc = (rawNode.docstring || "").trim();
+  if (!doc) {
+    hideNodeTooltip();
+    return;
+  }
+
+  hideEdgeTooltip();
+  const kindLabel = rawNode.type === "file" ? "Archivo" : "Función";
+  tip.innerHTML = `
+    <div class="node-tooltip-header">
+      <span class="node-tooltip-kind">${escapeHtml(kindLabel)}</span>
+      <span class="node-tooltip-title">${escapeHtml(rawNode.label || rawNode.id)}</span>
+    </div>
+    <div class="node-tooltip-body">${escapeHtml(doc)}</div>
+  `;
+  tip.classList.remove("hidden");
+
+  let offsetX = 0;
+  let offsetY = 0;
+  if (containerEl && containerEl !== area) {
+    const areaRect = area.getBoundingClientRect();
+    const boxRect = containerEl.getBoundingClientRect();
+    offsetX = boxRect.left - areaRect.left;
+    offsetY = boxRect.top - areaRect.top;
+  }
+
+  const maxX = Math.max(12, area.clientWidth - tip.offsetWidth - 14);
+  const maxY = Math.max(12, area.clientHeight - tip.offsetHeight - 14);
+  const rawX = offsetX + (renderedPos ? renderedPos.x : 20) + 14;
+  const rawY = offsetY + (renderedPos ? renderedPos.y : 20) + 14;
+  const left = Math.min(maxX, Math.max(12, Math.round(rawX)));
+  const top = Math.min(maxY, Math.max(12, Math.round(rawY)));
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+
+function bindNodeDocstringTooltip(cyInst, containerEl) {
+  if (!cyInst) {
+    return () => {};
+  }
+
+  const onNodeMouseOver = (event) => {
+    const raw = resolveTooltipNode(event.target);
+    if (!raw) {
+      hideNodeTooltip();
+      return;
+    }
+    state.nodeTooltipPos = event.renderedPosition || state.nodeTooltipPos;
+    state.nodeTooltipContainerEl = containerEl;
+    if (state.nodeTooltipTargetId === raw.id) {
+      return;
+    }
+    hideNodeTooltip();
+    state.nodeTooltipTargetId = raw.id;
+    state.nodeTooltipPos = event.renderedPosition || { x: 20, y: 20 };
+    state.nodeTooltipContainerEl = containerEl;
+    const expectedId = raw.id;
+    state.nodeTooltipTimer = setTimeout(() => {
+      state.nodeTooltipTimer = null;
+      if (state.nodeTooltipTargetId !== expectedId) {
+        return;
+      }
+      showNodeTooltip(raw, state.nodeTooltipPos, state.nodeTooltipContainerEl);
+    }, NODE_TOOLTIP_DELAY_MS);
+  };
+
+  const onNodeMouseMove = (event) => {
+    if (!state.nodeTooltipTargetId) {
+      return;
+    }
+    const raw = resolveTooltipNode(event.target);
+    if (raw && raw.id === state.nodeTooltipTargetId) {
+      state.nodeTooltipPos = event.renderedPosition || state.nodeTooltipPos;
+    }
+  };
+
+  const cancelTooltip = () => {
+    hideNodeTooltip();
+  };
+
+  cyInst.on("mouseover", "node", onNodeMouseOver);
+  cyInst.on("mousemove", "node", onNodeMouseMove);
+  cyInst.on("mouseout", "node", cancelTooltip);
+  cyInst.on("tap dbltap grab drag pan zoom", cancelTooltip);
+  cyInst.on("mouseover", "edge", cancelTooltip);
+
+  const cyDom = typeof cyInst.container === "function" ? cyInst.container() : null;
+  if (cyDom) {
+    cyDom.addEventListener("mouseleave", cancelTooltip);
+    cyDom.addEventListener("mousedown", cancelTooltip, true);
+  }
+
+  return () => {
+    if (state.nodeTooltipContainerEl === containerEl) {
+      hideNodeTooltip();
+    }
+    if (cyDom) {
+      cyDom.removeEventListener("mouseleave", cancelTooltip);
+      cyDom.removeEventListener("mousedown", cancelTooltip, true);
+    }
+    if (cyInst && typeof cyInst.off === "function") {
+      try {
+        cyInst.off("mouseover", "node", onNodeMouseOver);
+        cyInst.off("mousemove", "node", onNodeMouseMove);
+        cyInst.off("mouseout", "node", cancelTooltip);
+        cyInst.off("tap dbltap grab drag pan zoom", cancelTooltip);
+        cyInst.off("mouseover", "edge", cancelTooltip);
+      } catch (_err) {
+        // Ignorar si Cytoscape ya fue destruido.
+      }
+    }
+  };
 }
 
 function hideEdgeTooltip() {
@@ -2208,6 +2379,7 @@ function hideEdgeTooltip() {
 }
 
 function showEdgeTooltip(cyEdge, renderedPos, containerEl = null) {
+  hideNodeTooltip();
   const tip = document.getElementById("edge-tooltip");
   const area = document.getElementById("canvas-area");
   if (!tip || !area) {
@@ -2642,6 +2814,12 @@ function buildStylesheet() {
       },
     },
     {
+      selector: 'edge[taxiDir = "upward"]',
+      style: {
+        "taxi-direction": "upward",
+      },
+    },
+    {
       selector: "edge.elk-routed",
       style: {
         "curve-style": "segments",
@@ -2837,7 +3015,11 @@ function buildStylesheet() {
     },
     {
       selector: "edge.trace-caller",
-      style: { "opacity": 1, "width": 3, "line-color": "#22d3ee", "target-arrow-color": "#22d3ee" },
+      style: { "opacity": 1, "width": 3 },
+    },
+    {
+      selector: 'edge[edgeType = "direct_call"].trace-caller',
+      style: { "line-color": "#22d3ee", "target-arrow-color": "#22d3ee" },
     },
     {
       selector: "node.trace-callee",
@@ -2845,16 +3027,22 @@ function buildStylesheet() {
     },
     {
       selector: "edge.trace-callee",
-      style: { "opacity": 1, "width": 3, "line-color": "#fbbf24", "target-arrow-color": "#fbbf24" },
+      style: { "opacity": 1, "width": 3 },
+    },
+    {
+      selector: 'edge[edgeType = "direct_call"].trace-callee',
+      style: { "line-color": "#fbbf24", "target-arrow-color": "#fbbf24" },
     },
     {
       selector: "edge.trace-branch-active",
       style: {
         "opacity": 1,
-        "width": 4.2,
-        "line-color": "#facc15",
-        "target-arrow-color": "#facc15",
-        "z-index": 30,
+        "width": 4,
+        "arrow-scale": 1.3,
+        "underlay-color": "#f8fafc",
+        "underlay-opacity": 0.42,
+        "underlay-padding": 5,
+        "z-index": 40,
       },
     },
     {
@@ -2862,7 +3050,11 @@ function buildStylesheet() {
       style: {
         "opacity": 1,
         "border-width": 4,
-        "border-color": "#facc15",
+        "border-color": "#f8fafc",
+        "underlay-color": "#f8fafc",
+        "underlay-opacity": 0.24,
+        "underlay-padding": 6,
+        "z-index": 40,
       },
     },
     // Fase 3: Puertos de Frontera (Cross-Modal Connectors) en ventanas flotantes
@@ -2915,6 +3107,7 @@ function buildStylesheet() {
 
 async function refreshGraphView({ fit = true } = {}) {
   hideEdgeTooltip();
+  hideNodeTooltip();
   state.hoveredNodeId = null;
   const { nodes, edges } = buildVisibleElements();
   const callEdges = edges.filter((e) => e.data && e.data.kind === "call");
@@ -2941,7 +3134,132 @@ async function refreshGraphView({ fit = true } = {}) {
   }
 }
 
+function shiftElkSubtreeY(elkNode, deltaY, elkPositions, pinnedNodeIds, shiftedNodeIds) {
+  if (!elkNode || !deltaY) {
+    return;
+  }
+  if (elkNode.children && elkNode.children.length > 0) {
+    for (const child of elkNode.children) {
+      shiftElkSubtreeY(child, deltaY, elkPositions, pinnedNodeIds, shiftedNodeIds);
+    }
+    return;
+  }
+  if (pinnedNodeIds && pinnedNodeIds.has(elkNode.id)) {
+    return;
+  }
+  const pos = elkPositions.get(elkNode.id);
+  if (pos) {
+    pos.y += deltaY;
+    shiftedNodeIds.add(elkNode.id);
+  }
+}
+
+function applyCreationRowStagger(
+  layouted,
+  elkPositions,
+  pinnedNodeIds,
+  dataById,
+  stepPx = CREATION_ROW_STAGGER_PX,
+) {
+  const shiftedNodeIds = new Set();
+  if (!layouted || !Array.isArray(layouted.children) || stepPx <= 0) {
+    return shiftedNodeIds;
+  }
+
+  const processContainer = (container) => {
+    if (!container || !Array.isArray(container.children) || container.children.length === 0) {
+      return 0;
+    }
+    const containerData = dataById.get(container.id);
+    if (containerData && (containerData.expandedFn === "true" || containerData.flowContainer === "true")) {
+      return 0;
+    }
+
+    const childExtraHeight = new Map();
+    for (const child of container.children) {
+      if (child.children && child.children.length > 0) {
+        childExtraHeight.set(child.id, processContainer(child));
+      } else {
+        childExtraHeight.set(child.id, 0);
+      }
+    }
+
+    const sortedByY = [...container.children].sort((a, b) => (a.y || 0) - (b.y || 0) || (a.x || 0) - (b.x || 0));
+    const rows = [];
+    for (const child of sortedByY) {
+      const top = child.y || 0;
+      const bottom = top + (child.height || 44);
+      const lastRow = rows[rows.length - 1];
+      if (!lastRow || top >= lastRow.maxBottom) {
+        rows.push({ items: [child], maxBottom: bottom });
+      } else {
+        lastRow.items.push(child);
+        if (bottom > lastRow.maxBottom) {
+          lastRow.maxBottom = bottom;
+        }
+      }
+    }
+
+    let cumulativeDownShift = 0;
+    for (const row of rows) {
+      const rowShift = cumulativeDownShift;
+      const staggerCandidates = row.items.filter((child) => {
+        if (child.children && child.children.length > 0) {
+          return false;
+        }
+        if (pinnedNodeIds && pinnedNodeIds.has(child.id)) {
+          return false;
+        }
+        const d = dataById.get(child.id);
+        return Boolean(d && d.type === "function");
+      });
+
+      const staggerById = new Map();
+      if (staggerCandidates.length > 1) {
+        staggerCandidates.sort((a, b) => {
+          const da = dataById.get(a.id) || {};
+          const db = dataById.get(b.id) || {};
+          const lineA = typeof da.line === "number" ? da.line : 0;
+          const lineB = typeof db.line === "number" ? db.line : 0;
+          if (lineA !== lineB) {
+            return lineA - lineB;
+          }
+          return (a.x || 0) - (b.x || 0) || String(a.id).localeCompare(String(b.id));
+        });
+        staggerCandidates.forEach((child, idx) => {
+          staggerById.set(child.id, idx * stepPx);
+        });
+      }
+
+      let newRowMaxBottom = row.maxBottom + rowShift;
+      for (const child of row.items) {
+        const staggerDelta = staggerById.get(child.id) || 0;
+        const totalShift = rowShift + staggerDelta;
+        if (totalShift > 0) {
+          shiftElkSubtreeY(child, totalShift, elkPositions, pinnedNodeIds, shiftedNodeIds);
+        }
+        const childNewBottom = (child.y || 0)
+          + totalShift
+          + (child.height || 44)
+          + (childExtraHeight.get(child.id) || 0);
+        if (childNewBottom > newRowMaxBottom) {
+          newRowMaxBottom = childNewBottom;
+        }
+      }
+
+      const rowExtraPush = Math.max(0, newRowMaxBottom - (row.maxBottom + rowShift));
+      cumulativeDownShift += rowExtraPush;
+    }
+
+    return cumulativeDownShift;
+  };
+
+  processContainer(layouted);
+  return shiftedNodeIds;
+}
+
 async function runElkLayout(visibleNodes, visibleEdges) {
+  const isCreationOrder = state.layoutOrderMode === "creation";
   const elkGraph = buildElkInput(visibleNodes, visibleEdges);
   const layouted = await state.elk.layout(elkGraph);
 
@@ -2951,38 +3269,68 @@ async function runElkLayout(visibleNodes, visibleEdges) {
 
   const contextKey = getCurrentLayoutContextKey();
   const ignorePins = Boolean(computeSubgraphFilter());
+  const pinnedPositions = new Map();
   const pinnedNodeIds = new Set();
+
+  if (!ignorePins) {
+    state.cy.nodes().forEach((cyNode) => {
+      if (cyNode.isParent()) {
+        return;
+      }
+      const noteEntry = getNoteEntry(cyNode.id());
+      const pinnedPos = getPinnedPositionForContext(noteEntry, contextKey);
+      if (pinnedPos) {
+        pinnedPositions.set(cyNode.id(), pinnedPos);
+        pinnedNodeIds.add(cyNode.id());
+      }
+    });
+  }
+
+  let skipElkRoutingIds = pinnedNodeIds;
+  if (isCreationOrder) {
+    const dataById = new Map(visibleNodes.map((item) => [item.data.id, item.data]));
+    const shiftedNodeIds = applyCreationRowStagger(
+      layouted,
+      elkPositions,
+      pinnedNodeIds,
+      dataById,
+      CREATION_ROW_STAGGER_PX,
+    );
+    if (shiftedNodeIds.size > 0) {
+      skipElkRoutingIds = new Set([...pinnedNodeIds, ...shiftedNodeIds]);
+    }
+  }
+
+  const defaultDirection = isCreationOrder ? "upward" : "downward";
 
   state.cy.batch(() => {
     state.cy.nodes().forEach((cyNode) => {
       if (cyNode.isParent()) {
         return;
       }
-      if (!ignorePins) {
-        const noteEntry = getNoteEntry(cyNode.id());
-        const pinnedPos = getPinnedPositionForContext(noteEntry, contextKey);
-        if (pinnedPos) {
-          cyNode.position(pinnedPos);
-          pinnedNodeIds.add(cyNode.id());
-          return;
-        }
+      const pinnedPos = pinnedPositions.get(cyNode.id());
+      if (pinnedPos) {
+        cyNode.position(pinnedPos);
+        return;
       }
       const pos = elkPositions.get(cyNode.id());
       if (pos) {
         cyNode.position(pos);
       }
     });
-    applyElkEdgeRoutes(state.cy, layouted, elkPositions, containerOffsets, pinnedNodeIds, "downward");
+    applyElkEdgeRoutes(state.cy, layouted, elkPositions, containerOffsets, skipElkRoutingIds, defaultDirection);
   });
 }
 
 function buildElkInput(visibleNodes, visibleEdges) {
   const elkNodes = new Map();
   const dataById = new Map();
+  const orderIndexById = new Map();
   let hasLayerContainers = false;
 
-  for (const item of visibleNodes) {
+  visibleNodes.forEach((item, idx) => {
     dataById.set(item.data.id, item.data);
+    orderIndexById.set(item.data.id, idx);
     const size = estimateNodeSize(item.data);
     const isFlowBox = item.data.expandedFn === "true" || item.data.flowContainer === "true";
     const isLayerBox = item.data.type === "layer";
@@ -3010,7 +3358,7 @@ function buildElkInput(visibleNodes, visibleEdges) {
       children: [],
       layoutOptions: nodeLayoutOptions,
     });
-  }
+  });
 
   const rootChildren = [];
   for (const item of visibleNodes) {
@@ -3023,8 +3371,26 @@ function buildElkInput(visibleNodes, visibleEdges) {
     }
   }
 
+  const compareElkChildren = (a, b) => {
+    const da = dataById.get(a.id) || {};
+    const db = dataById.get(b.id) || {};
+    if (da.type === "flow" || db.type === "flow") {
+      return (orderIndexById.get(a.id) ?? 0) - (orderIndexById.get(b.id) ?? 0);
+    }
+    const lineA = typeof da.line === "number" ? da.line : 0;
+    const lineB = typeof db.line === "number" ? db.line : 0;
+    if (lineA !== lineB) {
+      return lineA - lineB;
+    }
+    return (orderIndexById.get(a.id) ?? 0) - (orderIndexById.get(b.id) ?? 0);
+  };
+
+  rootChildren.sort(compareElkChildren);
   for (const elkNode of elkNodes.values()) {
     if (elkNode.children.length > 0) {
+      if (elkNode.children.length > 1) {
+        elkNode.children.sort(compareElkChildren);
+      }
       delete elkNode.width;
       delete elkNode.height;
     } else {
@@ -3055,12 +3421,17 @@ function buildElkInput(visibleNodes, visibleEdges) {
     return elkEdge;
   });
 
+  const elkDirection = state.layoutOrderMode === "creation" ? "UP" : "DOWN";
   const rootLayoutOptions = hasLayerContainers
     ? {
         ...ELK_LAYOUT_OPTIONS,
+        "elk.direction": elkDirection,
         "elk.partitioning.activate": "true",
       }
-    : ELK_LAYOUT_OPTIONS;
+    : {
+        ...ELK_LAYOUT_OPTIONS,
+        "elk.direction": elkDirection,
+      };
 
   return {
     id: "root",
@@ -3945,9 +4316,83 @@ function clearSelectionPanel() {
   state.selectedNodeId = null;
   state.activeFlowStepId = null;
   syncFlowStepHighlight(null, null);
+  hideNodeTooltip();
   document.getElementById("details-empty").classList.remove("hidden");
-  document.getElementById("details-content").classList.add("hidden");
+  const detailsContent = document.getElementById("details-content");
+  detailsContent.classList.add("hidden");
+  detailsContent.classList.remove("node-type-file");
   renderEmptyInspectorSummary();
+}
+
+function updateFileFunctionsBlock(node) {
+  const block = document.getElementById("detail-file-functions-block");
+  const titleEl = document.getElementById("detail-file-functions-title");
+  const list = document.getElementById("detail-file-functions-list");
+  if (!block || !list) {
+    return;
+  }
+  list.innerHTML = "";
+  if (!node || node.type !== "file" || !state.rawGraph) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  const fileFunctions = (state.rawGraph.nodes || [])
+    .filter((item) => item.type === "function" && item.parent === node.id)
+    .sort((a, b) => (a.line || 0) - (b.line || 0) || a.id.localeCompare(b.id));
+
+  if (titleEl) {
+    titleEl.textContent = `Funciones en "${node.label}" (${fileFunctions.length})`;
+  }
+
+  if (fileFunctions.length === 0) {
+    const emptyLi = document.createElement("li");
+    emptyLi.className = "file-fn-empty";
+    emptyLi.textContent = "Este archivo no declara funciones visibles.";
+    list.appendChild(emptyLi);
+    block.classList.remove("hidden");
+    return;
+  }
+
+  fileFunctions.forEach((fn, idx) => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "file-fn-item";
+    btn.title = fn.signature || fn.id;
+
+    const indexSpan = document.createElement("span");
+    indexSpan.className = "file-fn-index";
+    indexSpan.textContent = `${idx + 1}.`;
+
+    const noteEntry = getNoteEntry(fn.id);
+    const effectiveRole = noteEntry.custom_role || fn.role || "transform";
+    const roleDot = document.createElement("span");
+    roleDot.className = `file-fn-role-dot role-${effectiveRole}`;
+    roleDot.setAttribute("aria-hidden", "true");
+
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "file-fn-name";
+    nameSpan.textContent = fn.label || fn.id;
+
+    const lineSpan = document.createElement("span");
+    lineSpan.className = "file-fn-line";
+    lineSpan.textContent = fn.line ? `L${fn.line}` : "";
+
+    btn.appendChild(indexSpan);
+    btn.appendChild(roleDot);
+    btn.appendChild(nameSpan);
+    if (fn.line) {
+      btn.appendChild(lineSpan);
+    }
+    btn.addEventListener("click", () => {
+      navigateToNode(fn.id);
+    });
+    li.appendChild(btn);
+    list.appendChild(li);
+  });
+
+  block.classList.remove("hidden");
 }
 
 function selectNode(nodeId, stepId = undefined) {
@@ -3965,7 +4410,9 @@ function selectNode(nodeId, stepId = undefined) {
   const noteEntry = getNoteEntry(nodeId);
 
   document.getElementById("details-empty").classList.add("hidden");
-  document.getElementById("details-content").classList.remove("hidden");
+  const detailsContent = document.getElementById("details-content");
+  detailsContent.classList.remove("hidden");
+  detailsContent.classList.toggle("node-type-file", node.type === "file");
 
   const effectiveRole = noteEntry.custom_role || node.role || node.type;
   const badge = document.getElementById("detail-badge");
@@ -3987,8 +4434,14 @@ function selectNode(nodeId, stepId = undefined) {
   document.getElementById("detail-note-input").value = noteEntry.note || "";
   document.getElementById("note-save-status").textContent = "";
 
+  const docstringTitle = document.getElementById("detail-docstring-title");
+  if (docstringTitle) {
+    docstringTitle.textContent = node.type === "file" ? `Docstring "${node.label}"` : "Docstring";
+  }
+
   updateOptionalBlock("detail-signature-block", "detail-signature", node.signature);
   updateOptionalBlock("detail-docstring-block", "detail-docstring", node.docstring);
+  updateFileFunctionsBlock(node);
   updateInternalCallsBlock(node);
   updateExternalCallsBlock(node);
   updateOptionalBlock("detail-fingerprint-block", "detail-fingerprint", node.fingerprint);
@@ -4048,12 +4501,45 @@ function resolveNodeFilePath(node) {
   return null;
 }
 
+function isSafeHttpUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    return false;
+  }
+  try {
+    const parsed = new URL(rawUrl.trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function encodeFileUriPath(rawPath) {
+  const normalized = String(rawPath || "").replace(/\\/g, "/");
+  return normalized
+    .split("/")
+    .map((segment, index) => {
+      if (segment === "") {
+        return "";
+      }
+      if (index === 0 && /^[A-Za-z]:$/.test(segment)) {
+        return segment;
+      }
+      if (index === 1 && normalized.startsWith("/") && /^[A-Za-z]:$/.test(segment)) {
+        return segment;
+      }
+      return encodeURIComponent(segment);
+    })
+    .join("/");
+}
+
 function buildVsCodeHref(node) {
   const filePath = resolveNodeFilePath(node);
   if (!filePath) {
     return null;
   }
-  return `vscode://file/${filePath}:${node.line || 1}`;
+  const encodedPath = encodeFileUriPath(filePath);
+  const line = Number.isInteger(node.line) && node.line > 0 ? node.line : 1;
+  return `vscode://file/${encodedPath}:${line}`;
 }
 
 function updateVsCodeLink(node) {
@@ -4520,7 +5006,7 @@ function updateExternalCallsBlock(node) {
     kindTag.textContent = EXTERNAL_KIND_LABELS[ext.kind] || ext.kind || "externo";
     actions.appendChild(kindTag);
 
-    if (ext.docs_url) {
+    if (isSafeHttpUrl(ext.docs_url)) {
       const docsLink = document.createElement("a");
       docsLink.className = "call-link docs-link";
       docsLink.href = ext.docs_url;
@@ -4916,7 +5402,7 @@ function renderApisModal() {
       actions.appendChild(badge);
     }
 
-    if (item.docs_url) {
+    if (isSafeHttpUrl(item.docs_url)) {
       const docsLink = document.createElement("a");
       docsLink.className = "call-link docs-link";
       docsLink.href = item.docs_url;
@@ -5208,59 +5694,81 @@ async function exportAiMarkdown(mode = "copy") {
 // Navegación ergonómica (Modo Mano, Zoom, Ajustar) y panel colapsable
 // ---------------------------------------------------------------------------
 
+function applySpacePanToCy(cyInst, areaEl, active) {
+  if (areaEl) {
+    areaEl.classList.toggle("pan-mode", active);
+    if (!active) {
+      areaEl.classList.remove("panning-active");
+    }
+  }
+  if (cyInst) {
+    if (typeof cyInst.autoungrabify === "function") {
+      cyInst.autoungrabify(active);
+    }
+    if (typeof cyInst.boxSelectionEnabled === "function") {
+      cyInst.boxSelectionEnabled(!active);
+    }
+  }
+}
+
 function setSpacePanMode(enabled) {
   const active = Boolean(enabled);
   if (state.spacePanning === active) {
     return;
   }
   state.spacePanning = active;
-  const area = document.getElementById("canvas-area");
-  if (area) {
-    area.classList.toggle("pan-mode", active);
-    if (!active) {
-      area.classList.remove("panning-active");
-    }
-  }
-  if (state.cy) {
-    if (typeof state.cy.autoungrabify === "function") {
-      state.cy.autoungrabify(active);
-    }
-    if (typeof state.cy.boxSelectionEnabled === "function") {
-      state.cy.boxSelectionEnabled(!active);
+  applySpacePanToCy(state.cy, document.getElementById("canvas-area"), active);
+  for (const win of state.floatingWindows.values()) {
+    if (win && !win.destroyed && win.cy) {
+      applySpacePanToCy(win.cy, win.bodyEl, active);
     }
   }
 }
 
-function bindCanvasPanControls() {
-  const container = document.getElementById("cy");
-  const area = document.getElementById("canvas-area");
-  if (!container || !area) {
-    return;
+function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPanMove, onPanEnd } = {}) {
+  if (!eventTarget || !areaContainer) {
+    return () => {};
   }
 
   let panDrag = null;
 
-  container.addEventListener("mousedown", (event) => {
+  const onMouseDown = (event) => {
+    const cyInst = typeof getCy === "function" ? getCy() : getCy;
+    if (!cyInst) {
+      return;
+    }
+    const isRightPan = event.button === 2;
     const isMiddlePan = event.button === 1;
     const isSpaceLeftPan = event.button === 0 && state.spacePanning;
-    if (!isMiddlePan && !isSpaceLeftPan) {
+    if (!isRightPan && !isMiddlePan && !isSpaceLeftPan) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
-    const currentPan = state.cy.pan();
+    if (typeof onPanStart === "function") {
+      onPanStart(event);
+    }
+    hideEdgeTooltip();
+    hideNodeTooltip();
+    const currentPan = cyInst.pan();
     panDrag = {
+      button: event.button,
       startX: event.clientX,
       startY: event.clientY,
       startPanX: currentPan.x,
       startPanY: currentPan.y,
       didMove: false,
     };
-    area.classList.add("panning-active");
-  }, true);
+    areaContainer.classList.add("panning-active");
+  };
 
-  window.addEventListener("mousemove", (event) => {
-    if (!panDrag || !state.cy) {
+  const onContextMenu = (event) => {
+    event.preventDefault();
+  };
+
+  const onMouseMove = (event) => {
+    const cyInst = typeof getCy === "function" ? getCy() : getCy;
+    if (!panDrag || !cyInst) {
       return;
     }
     const dx = event.clientX - panDrag.startX;
@@ -5268,28 +5776,54 @@ function bindCanvasPanControls() {
     if (!panDrag.didMove && Math.hypot(dx, dy) > 3) {
       panDrag.didMove = true;
     }
-    state.cy.pan({ x: panDrag.startPanX + dx, y: panDrag.startPanY + dy });
-  });
+    cyInst.pan({ x: panDrag.startPanX + dx, y: panDrag.startPanY + dy });
+    if (typeof onPanMove === "function") {
+      onPanMove(event);
+    }
+  };
 
   const finishPanDrag = () => {
     if (!panDrag) {
       return;
     }
-    if (panDrag.didMove) {
+    const didMove = panDrag.didMove;
+    if (didMove) {
       state.suppressNextTap = true;
       setTimeout(() => {
         state.suppressNextTap = false;
       }, 60);
     }
     panDrag = null;
-    area.classList.remove("panning-active");
+    areaContainer.classList.remove("panning-active");
+    if (typeof onPanEnd === "function") {
+      onPanEnd(didMove);
+    }
   };
 
+  eventTarget.addEventListener("mousedown", onMouseDown, true);
+  eventTarget.addEventListener("contextmenu", onContextMenu, true);
+  window.addEventListener("mousemove", onMouseMove);
   window.addEventListener("mouseup", finishPanDrag);
-  window.addEventListener("blur", () => {
+  window.addEventListener("blur", finishPanDrag);
+
+  return () => {
     finishPanDrag();
-    setSpacePanMode(false);
-  });
+    eventTarget.removeEventListener("mousedown", onMouseDown, true);
+    eventTarget.removeEventListener("contextmenu", onContextMenu, true);
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", finishPanDrag);
+    window.removeEventListener("blur", finishPanDrag);
+  };
+}
+
+function bindCanvasPanControls() {
+  if (state.mainPanCleanup) {
+    state.mainPanCleanup();
+    state.mainPanCleanup = null;
+  }
+  const container = document.getElementById("cy");
+  const area = document.getElementById("canvas-area");
+  state.mainPanCleanup = attachPanControls(() => state.cy, container, area);
 }
 
 function fitGraphToScreen() {
@@ -5372,17 +5906,18 @@ function toggleLegend(forceCollapsed = null) {
   const shouldCollapse = forceCollapsed === null ? !state.legendCollapsed : Boolean(forceCollapsed);
   state.legendCollapsed = shouldCollapse;
   legend.classList.toggle("collapsed", shouldCollapse);
+  legend.classList.toggle("hidden", shouldCollapse);
   if (body) {
     body.classList.toggle("hidden", shouldCollapse);
   }
-  toggleBtn.textContent = shouldCollapse ? "Leyenda ▴" : "Leyenda ▾";
+  toggleBtn.classList.toggle("active", !shouldCollapse);
   toggleBtn.setAttribute("aria-expanded", String(!shouldCollapse));
+  toggleBtn.title = shouldCollapse ? "Mostrar leyenda visual" : "Ocultar leyenda visual";
 }
 
 function toggleInspectorPanel(forceOpen = null) {
   const panel = document.getElementById("details-panel");
   const showBtn = document.getElementById("btn-show-panel");
-  const topbarBtn = document.getElementById("btn-topbar-inspector");
   if (!panel || !showBtn) {
     return;
   }
@@ -5390,11 +5925,6 @@ function toggleInspectorPanel(forceOpen = null) {
   state.panelCollapsed = shouldCollapse;
   panel.classList.toggle("collapsed", shouldCollapse);
   showBtn.classList.toggle("hidden", !shouldCollapse);
-  if (topbarBtn) {
-    topbarBtn.classList.toggle("active", !shouldCollapse);
-    topbarBtn.setAttribute("aria-expanded", String(!shouldCollapse));
-    topbarBtn.title = shouldCollapse ? "Mostrar inspector (])" : "Ocultar inspector (])";
-  }
   scheduleCanvasResize(panel);
 }
 
@@ -5402,12 +5932,47 @@ function toggleInspectorPanel(forceOpen = null) {
 // Eventos de barra, panel lateral y atajos de teclado
 // ---------------------------------------------------------------------------
 
+function updateLayoutOrderButton() {
+  const btn = document.getElementById("btn-layout-order");
+  if (!btn) {
+    return;
+  }
+  const isCreation = state.layoutOrderMode === "creation";
+  btn.textContent = isCreation ? "Orden: ↑ Creación" : "Orden: ↓ Ejecución";
+  btn.dataset.order = state.layoutOrderMode;
+  btn.setAttribute("aria-pressed", String(isCreation));
+  btn.classList.toggle("creation-mode", isCreation);
+  btn.title = isCreation
+    ? "Orden de Creación activo (helpers arriba, entradas abajo, escalonado por línea). Clic para volver a ↓ Ejecución"
+    : "Orden de Ejecución activo (entradas arriba, destinos abajo). Clic para cambiar a ↑ Creación";
+}
+
+async function toggleLayoutOrderMode(forceMode = null) {
+  const nextMode = forceMode === "execution" || forceMode === "creation"
+    ? forceMode
+    : (state.layoutOrderMode === "creation" ? "execution" : "creation");
+  if (state.layoutOrderMode === nextMode) {
+    updateLayoutOrderButton();
+    return;
+  }
+  state.layoutOrderMode = nextMode;
+  updateLayoutOrderButton();
+  await refreshGraphView({ fit: true });
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    selectNode(state.selectedNodeId, state.activeFlowStepId);
+  }
+}
+
 function bindControls() {
   for (const btn of document.querySelectorAll(".level-btn")) {
     btn.addEventListener("click", () => applyLevel(Number(btn.dataset.level)));
   }
   for (const btn of document.querySelectorAll(".group-btn")) {
     btn.addEventListener("click", () => setGroupingMode(btn.dataset.grouping));
+  }
+  const layoutOrderBtn = document.getElementById("btn-layout-order");
+  if (layoutOrderBtn) {
+    layoutOrderBtn.addEventListener("click", () => toggleLayoutOrderMode());
   }
 
   const toggleSidebarBtn = document.getElementById("btn-toggle-sidebar");
@@ -5421,12 +5986,9 @@ function bindControls() {
       toggleLegend();
     });
   }
-  const topbarInspectorBtn = document.getElementById("btn-topbar-inspector");
-  if (topbarInspectorBtn) {
-    topbarInspectorBtn.classList.toggle("active", !state.panelCollapsed);
-    topbarInspectorBtn.setAttribute("aria-expanded", String(!state.panelCollapsed));
-    topbarInspectorBtn.addEventListener("click", () => toggleInspectorPanel());
-  }
+  window.addEventListener("blur", () => {
+    setSpacePanMode(false);
+  });
   const zoomInBtn = document.getElementById("btn-zoom-in");
   if (zoomInBtn) {
     zoomInBtn.addEventListener("click", () => zoomByFactor(1.2));
@@ -6090,6 +6652,7 @@ function buildFloatingSubgraph(targetNode) {
         collapsed: "false",
         expandedFn: "false",
         flowStepOrder: 0,
+        line: rawNode.line || 0,
       },
     });
   };
@@ -6301,6 +6864,7 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
         "elk.spacing.nodeNode": "26",
         "elk.spacing.edgeNode": "20",
         "elk.padding": "[top=18,left=18,bottom=18,right=18]",
+        "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
       };
 
   const layouted = await state.elk.layout(elkGraph);
@@ -6788,6 +7352,8 @@ async function openFloatingWindow(
     lockNoticeTimer: null,
     pulseTimer: null,
     activeDragCleanup: null,
+    panCleanup: null,
+    tooltipCleanup: null,
     destroyed: false,
   };
 
@@ -6826,6 +7392,9 @@ async function openFloatingWindow(
 
   // Eventos de Cytoscape aislado dentro de la ventana flotante.
   subCy.on("tap", "node", async (event) => {
+    if (state.suppressNextTap) {
+      return;
+    }
     focusFloatingWindow(win.id);
     const data = event.target.data();
     if (data.type === "port") {
@@ -6865,6 +7434,20 @@ async function openFloatingWindow(
     hideEdgeTooltip();
     scheduleBridgeRender();
   });
+
+  win.panCleanup = attachPanControls(
+    () => (win.destroyed ? null : win.cy),
+    win.cyContainer,
+    win.bodyEl,
+    {
+      onPanStart: () => focusFloatingWindow(win.id),
+      onPanMove: () => scheduleBridgeRender(),
+    },
+  );
+  if (state.spacePanning) {
+    applySpacePanToCy(subCy, win.bodyEl, true);
+  }
+  win.tooltipCleanup = bindNodeDocstringTooltip(subCy, win.bodyEl);
 
   if (typeof ResizeObserver !== "undefined") {
     const ro = new ResizeObserver(() => {
@@ -6965,6 +7548,7 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
 
   win.destroyed = true;
   hideEdgeTooltip();
+  hideNodeTooltip();
 
   if (win.lockNoticeTimer) {
     clearTimeout(win.lockNoticeTimer);
@@ -6977,6 +7561,14 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
   if (win.activeDragCleanup) {
     win.activeDragCleanup();
     win.activeDragCleanup = null;
+  }
+  if (win.panCleanup) {
+    win.panCleanup();
+    win.panCleanup = null;
+  }
+  if (win.tooltipCleanup) {
+    win.tooltipCleanup();
+    win.tooltipCleanup = null;
   }
   if (win.resizeObserver) {
     try {

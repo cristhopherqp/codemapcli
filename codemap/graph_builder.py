@@ -509,6 +509,7 @@ def build_file_nodes(
             "label": file_id.rpartition("/")[2],
             "file_path": analysis.path,
             "language": analysis.language,
+            "docstring": analysis.docstring,
             "is_main_entry": file_id in main_files,
         }
         if file_id in scripts_map:

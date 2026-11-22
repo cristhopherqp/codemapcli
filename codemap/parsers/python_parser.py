@@ -6,6 +6,7 @@ llamadas por función, imports, roles base y flujo intra-función.
 
 from __future__ import annotations
 
+import inspect
 import re
 
 from tree_sitter import Node
@@ -158,7 +159,11 @@ EVENT_DECORATOR_PATTERN = re.compile(
 
 def parse_python_file(path: str, source: bytes) -> FileAnalysis:
     root = get_parser(LANGUAGE).parse(source).root_node
-    analysis = FileAnalysis(path=path, language=LANGUAGE)
+    analysis = FileAnalysis(
+        path=path,
+        language=LANGUAGE,
+        docstring=extract_module_docstring(root, source),
+    )
 
     function_nodes = collect_function_nodes(root)
     calls_by_function, module_calls = collect_calls(root, source, function_nodes)
@@ -337,6 +342,28 @@ def has_entry_decorator(node: Node, source: bytes) -> bool:
     return inspect_entry_decorator(node, source)[0] is not None
 
 
+def extract_module_docstring(root: Node | None, source: bytes) -> str:
+    """Extrae el docstring de cabecera del módulo Python, ignorando comentarios/shebang previos."""
+    if root is None or root.named_child_count == 0:
+        return ""
+    first: Node | None = None
+    for child in root.named_children:
+        if child.type == "comment":
+            continue
+        first = child
+        break
+    if first is None:
+        return ""
+    if first.type == "expression_statement" and first.named_child_count == 1:
+        first = first.named_children[0]
+    if first.type != "string":
+        return ""
+    parts = [node_text(c, source) for c in first.named_children if c.type == "string_content"]
+    text = "".join(parts) if parts else node_text(first, source).strip("\"'")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return inspect.cleandoc(text).strip()[:DOCSTRING_MAX_CHARS]
+
+
 def extract_docstring(body: Node | None, source: bytes) -> str:
     """Primer literal string del cuerpo (con o sin expression_statement envolvente)."""
     if body is None or body.named_child_count == 0:
@@ -348,7 +375,8 @@ def extract_docstring(body: Node | None, source: bytes) -> str:
         return ""
     parts = [node_text(c, source) for c in first.named_children if c.type == "string_content"]
     text = "".join(parts) if parts else node_text(first, source).strip("\"'")
-    return text.strip()[:DOCSTRING_MAX_CHARS]
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return inspect.cleandoc(text).strip()[:DOCSTRING_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------

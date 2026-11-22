@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import webbrowser
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
@@ -27,12 +29,95 @@ from codemap.watcher import start_watcher
 
 VIEWER_DIR = Path(__file__).parent / "viewer"
 NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+ALLOWED_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 APP_TARGET_PATH = web.AppKey("target_path", str)
 APP_GRAPH = web.AppKey("graph", dict)
 APP_REBUILD_FN = web.AppKey("rebuild_fn", object)
 APP_WEBSOCKETS = web.AppKey("websockets", set)
 APP_REBUILD_LOCK = web.AppKey("rebuild_lock", asyncio.Lock)
+APP_NOTES_LOCK = web.AppKey("notes_lock", asyncio.Lock)
+APP_BOUND_PORT = web.AppKey("bound_port", int)
+
+
+def _expected_port(request: web.Request) -> int | None:
+    bound_port = request.app.get(APP_BOUND_PORT)
+    if isinstance(bound_port, int) and bound_port > 0:
+        return bound_port
+    transport = request.transport
+    if transport is not None:
+        sockname = transport.get_extra_info("sockname")
+        if isinstance(sockname, tuple) and len(sockname) >= 2 and isinstance(sockname[1], int):
+            return sockname[1]
+    return None
+
+
+def _is_allowed_host_header(raw_host: str, expected_port: int | None) -> bool:
+    host = raw_host.strip()
+    if not host:
+        return False
+    try:
+        parsed = urlsplit(f"http://{host}")
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path or parsed.query or parsed.fragment:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ALLOWED_LOCAL_HOSTS:
+        return False
+    if expected_port is not None:
+        effective_port = port if port is not None else 80
+        if effective_port != expected_port:
+            return False
+    return True
+
+
+def _is_allowed_origin_header(raw_origin: str, expected_port: int | None) -> bool:
+    origin = raw_origin.strip()
+    if not origin or origin.lower() == "null":
+        return False
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in ALLOWED_LOCAL_HOSTS:
+        return False
+    if expected_port is not None:
+        default_port = 443 if scheme == "https" else 80
+        effective_port = port if port is not None else default_port
+        if effective_port != expected_port:
+            return False
+    return True
+
+
+@web.middleware
+async def local_origin_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], object],
+) -> web.StreamResponse:
+    """Restringe el servidor local a Host/Origin loopback en el puerto asignado."""
+    expected_port = _expected_port(request)
+    raw_host = request.headers.get("Host") or request.host or ""
+    if not _is_allowed_host_header(raw_host, expected_port):
+        return web.json_response({"error": "Host no permitido"}, status=403, headers=NO_STORE_HEADERS)
+
+    raw_origin = request.headers.get("Origin")
+    if raw_origin is not None and not _is_allowed_origin_header(raw_origin, expected_port):
+        return web.json_response({"error": "Origin no permitido"}, status=403, headers=NO_STORE_HEADERS)
+
+    return await handler(request)
 
 
 def create_app(
@@ -41,12 +126,13 @@ def create_app(
     rebuild_fn: Callable[[], tuple[dict, dict]] | None = None,
 ) -> web.Application:
     """Construye la aplicación aiohttp con rutas REST, WebSocket y estáticos."""
-    app = web.Application()
+    app = web.Application(middlewares=[local_origin_middleware])
     app[APP_TARGET_PATH] = target_path
     app[APP_GRAPH] = graph
     app[APP_REBUILD_FN] = rebuild_fn
     app[APP_WEBSOCKETS] = set()
     app[APP_REBUILD_LOCK] = asyncio.Lock()
+    app[APP_NOTES_LOCK] = asyncio.Lock()
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/graph.json", handle_get_graph)
@@ -117,7 +203,11 @@ async def handle_post_notes(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"error": "Se esperaba un objeto JSON"}, status=400)
 
-    notes = update_notes(request.app[APP_TARGET_PATH], payload, request.app[APP_GRAPH])
+    async with request.app[APP_NOTES_LOCK]:
+        notes = await asyncio.to_thread(
+            update_notes, request.app[APP_TARGET_PATH], payload, request.app[APP_GRAPH]
+        )
+    await _broadcast_json(request.app, {"type": "notes_updated", "notes": notes})
     return web.json_response(notes, headers=NO_STORE_HEADERS)
 
 
@@ -133,7 +223,7 @@ async def handle_post_known_apis(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"error": "Se esperaba un objeto JSON"}, status=400)
 
-    known_apis = update_known_apis(payload)
+    known_apis = await asyncio.to_thread(update_known_apis, payload)
     await _broadcast_json(request.app, {"type": "known_apis_updated", "known_apis": known_apis})
     return web.json_response(known_apis, headers=NO_STORE_HEADERS)
 
@@ -168,10 +258,13 @@ async def _handle_ws_message(app: web.Application, ws: web.WebSocketResponse, ra
     msg_type = message.get("type")
     payload = message.get("payload")
     if msg_type == "save_notes" and isinstance(payload, dict):
-        notes = update_notes(app[APP_TARGET_PATH], payload, app[APP_GRAPH])
-        await ws.send_json({"type": "notes_updated", "notes": notes})
+        async with app[APP_NOTES_LOCK]:
+            notes = await asyncio.to_thread(
+                update_notes, app[APP_TARGET_PATH], payload, app[APP_GRAPH]
+            )
+        await _broadcast_json(app, {"type": "notes_updated", "notes": notes})
     elif msg_type == "save_known_apis" and isinstance(payload, dict):
-        known_apis = update_known_apis(payload)
+        known_apis = await asyncio.to_thread(update_known_apis, payload)
         await _broadcast_json(app, {"type": "known_apis_updated", "known_apis": known_apis})
 
 
@@ -183,7 +276,7 @@ async def _broadcast_json(app: web.Application, payload: dict) -> None:
             continue
         try:
             await ws.send_json(payload)
-        except ConnectionResetError:
+        except (ConnectionResetError, RuntimeError):
             stale.append(ws)
     for ws in stale:
         app[APP_WEBSOCKETS].discard(ws)
@@ -199,7 +292,11 @@ async def rebuild_and_broadcast(app: web.Application) -> None:
     if rebuild_fn is None:
         return
     async with app[APP_REBUILD_LOCK]:
-        graph, notes = await asyncio.to_thread(rebuild_fn)
+        try:
+            graph, notes = await asyncio.to_thread(rebuild_fn)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CodeMap] Error al reconstruir el grafo: {exc}", file=sys.stderr)
+            return
         app[APP_GRAPH] = graph
         await broadcast_update(app, graph, notes)
 
@@ -226,6 +323,7 @@ async def run_server(
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+        app[APP_BOUND_PORT] = port
         url = f"http://127.0.0.1:{port}/"
 
         if watch and rebuild_fn is not None:

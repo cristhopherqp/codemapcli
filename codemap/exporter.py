@@ -125,6 +125,7 @@ def _compact_node(node: dict, *, include_flow: bool) -> dict:
                 "parent": node.get("parent"),
                 "label": node.get("label"),
                 "language": node.get("language"),
+                "docstring": node.get("docstring"),
                 "arch_layer": node.get("arch_layer"),
                 "is_main_entry": node.get("is_main_entry"),
                 "script_targets": node.get("script_targets"),
@@ -390,6 +391,12 @@ def build_ai_markdown(graph: dict, *, include_flow: bool = False) -> str:
             header_tags = f" ({', '.join(tags)})" if tags else ""
             lines.append("")
             lines.append(f"### `{fid}`{header_tags}")
+
+            file_doc = _collapse_ws(fnode.get("docstring", ""))
+            if file_doc:
+                if len(file_doc) > 200:
+                    file_doc = file_doc[:199].rstrip() + "…"
+                lines.append(f"> {file_doc}")
 
             if fnode.get("script_targets"):
                 targets = ", ".join(f"`{t}`" for t in fnode["script_targets"])

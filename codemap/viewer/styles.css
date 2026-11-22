@@ -82,7 +82,6 @@ body {
 }
 
 .toolbar-center,
-.toolbar-right,
 .level-switcher {
   display: flex;
   align-items: center;
@@ -121,10 +120,6 @@ body {
 .zoom-step-btn:hover,
 .zoom-indicator:hover {
   background: #273342;
-}
-
-.inspector-toggle-btn {
-  font-weight: 600;
 }
 
 button {
@@ -208,6 +203,17 @@ button:hover {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .sidebar-btn {
@@ -339,31 +345,7 @@ button:hover {
 }
 
 .legend.collapsed {
-  padding: 4px 6px;
-}
-
-.legend.collapsed .legend-body {
   display: none;
-}
-
-.legend-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.legend-toggle-btn {
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-
-.legend-toggle-btn:hover {
-  background: var(--bg-elevated);
 }
 
 .legend-body {
@@ -793,6 +775,118 @@ button:hover {
   font-size: 13px;
   line-height: 1.45;
   color: #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Orden vertical específico del Inspector al seleccionar un Archivo:
+   1. Docstring del archivo -> 2. Recuadro de funciones numeradas -> 3. Nota personal */
+.details-content.node-type-file {
+  display: flex;
+  flex-direction: column;
+}
+
+.details-content.node-type-file .details-header {
+  order: 1;
+}
+
+.details-content.node-type-file .details-actions {
+  order: 2;
+}
+
+.details-content.node-type-file #detail-docstring-block {
+  order: 3;
+}
+
+.details-content.node-type-file #detail-file-functions-block {
+  order: 4;
+}
+
+.details-content.node-type-file #detail-note-block {
+  order: 5;
+}
+
+.details-content.node-type-file .detail-block {
+  order: 6;
+}
+
+.file-functions-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.file-functions-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.file-fn-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.file-fn-item:hover {
+  background: var(--bg-elevated);
+  border-color: var(--accent);
+}
+
+.file-fn-index {
+  color: var(--accent);
+  font-weight: 700;
+  min-width: 22px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.file-fn-role-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--transform);
+}
+
+.file-fn-role-dot.role-entry { background: var(--entry); }
+.file-fn-role-dot.role-transform { background: var(--transform); }
+.file-fn-role-dot.role-decision { background: var(--decision); }
+.file-fn-role-dot.role-io { background: var(--io); }
+
+.file-fn-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-fn-line {
+  font-size: 10px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.file-fn-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 6px 8px;
 }
 
 .fingerprint-code {
@@ -1518,6 +1612,61 @@ kbd {
   margin-top: 2px;
 }
 
+/* Tooltip flotante de docstring tras 1000 ms de hover */
+.node-tooltip {
+  position: absolute;
+  z-index: 910;
+  pointer-events: none;
+  max-width: 340px;
+  padding: 8px 11px;
+  border-radius: 7px;
+  background: rgba(15, 20, 27, 0.97);
+  border: 1px solid #3b5575;
+  border-left: 3px solid var(--accent);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.node-tooltip-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-weight: 700;
+  color: #e0f2fe;
+}
+
+.node-tooltip-kind {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  color: #bae6fd;
+  flex-shrink: 0;
+}
+
+.node-tooltip-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-tooltip-body {
+  color: #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow: hidden;
+}
+
 /* Nuevos símbolos en leyenda */
 .shape-route {
   border-radius: 50%;
@@ -2026,6 +2175,30 @@ kbd {
   border-color: rgba(168, 85, 247, 0.65);
 }
 
+.layout-order-btn {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+
+.layout-order-btn:hover {
+  border-color: var(--accent);
+  color: #e0f2fe;
+}
+
+.layout-order-btn.creation-mode {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.65);
+}
+
 .nhops-hud {
   position: absolute;
   top: 12px;
@@ -2305,6 +2478,16 @@ kbd {
   flex: 1;
   min-height: 0;
   background: radial-gradient(circle at center, #121a24 0%, #0d131b 85%);
+}
+
+.fw-body.pan-mode,
+.fw-body.pan-mode .fw-cy-container {
+  cursor: grab;
+}
+
+.fw-body.panning-active,
+.fw-body.panning-active .fw-cy-container {
+  cursor: grabbing !important;
 }
 
 .fw-cy-container {
