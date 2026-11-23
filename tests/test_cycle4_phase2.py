@@ -53,10 +53,16 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "  return src.slice(idx, end);\n"
             "};\n"
             "const elkOptMatch = src.match(/const ELK_LAYOUT_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
+            "const creationFileOptMatch = src.match(/const CREATION_FILE_ELK_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
+            "const creationContOptMatch = src.match(/const CREATION_CONTAINER_ELK_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
+            "const macroPrefixMatch = src.match(/const CREATION_MACRO_EDGE_PREFIX = \"[^\"]+\";/);\n"
             "const staggerMatch = src.match(/const CREATION_ROW_STAGGER_PX = \\d+;/);\n"
             "const state = { activeLevel: 3, expandedFunctions: new Set(), groupingMode: 'folders', layoutOrderMode: 'creation' };\n"
             "eval([\n"
             "  elkOptMatch[0].replace(/^const /, 'var '),\n"
+            "  creationFileOptMatch[0].replace(/^const /, 'var '),\n"
+            "  creationContOptMatch[0].replace(/^const /, 'var '),\n"
+            "  macroPrefixMatch[0].replace(/^const /, 'var '),\n"
             "  staggerMatch[0].replace(/^const /, 'var '),\n"
             "  extractFn('buildStylesheet'),\n"
             "  extractFn('estimateWrappedTextMetrics'),\n"
@@ -64,6 +70,12 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "  extractFn('estimateNodeSize'),\n"
             "  extractFn('estimateCompoundHeaderWidth'),\n"
             "  extractFn('computeElkSubtreeWidth'),\n"
+            "  extractFn('assignCreationBands'),\n"
+            "  extractFn('computeCreationPartition'),\n"
+            "  extractFn('computeIntraTierFoundationDepths'),\n"
+            "  extractFn('buildCreationElkInput'),\n"
+            "  extractFn('buildPostStaggerBoxes'),\n"
+            "  extractFn('stitchCrossFileEdgeOntoMacroCorridor'),\n"
             "  extractFn('buildElkInput'),\n"
             "  extractFn('collectAbsolutePositions'),\n"
             "  extractFn('collectAllLayoutedEdges'),\n"
@@ -87,6 +99,7 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "        role: n.role || n.type,\n"
             "        label: n.label,\n"
             "        line: n.line || 0,\n"
+            "        archLayer: typeof n.arch_layer === 'number' ? n.arch_layer : undefined,\n"
             "      },\n"
             "    }));\n"
             "  const nodeIds = new Set(visibleNodes.map((n) => n.data.id));\n"
@@ -96,7 +109,7 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "      data: { id: 'e' + i, source: e.source, target: e.target, label: e.event || '', kind: 'call', confidence: e.confidence || 'confirmed' },\n"
             "    }));\n"
             "\n"
-            "  const elkIn = buildElkInput(visibleNodes, visibleEdges);\n"
+            "  const { elkGraph: elkIn, creationMeta } = buildCreationElkInput(visibleNodes, visibleEdges);\n"
             "  const layouted = await elk.layout(elkIn);\n"
             "  const elkPos = new Map();\n"
             "  const offsets = new Map([['root', { x: 0, y: 0 }]]);\n"
@@ -109,50 +122,38 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "    const p = elkPos.get(n.id());\n"
             "    if (p && !n.isParent()) n.position(p);\n"
             "  });\n"
-            "  applyElkEdgeRoutes(cy, layouted, elkPos, offsets, new Set(), 'upward', shifted.staggerMeta);\n"
+            "  applyElkEdgeRoutes(cy, layouted, elkPos, offsets, new Set(), 'downward', shifted.staggerMeta, creationMeta);\n"
             "\n"
             "  const allEdges = [];\n"
             "  collectAllLayoutedEdges(layouted, allEdges);\n"
-            "  const leafBoxes = [];\n"
-            "  const collectLeaves = (node) => {\n"
-            "    if (node.children && node.children.length > 0) {\n"
-            "      for (const c of node.children) collectLeaves(c);\n"
-            "    } else if (node.id !== 'root') {\n"
-            "      const p = elkPos.get(node.id);\n"
-            "      if (p) leafBoxes.push({ id: node.id, left: p.x - node.width / 2, right: p.x + node.width / 2, top: p.y - node.height / 2, bottom: p.y + node.height / 2 });\n"
-            "    }\n"
-            "  };\n"
-            "  collectLeaves(layouted);\n"
+            "  const boxes = buildPostStaggerBoxes(layouted, elkPos, dataById);\n"
             "\n"
-            "  let edgesWithBends = 0;\n"
-            "  let edgesWithBendsRouted = 0;\n"
+            "  let crossRouted = 0;\n"
             "  let totalRouted = 0;\n"
             "  const nonOrtho = [];\n"
             "  const crossings = [];\n"
+            "  for (const e of visibleEdges) {\n"
+            "    const cyEdge = cy.getElementById(e.data.id);\n"
+            "    if (cyEdge.hasClass('elk-routed')) totalRouted++;\n"
+            "    if (creationMeta.crossEdgeMeta.has(e.data.id) && cyEdge.hasClass('elk-routed')) crossRouted++;\n"
+            "  }\n"
             "  for (const e of allEdges) {\n"
+            "    if (String(e.id).startsWith(CREATION_MACRO_EDGE_PREFIX)) continue;\n"
             "    const sec = e.sections && e.sections[0];\n"
+            "    if (!sec) continue;\n"
             "    const src = e.sources[0], tgt = e.targets[0];\n"
-            "    const cyEdge = cy.getElementById(e.id);\n"
-            "    const isRouted = cyEdge.hasClass('elk-routed');\n"
-            "    if (isRouted) totalRouted++;\n"
-            "    if (sec && Array.isArray(sec.bendPoints) && sec.bendPoints.length > 0) {\n"
-            "      edgesWithBends++;\n"
-            "      if (isRouted) edgesWithBendsRouted++;\n"
-            "    }\n"
             "    const off = offsets.get(e.container || 'root') || { x: 0, y: 0 };\n"
             "    const pts = adjustElkSectionPoints(sec, e.container || 'root', off, src, tgt, shifted.staggerMeta);\n"
             "    for (let i = 0; i < pts.length - 1; i++) {\n"
             "      const dx = Math.abs(pts[i + 1].x - pts[i].x);\n"
             "      const dy = Math.abs(pts[i + 1].y - pts[i].y);\n"
-            "      if (dx > 0.01 && dy > 0.01) {\n"
-            "        nonOrtho.push({ edge: e.id, src, tgt, p1: pts[i], p2: pts[i + 1] });\n"
-            "      }\n"
+            "      if (dx > 0.01 && dy > 0.01) nonOrtho.push({ edge: e.id, src, tgt, p1: pts[i], p2: pts[i + 1] });\n"
             "      const x1 = Math.min(pts[i].x, pts[i + 1].x), x2 = Math.max(pts[i].x, pts[i + 1].x);\n"
             "      const y1 = Math.min(pts[i].y, pts[i + 1].y), y2 = Math.max(pts[i].y, pts[i + 1].y);\n"
-            "      for (const b of leafBoxes) {\n"
+            "      for (const b of boxes.leafBoxes) {\n"
             "        if (b.id === src || b.id === tgt) continue;\n"
             "        if (x2 > b.left + 1 && x1 < b.right - 1 && y2 > b.top + 1 && y1 < b.bottom - 1) {\n"
-            "          crossings.push({ edge: e.id, src, tgt, crossed: b.id, seg: [pts[i], pts[i + 1]] });\n"
+            "          crossings.push({ edge: e.id, src, tgt, crossed: b.id });\n"
             "        }\n"
             "      }\n"
             "    }\n"
@@ -160,31 +161,30 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
             "\n"
             "  // Caso con un nodo fijado: solo sus aristas incidentes pierden `elk-routed`, las demás se conservan.\n"
             "  const pinnedId = 'frontend/src/main.ts::bootstrap';\n"
-            "  applyElkEdgeRoutes(cy, layouted, elkPos, offsets, new Set([pinnedId]), 'upward', shifted.staggerMeta);\n"
+            "  applyElkEdgeRoutes(cy, layouted, elkPos, offsets, new Set([pinnedId]), 'downward', shifted.staggerMeta, creationMeta);\n"
             "  let pinnedIncidentRouted = 0;\n"
-            "  let nonPinnedBendsRouted = 0;\n"
-            "  for (const e of allEdges) {\n"
-            "    const src = e.sources[0], tgt = e.targets[0];\n"
-            "    const cyEdge = cy.getElementById(e.id);\n"
+            "  let nonPinnedCrossRouted = 0;\n"
+            "  for (const e of visibleEdges) {\n"
+            "    const cyEdge = cy.getElementById(e.data.id);\n"
             "    const isRouted = cyEdge.hasClass('elk-routed');\n"
-            "    if (src === pinnedId || tgt === pinnedId) {\n"
+            "    if (e.data.source === pinnedId || e.data.target === pinnedId) {\n"
             "      if (isRouted) pinnedIncidentRouted++;\n"
-            "    } else if (e.sections && e.sections[0] && e.sections[0].bendPoints && e.sections[0].bendPoints.length > 0) {\n"
-            "      if (isRouted) nonPinnedBendsRouted++;\n"
+            "    } else if (creationMeta.crossEdgeMeta.has(e.data.id) && isRouted) {\n"
+            "      nonPinnedCrossRouted++;\n"
             "    }\n"
             "  }\n"
             "\n"
             "  console.log(JSON.stringify({\n"
-            "    upOptions: elkIn.layoutOptions,\n"
-            "    totalEdges: allEdges.length,\n"
+            "    creationOptions: elkIn.layoutOptions,\n"
+            "    totalEdges: visibleEdges.length,\n"
+            "    crossCount: creationMeta.crossEdgeMeta.size,\n"
             "    shiftedCount: shifted.size,\n"
-            "    edgesWithBends,\n"
-            "    edgesWithBendsRouted,\n"
+            "    crossRouted,\n"
             "    totalRouted,\n"
             "    nonOrtho,\n"
             "    crossings,\n"
             "    pinnedIncidentRouted,\n"
-            "    nonPinnedBendsRouted,\n"
+            "    nonPinnedCrossRouted,\n"
             "  }));\n"
             "  cy.destroy();\n"
             "})();\n"
@@ -198,26 +198,26 @@ class TestCycle4Phase2RoutingMiddleClickAndCodeView(unittest.TestCase):
         )
         res = json.loads(proc.stdout)
 
-        # Espaciado reforzado en modo UP (`↑ Creación`).
-        self.assertEqual(res["upOptions"]["elk.direction"], "UP")
-        self.assertEqual(res["upOptions"]["elk.spacing.edgeEdge"], "16")
-        self.assertEqual(res["upOptions"]["elk.layered.spacing.edgeEdgeBetweenLayers"], "16")
-        self.assertEqual(res["upOptions"]["elk.layered.spacing.edgeNodeBetweenLayers"], "24")
-        self.assertEqual(res["upOptions"]["elk.layered.spacing.nodeNodeBetweenLayers"], "54")
+        # Modo Creación estricto (1→N): SEPARATE_CHILDREN + particionamiento + espaciado reforzado.
+        self.assertEqual(res["creationOptions"]["elk.direction"], "DOWN")
+        self.assertEqual(res["creationOptions"]["elk.hierarchyHandling"], "SEPARATE_CHILDREN")
+        self.assertEqual(res["creationOptions"]["elk.partitioning.activate"], "true")
+        self.assertEqual(res["creationOptions"]["elk.spacing.edgeEdge"], "16")
+        self.assertEqual(res["creationOptions"]["elk.layered.spacing.edgeEdgeBetweenLayers"], "16")
 
-        # El escalonamiento debe activarse y aun así TODAS las aristas con bendPoints conservan `elk-routed`.
+        # El escalonamiento se activa y TODAS las aristas inter-archivo se cosen limpiamente con `elk-routed`.
         self.assertGreater(res["shiftedCount"], 0)
-        self.assertGreater(res["edgesWithBends"], 0)
-        self.assertEqual(res["edgesWithBendsRouted"], res["edgesWithBends"])
-        self.assertGreaterEqual(res["totalRouted"], res["edgesWithBends"])
+        self.assertGreater(res["crossCount"], 0)
+        self.assertEqual(res["crossRouted"], res["crossCount"])
+        self.assertGreaterEqual(res["totalRouted"], res["crossCount"])
 
         # Estricta ortogonalidad (0 segmentos diagonales) y 0 cruces sobre nodos hoja no incidentes.
         self.assertEqual(res["nonOrtho"], [], f"Segmentos no ortogonales detectados: {res['nonOrtho']}")
         self.assertEqual(res["crossings"], [], f"Aristas cruzando nodos escalonados: {res['crossings']}")
 
-        # Solo nodos fijados por el usuario ceden a `taxi`; los escalonados no fijados mantienen `elk-routed`.
+        # Solo nodos fijados por el usuario ceden a `taxi`; los no fijados mantienen `elk-routed`.
         self.assertEqual(res["pinnedIncidentRouted"], 0)
-        self.assertGreater(res["nonPinnedBendsRouted"], 0)
+        self.assertGreater(res["nonPinnedCrossRouted"], 0)
 
     def test_middle_click_floating_window_and_pan_contracts(self) -> None:
         self.assertIn("Clic central en nodo", self.html)

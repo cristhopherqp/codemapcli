@@ -31,7 +31,48 @@ const ELK_LAYOUT_OPTIONS = {
   "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
 };
 
+const CREATION_FILE_ELK_OPTIONS = {
+  "elk.algorithm": "layered",
+  "elk.direction": "DOWN",
+  "elk.hierarchyHandling": "SEPARATE_CHILDREN",
+  "elk.edgeRouting": "ORTHOGONAL",
+  "elk.partitioning.activate": "true",
+  "elk.separateConnectedComponents": "false",
+  "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+  "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+  "elk.layered.crossingMinimization.forceNodeModelOrder": "true",
+  "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+  "elk.layered.spacing.nodeNodeBetweenLayers": "52",
+  "elk.layered.spacing.edgeNodeBetweenLayers": "22",
+  "elk.layered.spacing.edgeEdgeBetweenLayers": "14",
+  "elk.spacing.nodeNode": "32",
+  "elk.spacing.edgeNode": "22",
+  "elk.spacing.edgeEdge": "14",
+  "elk.padding": "[top=42,left=36,bottom=24,right=36]",
+};
+
+const CREATION_CONTAINER_ELK_OPTIONS = {
+  "elk.algorithm": "layered",
+  "elk.direction": "DOWN",
+  "elk.hierarchyHandling": "SEPARATE_CHILDREN",
+  "elk.edgeRouting": "ORTHOGONAL",
+  "elk.partitioning.activate": "true",
+  "elk.separateConnectedComponents": "false",
+  "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+  "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+  "elk.layered.crossingMinimization.forceNodeModelOrder": "true",
+  "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+  "elk.layered.spacing.nodeNodeBetweenLayers": "60",
+  "elk.layered.spacing.edgeNodeBetweenLayers": "24",
+  "elk.layered.spacing.edgeEdgeBetweenLayers": "16",
+  "elk.spacing.nodeNode": "40",
+  "elk.spacing.edgeNode": "24",
+  "elk.spacing.edgeEdge": "16",
+  "elk.padding": "[top=42,left=28,bottom=24,right=28]",
+};
+
 const CREATION_ROW_STAGGER_PX = 14;
+const CREATION_MACRO_EDGE_PREFIX = "__creation_macro_";
 
 const ROLE_LABELS = {
   entry: "Entrada",
@@ -813,7 +854,35 @@ function getNodeArchLayer(rawNode) {
   if (rawNode && typeof rawNode.arch_layer === "number") {
     return rawNode.arch_layer;
   }
+  if (rawNode && rawNode.type === "module") {
+    return computeModuleArchLayer(rawNode.id);
+  }
   return 3;
+}
+
+function computeModuleArchLayer(moduleId) {
+  if (!moduleId || !state.childrenByParent) {
+    return 3;
+  }
+  const nonEmptyFileLayers = [];
+  const allFileLayers = [];
+  const walk = (id) => {
+    const children = state.childrenByParent.get(id) || [];
+    for (const child of children) {
+      if (child.type === "file" && typeof child.arch_layer === "number") {
+        allFileLayers.push(child.arch_layer);
+        const fileChildren = state.childrenByParent.get(child.id) || [];
+        if (fileChildren.some((c) => c.type === "function")) {
+          nonEmptyFileLayers.push(child.arch_layer);
+        }
+      } else if (child.type === "module") {
+        walk(child.id);
+      }
+    }
+  };
+  walk(moduleId);
+  const pool = nonEmptyFileLayers.length > 0 ? nonEmptyFileLayers : allFileLayers;
+  return pool.length > 0 ? Math.min(...pool) : 3;
 }
 
 function getLargeProjectThreshold() {
@@ -1719,6 +1788,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
           expandedFn: isExpandedFn ? "true" : "false",
           flowStepOrder: stepOrder || 0,
           line: rawNode.line || 0,
+          archLayer: getNodeArchLayer(rawNode),
         },
       });
 
@@ -1796,6 +1866,7 @@ function buildVisibleElements() {
         expandedFn: isExpandedFn ? "true" : "false",
         flowStepOrder: stepOrder || 0,
         line: rawNode.line || 0,
+        archLayer: getNodeArchLayer(rawNode),
       },
     });
 
@@ -2945,10 +3016,33 @@ function buildStylesheet() {
         "font-weight": "bold",
       },
     },
+    // Atenuación suave de aristas inter-archivo en modo Creación (1→N), restaurada al 100% al interactuar
+    {
+      selector: "edge.creation-cross-edge",
+      style: {
+        "opacity": 0.48,
+        "text-opacity": 0.65,
+        "width": 1.5,
+        "z-index": 2,
+      },
+    },
+    {
+      selector: "edge.creation-cross-edge:selected",
+      style: {
+        "opacity": 1,
+        "text-opacity": 1,
+        "width": 2.4,
+        "z-index": 25,
+      },
+    },
     // Clases de aislamiento, Hilos de Ejecución y Modo Foco multi-rama
     {
       selector: ".dimmed",
       style: { "opacity": 0.15 },
+    },
+    {
+      selector: "edge.creation-cross-edge.dimmed",
+      style: { "opacity": 0.15, "text-opacity": 0 },
     },
     // Etapa 3: Modo "Aristas bajo demanda" (Hover / Selection Reveal)
     {
@@ -2993,6 +3087,15 @@ function buildStylesheet() {
       },
     },
     {
+      selector: "edge.creation-cross-edge.edge-reveal-internal",
+      style: {
+        "opacity": 1,
+        "text-opacity": 1,
+        "width": 2.4,
+        "z-index": 25,
+      },
+    },
+    {
       selector: ".export-hidden",
       style: { "display": "none" },
     },
@@ -3006,7 +3109,7 @@ function buildStylesheet() {
     },
     {
       selector: "edge.flow-active-edge",
-      style: { "opacity": 1, "width": 3.2, "z-index": 20 },
+      style: { "opacity": 1, "text-opacity": 1, "width": 3.2, "z-index": 20 },
     },
     {
       selector: "node.trace-focus",
@@ -3018,7 +3121,7 @@ function buildStylesheet() {
     },
     {
       selector: "edge.trace-caller",
-      style: { "opacity": 1, "width": 3 },
+      style: { "opacity": 1, "text-opacity": 1, "width": 3 },
     },
     {
       selector: 'edge[edgeType = "direct_call"].trace-caller',
@@ -3030,7 +3133,7 @@ function buildStylesheet() {
     },
     {
       selector: "edge.trace-callee",
-      style: { "opacity": 1, "width": 3 },
+      style: { "opacity": 1, "text-opacity": 1, "width": 3 },
     },
     {
       selector: 'edge[edgeType = "direct_call"].trace-callee',
@@ -3040,6 +3143,7 @@ function buildStylesheet() {
       selector: "edge.trace-branch-active",
       style: {
         "opacity": 1,
+        "text-opacity": 1,
         "width": 4,
         "arrow-scale": 1.3,
         "underlay-color": "#f8fafc",
@@ -3319,9 +3423,21 @@ function computeStaggeredChannelShiftY(containerId, localY, staggerMeta) {
   return shift;
 }
 
-function adjustElkSectionPoints(section, edgeContainer, origOffset, srcId, tgtId, staggerMeta) {
-  const srcDy = (staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(srcId)) || 0;
-  const tgtDy = (staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(tgtId)) || 0;
+function adjustElkSectionPoints(
+  section,
+  edgeContainer,
+  origOffset,
+  srcId,
+  tgtId,
+  staggerMeta,
+  useChannelShiftForEndpoints = false,
+) {
+  const srcDy = useChannelShiftForEndpoints && section && section.startPoint
+    ? computeStaggeredChannelShiftY(edgeContainer, section.startPoint.y, staggerMeta)
+    : ((staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(srcId)) || 0);
+  const tgtDy = useChannelShiftForEndpoints && section && section.endPoint
+    ? computeStaggeredChannelShiftY(edgeContainer, section.endPoint.y, staggerMeta)
+    : ((staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(tgtId)) || 0);
   const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
   const absPoints = [];
 
@@ -3347,9 +3463,946 @@ function adjustElkSectionPoints(section, edgeContainer, origOffset, srcId, tgtId
   return absPoints;
 }
 
+function assignCreationBands(fnElkNodes, intraEdges, maxPerBand = null) {
+  if (!Array.isArray(fnElkNodes) || fnElkNodes.length === 0) {
+    return [];
+  }
+  const bandCap = typeof maxPerBand === "number" && maxPerBand > 0
+    ? maxPerBand
+    : (fnElkNodes.length <= 4 ? 2 : 3);
+  const fnIdSet = new Set(fnElkNodes.map((n) => n.id));
+  const neighbors = new Map(fnElkNodes.map((n) => [n.id, new Set()]));
+  for (const edge of intraEdges || []) {
+    const src = edge.sources ? edge.sources[0] : (edge.data && edge.data.source);
+    const tgt = edge.targets ? edge.targets[0] : (edge.data && edge.data.target);
+    if (fnIdSet.has(src) && fnIdSet.has(tgt) && src !== tgt) {
+      neighbors.get(src).add(tgt);
+      neighbors.get(tgt).add(src);
+    }
+  }
+  const bands = [];
+  let currentBand = [];
+  for (const fnNode of fnElkNodes) {
+    const conflictsWithBand = currentBand.some((prev) => neighbors.get(fnNode.id).has(prev.id));
+    if (currentBand.length >= bandCap || conflictsWithBand) {
+      if (currentBand.length > 0) {
+        bands.push(currentBand);
+      }
+      currentBand = [fnNode];
+    } else {
+      currentBand.push(fnNode);
+    }
+  }
+  if (currentBand.length > 0) {
+    bands.push(currentBand);
+  }
+  return bands;
+}
+
+function computeCreationPartition(nodeId, dataById, childrenByParent = null) {
+  const data = dataById.get(nodeId);
+  if (!data) {
+    return 0;
+  }
+  if (data.type === "layer" && typeof data.layerIndex === "number") {
+    return Math.max(0, 3 - data.layerIndex);
+  }
+  if (typeof data.archLayer === "number") {
+    return Math.max(0, 3 - data.archLayer);
+  }
+  if (childrenByParent) {
+    const nonEmptyFileLayers = [];
+    const allFileLayers = [];
+    const walk = (id) => {
+      for (const child of childrenByParent.get(id) || []) {
+        const childData = dataById.get(child.id);
+        if (childData && childData.type === "file" && typeof childData.archLayer === "number") {
+          allFileLayers.push(childData.archLayer);
+          const fileKids = childrenByParent.get(child.id) || [];
+          if (fileKids.some((k) => (dataById.get(k.id) || {}).type === "function")) {
+            nonEmptyFileLayers.push(childData.archLayer);
+          }
+        } else {
+          walk(child.id);
+        }
+      }
+    };
+    walk(nodeId);
+    const pool = nonEmptyFileLayers.length > 0 ? nonEmptyFileLayers : allFileLayers;
+    if (pool.length > 0) {
+      return Math.max(0, 3 - Math.min(...pool));
+    }
+  }
+  return 0;
+}
+
+function computeIntraTierFoundationDepths(siblingIds, callEdges, basePartitionById) {
+  const depthById = new Map();
+  const byTier = new Map();
+  for (const id of siblingIds) {
+    const tier = basePartitionById.get(id) ?? 0;
+    if (!byTier.has(tier)) {
+      byTier.set(tier, []);
+    }
+    byTier.get(tier).push(id);
+    depthById.set(id, 0);
+  }
+
+  for (const [, tierIds] of byTier.entries()) {
+    if (tierIds.length <= 1) {
+      continue;
+    }
+    const tierSet = new Set(tierIds);
+    // Aristas reales son caller -> callee; las bases (callees sin dependencias dentro del tier) tienen depth = 0.
+    const calleesOf = new Map(tierIds.map((id) => [id, new Set()]));
+    for (const e of callEdges) {
+      const s = e.source;
+      const t = e.target;
+      if (tierSet.has(s) && tierSet.has(t) && s !== t) {
+        calleesOf.get(s).add(t);
+      }
+    }
+    // Relajación acotada (segura ante ciclos).
+    const maxSteps = Math.min(8, tierIds.length - 1);
+    for (let iter = 0; iter < maxSteps; iter += 1) {
+      let changed = false;
+      for (const id of tierIds) {
+        let best = depthById.get(id) || 0;
+        for (const callee of calleesOf.get(id)) {
+          const cand = (depthById.get(callee) || 0) + 1;
+          if (cand > best && cand <= maxSteps) {
+            best = cand;
+          }
+        }
+        if (best !== depthById.get(id)) {
+          depthById.set(id, best);
+          changed = true;
+        }
+      }
+      if (!changed) {
+        break;
+      }
+    }
+  }
+  return depthById;
+}
+
+function buildCreationElkInput(visibleNodes, visibleEdges, options) {
+  const floatingPorts = Boolean(options && options.floatingPorts);
+  const elkNodes = new Map();
+  const dataById = new Map();
+  const orderIndexById = new Map();
+  const parentOf = new Map();
+  const childrenByParent = new Map();
+
+  visibleNodes.forEach((item, idx) => {
+    const d = item.data;
+    dataById.set(d.id, d);
+    orderIndexById.set(d.id, idx);
+    const size = estimateNodeSize(d);
+    const isFlowBox = d.expandedFn === "true" || d.flowContainer === "true";
+    let nodeLayoutOptions = undefined;
+    if (isFlowBox) {
+      nodeLayoutOptions = {
+        "elk.algorithm": "layered",
+        "elk.direction": "DOWN",
+        "elk.hierarchyHandling": "INCLUDE_CHILDREN",
+        "elk.edgeRouting": "ORTHOGONAL",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "30",
+        "elk.spacing.nodeNode": "26",
+        "elk.padding": d.flowContainer === "true"
+          ? "[top=38,left=24,bottom=22,right=24]"
+          : "[top=44,left=24,bottom=22,right=24]",
+      };
+    }
+    elkNodes.set(d.id, {
+      id: d.id,
+      width: size.width,
+      height: size.height,
+      children: [],
+      edges: [],
+      layoutOptions: nodeLayoutOptions,
+    });
+  });
+
+  const rootChildren = [];
+  for (const item of visibleNodes) {
+    const d = item.data;
+    const elkNode = elkNodes.get(d.id);
+    const parentId = d.parent && elkNodes.has(d.parent) ? d.parent : null;
+    parentOf.set(d.id, parentId);
+    const parentKey = parentId || "__root__";
+    if (!childrenByParent.has(parentKey)) {
+      childrenByParent.set(parentKey, []);
+    }
+    childrenByParent.get(parentKey).push(elkNode);
+    if (parentId) {
+      elkNodes.get(parentId).children.push(elkNode);
+    } else {
+      rootChildren.push(elkNode);
+    }
+  }
+
+  const compareByCreationLine = (a, b) => {
+    const da = dataById.get(a.id) || {};
+    const db = dataById.get(b.id) || {};
+    if (da.type === "flow" || db.type === "flow") {
+      return (orderIndexById.get(a.id) ?? 0) - (orderIndexById.get(b.id) ?? 0);
+    }
+    const lineA = typeof da.line === "number" ? da.line : 0;
+    const lineB = typeof db.line === "number" ? db.line : 0;
+    if (lineA !== lineB) {
+      return lineA - lineB;
+    }
+    return (orderIndexById.get(a.id) ?? 0) - (orderIndexById.get(b.id) ?? 0);
+  };
+
+  const compareLayerFunctions = (a, b) => {
+    const da = dataById.get(a.id) || {};
+    const db = dataById.get(b.id) || {};
+    const fileA = String(a.id).split("::")[0];
+    const fileB = String(b.id).split("::")[0];
+    if (fileA !== fileB) {
+      return fileA.localeCompare(fileB);
+    }
+    return compareByCreationLine(a, b);
+  };
+
+  const makeElkEdge = (edge) => {
+    const elkEdge = {
+      id: edge.data.id,
+      sources: [edge.data.source],
+      targets: [edge.data.target],
+    };
+    const labelText = String(edge.data.label || "").trim();
+    if (labelText) {
+      elkEdge.labels = [
+        {
+          text: labelText,
+          width: Math.max(24, Math.round(labelText.length * 6.8 + 10)),
+          height: 16,
+        },
+      ];
+    }
+    return elkEdge;
+  };
+
+  const getAncestorsFromRoot = (id) => {
+    const chain = [];
+    let cur = id;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      chain.push(cur);
+      cur = parentOf.get(cur) || null;
+    }
+    return chain.reverse();
+  };
+
+  const findEnclosingFlowFn = (nodeId) => {
+    let cur = nodeId;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const d = dataById.get(cur);
+      if (d && d.expandedFn === "true") {
+        return cur;
+      }
+      cur = parentOf.get(cur) || null;
+    }
+    return null;
+  };
+
+  const findEnclosingContainerId = (nodeId) => {
+    let cur = parentOf.get(nodeId) || null;
+    while (cur) {
+      const d = dataById.get(cur);
+      if (d && (d.type === "file" || d.type === "layer" || d.type === "module")) {
+        return cur;
+      }
+      cur = parentOf.get(cur) || null;
+    }
+    return "root";
+  };
+
+  // Pre-agrupar aristas directas entre hermanos de cada contenedor y aristas de flujo intra-función.
+  const directEdgesByContainer = new Map();
+  const flowEdgesByFn = new Map();
+  const crossEdges = [];
+
+  for (const edge of visibleEdges) {
+    const src = edge.data.source;
+    const tgt = edge.data.target;
+    if (!elkNodes.has(src) || !elkNodes.has(tgt) || src === tgt) {
+      continue;
+    }
+    if (edge.data.kind === "flow") {
+      const ownerFn = findEnclosingFlowFn(src) || findEnclosingFlowFn(tgt);
+      if (ownerFn) {
+        if (!flowEdgesByFn.has(ownerFn)) {
+          flowEdgesByFn.set(ownerFn, []);
+        }
+        flowEdgesByFn.get(ownerFn).push(edge);
+      }
+      continue;
+    }
+    const pSrc = parentOf.get(src) || "root";
+    const pTgt = parentOf.get(tgt) || "root";
+    if (pSrc === pTgt) {
+      if (!directEdgesByContainer.has(pSrc)) {
+        directEdgesByContainer.set(pSrc, []);
+      }
+      directEdgesByContainer.get(pSrc).push(edge);
+    } else {
+      crossEdges.push(edge);
+    }
+  }
+
+  // Calcular particiones base para todos los contenedores (módulos, archivos, capas) y sus hermanos.
+  const partitionById = new Map();
+  const assignSiblingContainerPartitions = (containerId, childElkNodes) => {
+    const nonPortChildren = childElkNodes.filter((c) => {
+      const d = dataById.get(c.id);
+      return d && d.type !== "port";
+    });
+    const basePartById = new Map();
+    for (const c of nonPortChildren) {
+      basePartById.set(c.id, computeCreationPartition(c.id, dataById, childrenByParent));
+    }
+    // Proyectar aristas de llamada entre descendientes de estos hermanos para ordenar bases dentro del mismo tier.
+    const siblingIdSet = new Set(nonPortChildren.map((c) => c.id));
+    const projectedCalls = [];
+    const resolveToSibling = (id) => {
+      let cur = id;
+      while (cur) {
+        if (siblingIdSet.has(cur)) {
+          return cur;
+        }
+        cur = parentOf.get(cur) || null;
+      }
+      return null;
+    };
+    for (const edge of visibleEdges) {
+      if (edge.data.kind === "flow") {
+        continue;
+      }
+      const sSib = resolveToSibling(edge.data.source);
+      const tSib = resolveToSibling(edge.data.target);
+      if (sSib && tSib && sSib !== tSib) {
+        projectedCalls.push({ source: sSib, target: tSib });
+      }
+    }
+    const subDepths = computeIntraTierFoundationDepths(
+      nonPortChildren.map((c) => c.id),
+      projectedCalls,
+      basePartById,
+    );
+    const outPorts = childElkNodes.filter((c) => {
+      const d = dataById.get(c.id);
+      return d && d.type === "port" && d.portDir === "out";
+    });
+    const inPorts = childElkNodes.filter((c) => {
+      const d = dataById.get(c.id);
+      return d && d.type === "port" && d.portDir === "in";
+    });
+    const portOffset = floatingPorts && outPorts.length > 0 ? 1 : 0;
+    let maxAssigned = portOffset;
+    for (const c of nonPortChildren) {
+      const tier = basePartById.get(c.id) ?? 0;
+      const depth = subDepths.get(c.id) ?? 0;
+      const pVal = tier * 10 + depth + portOffset;
+      partitionById.set(c.id, pVal);
+      if (pVal > maxAssigned) {
+        maxAssigned = pVal;
+      }
+    }
+    if (floatingPorts) {
+      for (const p of outPorts) {
+        partitionById.set(p.id, 0);
+      }
+      for (const p of inPorts) {
+        partitionById.set(p.id, maxAssigned + 1);
+      }
+    }
+    childElkNodes.sort((a, b) => {
+      const pa = partitionById.get(a.id) ?? 0;
+      const pb = partitionById.get(b.id) ?? 0;
+      if (pa !== pb) {
+        return pa - pb;
+      }
+      return compareByCreationLine(a, b);
+    });
+  };
+
+  // Configurar contenedores que agrupan funciones en bandas 1 -> N (archivos, capas con funciones, o root plano).
+  const configureFunctionContainer = (containerId, containerChildren, maxPerBand = null) => {
+    const outPorts = containerChildren.filter((c) => {
+      const d = dataById.get(c.id);
+      return d && d.type === "port" && d.portDir === "out";
+    });
+    const inPorts = containerChildren.filter((c) => {
+      const d = dataById.get(c.id);
+      return d && d.type === "port" && d.portDir === "in";
+    });
+    const internalChildren = containerChildren.filter((c) => {
+      const d = dataById.get(c.id);
+      return !d || d.type !== "port";
+    });
+    const containerData = dataById.get(containerId);
+    const sortFn = containerData && containerData.type === "layer" ? compareLayerFunctions : compareByCreationLine;
+    internalChildren.sort(sortFn);
+
+    const directEdges = directEdgesByContainer.get(containerId) || [];
+    const bands = assignCreationBands(internalChildren, directEdges, maxPerBand);
+    const portOffset = floatingPorts && outPorts.length > 0 ? 1 : 0;
+    bands.forEach((band, bandIdx) => {
+      for (const fnNode of band) {
+        const partVal = bandIdx + portOffset;
+        partitionById.set(fnNode.id, partVal);
+        fnNode.layoutOptions = {
+          ...(fnNode.layoutOptions || {}),
+          "elk.partitioning.partition": String(partVal),
+        };
+      }
+    });
+    if (floatingPorts) {
+      for (const p of outPorts) {
+        partitionById.set(p.id, 0);
+        p.layoutOptions = { ...(p.layoutOptions || {}), "elk.partitioning.partition": "0" };
+      }
+      const inPart = bands.length + portOffset;
+      for (const p of inPorts) {
+        partitionById.set(p.id, inPart);
+        p.layoutOptions = { ...(p.layoutOptions || {}), "elk.partitioning.partition": String(inPart) };
+      }
+    }
+    // Ordenar array de hijos para que `forceNodeModelOrder` coincida exactamente con 1 -> N.
+    containerChildren.length = 0;
+    containerChildren.push(...outPorts, ...internalChildren, ...inPorts);
+  };
+
+  // Configurar contenedores jerárquicos (root, module, layer, file, expandedFn).
+  const rootNonPort = rootChildren.filter((c) => (dataById.get(c.id) || {}).type !== "port");
+  const rootHasOnlyFunctions = rootNonPort.length > 0
+    && rootNonPort.every((c) => (dataById.get(c.id) || {}).type === "function");
+
+  if (rootHasOnlyFunctions) {
+    configureFunctionContainer("root", rootChildren, null);
+  } else {
+    assignSiblingContainerPartitions("root", rootChildren);
+  }
+
+  for (const [id, elkNode] of elkNodes.entries()) {
+    const d = dataById.get(id);
+    if (!d) {
+      continue;
+    }
+    const isFlowBox = d.expandedFn === "true" || d.flowContainer === "true";
+    if (isFlowBox) {
+      if (d.expandedFn === "true") {
+        const fEdges = flowEdgesByFn.get(id) || [];
+        elkNode.edges = fEdges.map(makeElkEdge);
+      } else {
+        delete elkNode.edges;
+      }
+      if (elkNode.children.length > 0) {
+        delete elkNode.width;
+        delete elkNode.height;
+      } else {
+        delete elkNode.children;
+      }
+      continue;
+    }
+
+    if (elkNode.children.length > 0) {
+      const childTypes = elkNode.children.map((c) => (dataById.get(c.id) || {}).type);
+      const isFileOrFnLayer = d.type === "file"
+        || (d.type === "layer" && childTypes.some((t) => t === "function"));
+      if (isFileOrFnLayer) {
+        configureFunctionContainer(id, elkNode.children, d.type === "layer" ? 4 : null);
+        const directEdges = directEdgesByContainer.get(id) || [];
+        elkNode.edges = directEdges.map(makeElkEdge);
+        const selfPart = partitionById.get(id);
+        elkNode.layoutOptions = {
+          ...CREATION_FILE_ELK_OPTIONS,
+          ...(selfPart !== undefined ? { "elk.partitioning.partition": String(selfPart) } : {}),
+        };
+      } else {
+        assignSiblingContainerPartitions(id, elkNode.children);
+        const directEdges = directEdgesByContainer.get(id) || [];
+        elkNode.edges = directEdges.map(makeElkEdge);
+        const selfPart = partitionById.get(id);
+        elkNode.layoutOptions = {
+          ...CREATION_CONTAINER_ELK_OPTIONS,
+          ...(selfPart !== undefined ? { "elk.partitioning.partition": String(selfPart) } : {}),
+        };
+      }
+      delete elkNode.width;
+      delete elkNode.height;
+    } else {
+      const selfPart = partitionById.get(id);
+      if (selfPart !== undefined && d.type !== "flow") {
+        elkNode.layoutOptions = {
+          ...(elkNode.layoutOptions || {}),
+          "elk.partitioning.partition": String(selfPart),
+        };
+      }
+      delete elkNode.children;
+      delete elkNode.edges;
+    }
+  }
+
+  for (const rootChild of rootChildren) {
+    computeElkSubtreeWidth(rootChild, dataById);
+  }
+
+  const rootElkEdges = (directEdgesByContainer.get("root") || []).map(makeElkEdge);
+  const rootLayoutOptions = rootHasOnlyFunctions
+    ? {
+        ...CREATION_FILE_ELK_OPTIONS,
+        ...(floatingPorts ? { "elk.padding": "[top=24,left=36,bottom=24,right=36]" } : {}),
+      }
+    : {
+        ...CREATION_CONTAINER_ELK_OPTIONS,
+        ...(floatingPorts ? { "elk.padding": "[top=24,left=28,bottom=24,right=28]" } : {}),
+      };
+
+  const elkGraph = {
+    id: "root",
+    layoutOptions: rootLayoutOptions,
+    children: rootChildren,
+    edges: rootElkEdges,
+  };
+
+  // Proyectar aristas inter-contenedor como aristas macro ortogonales en su ancestro común (LCA).
+  const macroByKey = new Map();
+  const crossEdgeMeta = new Map();
+  let macroCounter = 0;
+
+  for (const edge of crossEdges) {
+    const src = edge.data.source;
+    const tgt = edge.data.target;
+    const sAnc = getAncestorsFromRoot(src);
+    const tAnc = getAncestorsFromRoot(tgt);
+    let lcaIdx = -1;
+    while (
+      lcaIdx + 1 < sAnc.length
+      && lcaIdx + 1 < tAnc.length
+      && sAnc[lcaIdx + 1] === tAnc[lcaIdx + 1]
+    ) {
+      lcaIdx += 1;
+    }
+    const lcaId = lcaIdx >= 0 ? sAnc[lcaIdx] : "root";
+    const lcaNode = lcaId === "root" ? elkGraph : elkNodes.get(lcaId);
+    const cS = sAnc[lcaIdx + 1];
+    const cT = tAnc[lcaIdx + 1];
+    if (!lcaNode || !cS || !cT || cS === cT) {
+      continue;
+    }
+
+    const partS = partitionById.get(cS) ?? 0;
+    const partT = partitionById.get(cT) ?? 0;
+    // Orientar la arista macro en el sentido descendente de particiones (cimiento -> consumidor) para alinearla con DOWN.
+    const reverseMacro = partT <= partS;
+    const fromContainer = reverseMacro ? cT : cS;
+    const toContainer = reverseMacro ? cS : cT;
+    const macroKey = `${lcaId}:${fromContainer}->${toContainer}`;
+
+    crossEdgeMeta.set(edge.data.id, {
+      macroKey,
+      lcaId,
+      srcContainer: cS,
+      tgtContainer: cT,
+      reverseMacro,
+      srcEnclosing: findEnclosingContainerId(src),
+      tgtEnclosing: findEnclosingContainerId(tgt),
+    });
+
+    if (!macroByKey.has(macroKey)) {
+      macroCounter += 1;
+      const macroId = `${CREATION_MACRO_EDGE_PREFIX}${macroCounter}`;
+      macroByKey.set(macroKey, {
+        id: macroId,
+        lcaId,
+        fromContainer,
+        toContainer,
+      });
+      if (!Array.isArray(lcaNode.edges)) {
+        lcaNode.edges = [];
+      }
+      lcaNode.edges.push({
+        id: macroId,
+        sources: [fromContainer],
+        targets: [toContainer],
+      });
+    }
+  }
+
+  return {
+    elkGraph,
+    creationMeta: {
+      isCreationStrict: true,
+      markCrossEdges: !floatingPorts,
+      macroByKey,
+      crossEdgeMeta,
+      parentOf,
+      dataById,
+    },
+  };
+}
+
+function buildPostStaggerBoxes(layouted, elkPositions, dataById) {
+  const boxOf = new Map();
+  const leafBoxes = [];
+  const containerBoxes = [];
+
+  const walk = (node) => {
+    if (!node) {
+      return null;
+    }
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const child of node.children) {
+        const cb = walk(child);
+        if (!cb) {
+          continue;
+        }
+        if (cb.left < minX) minX = cb.left;
+        if (cb.top < minY) minY = cb.top;
+        if (cb.right > maxX) maxX = cb.right;
+        if (cb.bottom > maxY) maxY = cb.bottom;
+      }
+      if (!Number.isFinite(minX)) {
+        return null;
+      }
+      const d = dataById ? dataById.get(node.id) : null;
+      const padLR = d && (d.type === "file" || d.type === "layer") ? 36 : 28;
+      const padT = 42;
+      const padB = 24;
+      const box = {
+        id: node.id,
+        isContainer: true,
+        left: minX - padLR,
+        right: maxX + padLR,
+        top: minY - padT,
+        bottom: maxY + padB,
+        cx: (minX + maxX) / 2,
+        cy: (minY + maxY) / 2,
+        w: (maxX - minX) + padLR * 2,
+        h: (maxY - minY) + padT + padB,
+      };
+      boxOf.set(node.id, box);
+      if (node.id !== "root") {
+        containerBoxes.push(box);
+      }
+      return box;
+    }
+    if (node.id === "root") {
+      return null;
+    }
+    const pos = elkPositions.get(node.id);
+    if (!pos) {
+      return null;
+    }
+    const w = node.width || 140;
+    const h = node.height || 44;
+    const box = {
+      id: node.id,
+      isContainer: false,
+      left: pos.x - w / 2,
+      right: pos.x + w / 2,
+      top: pos.y - h / 2,
+      bottom: pos.y + h / 2,
+      cx: pos.x,
+      cy: pos.y,
+      w,
+      h,
+    };
+    boxOf.set(node.id, box);
+    leafBoxes.push(box);
+    return box;
+  };
+
+  walk(layouted);
+  return { boxOf, leafBoxes, containerBoxes };
+}
+
+function stitchCrossFileEdgeOntoMacroCorridor(
+  srcId,
+  tgtId,
+  macroPts,
+  reverseMacro,
+  laneIdx,
+  totalLanes,
+  boxes,
+  srcEnclosingId,
+  tgtEnclosingId,
+) {
+  if (!macroPts || macroPts.length < 2 || !boxes || !boxes.boxOf) {
+    return null;
+  }
+  const { boxOf, leafBoxes, containerBoxes } = boxes;
+  const srcB = boxOf.get(srcId);
+  const tgtB = boxOf.get(tgtId);
+  if (!srcB || !tgtB) {
+    return null;
+  }
+  const srcFileB = boxOf.get(srcEnclosingId) || srcB;
+  const tgtFileB = boxOf.get(tgtEnclosingId) || tgtB;
+  const ignoreLeaves = new Set([srcId, tgtId]);
+
+  const Q = reverseMacro ? [...macroPts].reverse() : [...macroPts];
+  const centered = totalLanes > 1 ? laneIdx - (totalLanes - 1) / 2 : 0;
+
+  const vSegBlocked = (x, y1, y2) => {
+    const top = Math.min(y1, y2);
+    const bot = Math.max(y1, y2);
+    return leafBoxes.some(
+      (b) => !ignoreLeaves.has(b.id)
+        && x > b.left + 1
+        && x < b.right - 1
+        && bot > b.top + 1
+        && top < b.bottom - 1,
+    );
+  };
+
+  const hSegBlocked = (y, x1, x2) => {
+    const left = Math.min(x1, x2);
+    const right = Math.max(x1, x2);
+    return leafBoxes.some(
+      (b) => !ignoreLeaves.has(b.id)
+        && y > b.top + 1
+        && y < b.bottom - 1
+        && right > b.left + 1
+        && left < b.right - 1,
+    );
+  };
+
+  // Medir holgura real alrededor de un corredor vertical para acotar `±7px` sin invadir cajas vecinas.
+  const computeClampedVerticalOffset = (baseX, y1, y2, maxCap = 24) => {
+    if (centered === 0) {
+      return 0;
+    }
+    const minY = Math.min(y1, y2);
+    const maxY = Math.max(y1, y2);
+    let leftClear = maxCap;
+    let rightClear = maxCap;
+    const obstacles = [...leafBoxes, ...containerBoxes];
+    for (const b of obstacles) {
+      if (b.id === srcId || b.id === tgtId || b.id === srcEnclosingId || b.id === tgtEnclosingId) {
+        continue;
+      }
+      if (maxY <= b.top + 1 || minY >= b.bottom - 1) {
+        continue;
+      }
+      if (b.right <= baseX + 1) {
+        leftClear = Math.min(leftClear, Math.max(0, baseX - b.right - 5));
+      } else if (b.left >= baseX - 1) {
+        rightClear = Math.min(rightClear, Math.max(0, b.left - baseX - 5));
+      }
+    }
+    const maxHalf = Math.max(0, Math.min(leftClear, rightClear, maxCap));
+    if (maxHalf < 1) {
+      return 0;
+    }
+    const safeStep = Math.min(7, (2 * maxHalf) / Math.max(1, totalLanes - 1));
+    return Math.max(-maxHalf, Math.min(maxHalf, centered * safeStep));
+  };
+
+  // Medir holgura real alrededor de un pasillo horizontal para acotar el offset vertical sin pisar cajas.
+  const computeClampedHorizontalOffset = (baseY, x1, x2, maxCap = 16) => {
+    if (centered === 0) {
+      return 0;
+    }
+    const minX = Math.min(x1, x2);
+    const maxX = Math.max(x1, x2);
+    let topClear = maxCap;
+    let bottomClear = maxCap;
+    for (const b of leafBoxes) {
+      if (ignoreLeaves.has(b.id)) {
+        continue;
+      }
+      if (maxX <= b.left + 1 || minX >= b.right - 1) {
+        continue;
+      }
+      if (b.bottom <= baseY + 1) {
+        topClear = Math.min(topClear, Math.max(0, baseY - b.bottom - 5));
+      } else if (b.top >= baseY - 1) {
+        bottomClear = Math.min(bottomClear, Math.max(0, b.top - baseY - 5));
+      }
+    }
+    const maxHalf = Math.max(0, Math.min(topClear, bottomClear, maxCap));
+    if (maxHalf < 1) {
+      return 0;
+    }
+    const safeStep = Math.min(6, (2 * maxHalf) / Math.max(1, totalLanes - 1));
+    return Math.max(-maxHalf, Math.min(maxHalf, centered * safeStep));
+  };
+
+  // Offset acotado dentro del margen lateral del archivo (padding 36px -> franja segura ±9px alrededor del centro del gutter).
+  const gutterHalf = 9;
+  const gutterStep = totalLanes > 1 ? Math.min(5, (2 * gutterHalf) / (totalLanes - 1)) : 0;
+  const gutterOff = Math.max(-gutterHalf, Math.min(gutterHalf, centered * gutterStep));
+
+  const findClearHorizontalY = (nodeB, preferBelow, x1, x2) => {
+    const step = preferBelow ? 10 : -10;
+    const base = preferBelow ? nodeB.bottom + 14 : nodeB.top - 14;
+    for (let k = 0; k < 6; k += 1) {
+      const candidateY = base + k * step;
+      if (!hSegBlocked(candidateY, x1, x2)) {
+        return candidateY + computeClampedHorizontalOffset(candidateY, x1, x2, 6);
+      }
+    }
+    return base;
+  };
+
+  let entryY;
+  let exitY;
+  let spinePts = [];
+
+  if (Q.length === 2) {
+    const gap = Math.abs(Q[1].y - Q[0].y);
+    if (gap > 90) {
+      const dir = Q[1].y < Q[0].y ? -1 : 1;
+      const baseEntryY = Q[0].y + dir * 16;
+      const baseExitY = Q[1].y - dir * 16;
+      const spineOff = computeClampedVerticalOffset(Q[0].x, baseEntryY, baseExitY, 22);
+      const spineX = Q[0].x + spineOff;
+      entryY = baseEntryY + computeClampedHorizontalOffset(baseEntryY, srcB.cx, spineX, 8);
+      exitY = baseExitY + computeClampedHorizontalOffset(baseExitY, spineX, tgtB.cx, 8);
+      spinePts = [{ x: spineX, y: entryY }, { x: spineX, y: exitY }];
+    } else {
+      const baseMidY = (Q[0].y + Q[1].y) / 2;
+      const yOff = computeClampedHorizontalOffset(baseMidY, srcB.cx, tgtB.cx, Math.max(4, gap * 0.32));
+      entryY = baseMidY + yOff;
+      exitY = entryY;
+    }
+  } else if (Q.length === 4) {
+    if (Math.abs(Q[0].x - Q[1].x) < 1 && Math.abs(Q[1].y - Q[2].y) < 1) {
+      const vGap = Math.abs(Q[1].y - Q[0].y);
+      if (vGap > 90) {
+        const dir = Q[1].y < Q[0].y ? -1 : 1;
+        const baseEntryY = Q[0].y + dir * 16;
+        const baseExitY = Q[1].y;
+        const spineOff = computeClampedVerticalOffset(Q[0].x, baseEntryY, baseExitY, 22);
+        const spineX = Q[0].x + spineOff;
+        entryY = baseEntryY + computeClampedHorizontalOffset(baseEntryY, srcB.cx, spineX, 8);
+        exitY = baseExitY + computeClampedHorizontalOffset(baseExitY, spineX, tgtB.cx, 12);
+        spinePts = [{ x: spineX, y: entryY }, { x: spineX, y: exitY }];
+      } else {
+        const yOff = computeClampedHorizontalOffset(Q[1].y, srcB.cx, tgtB.cx, 14);
+        entryY = Q[1].y + yOff;
+        exitY = entryY;
+      }
+    } else {
+      const spineOff = computeClampedVerticalOffset(Q[1].x, Q[1].y, Q[2].y, 22);
+      entryY = Q[1].y + computeClampedHorizontalOffset(Q[1].y, srcB.cx, Q[1].x + spineOff, 10);
+      exitY = Q[2].y + computeClampedHorizontalOffset(Q[2].y, Q[2].x + spineOff, tgtB.cx, 10);
+      spinePts = [
+        { x: Q[1].x + spineOff, y: entryY },
+        { x: Q[2].x + spineOff, y: exitY },
+      ];
+    }
+  } else {
+    const interior = Q.slice(1, -1);
+    const spineRefX = interior.length >= 2 ? interior[1].x : interior[0].x;
+    const minIntY = Math.min(...interior.map((p) => p.y));
+    const maxIntY = Math.max(...interior.map((p) => p.y));
+    const spineOff = computeClampedVerticalOffset(spineRefX, minIntY, maxIntY, 22);
+    entryY = interior[0].y + computeClampedHorizontalOffset(interior[0].y, srcB.cx, spineRefX + spineOff, 10);
+    exitY = interior[interior.length - 1].y
+      + computeClampedHorizontalOffset(interior[interior.length - 1].y, spineRefX + spineOff, tgtB.cx, 10);
+    spinePts = interior.map((p, idx, arr) => ({
+      x: p.x + spineOff,
+      y: idx === 0
+        ? entryY
+        : (idx === arr.length - 1 ? exitY : p.y + (idx === 1 ? (entryY - interior[0].y) : (exitY - interior[arr.length - 1].y))),
+    }));
+  }
+
+  const pts = [];
+  const targetRefX = spinePts.length > 0 ? spinePts[0].x : tgtB.cx;
+
+  // 1. Conectar nodo origen -> pasillo de entrada `entryY`.
+  const goingUpFromSrc = entryY < srcB.cy;
+  const srcPortY = goingUpFromSrc ? srcB.top : srcB.bottom;
+  if (!vSegBlocked(srcB.cx, srcPortY, entryY)) {
+    pts.push({ x: srcB.cx, y: srcPortY });
+    pts.push({ x: srcB.cx, y: entryY });
+  } else {
+    const useLeft = targetRefX <= srcB.cx;
+    const gutterX = useLeft ? (srcFileB.left + 18 + gutterOff) : (srcFileB.right - 18 + gutterOff);
+    const localY = findClearHorizontalY(srcB, !goingUpFromSrc, srcB.cx, gutterX);
+    pts.push({ x: srcB.cx, y: srcPortY });
+    pts.push({ x: srcB.cx, y: localY });
+    pts.push({ x: gutterX, y: localY });
+    pts.push({ x: gutterX, y: entryY });
+  }
+
+  // 2. Recorrer el tronco ortogonal calculado por ELK.
+  if (spinePts.length > 0) {
+    for (const sp of spinePts) {
+      pts.push(sp);
+    }
+  }
+
+  // 3. Conectar pasillo de salida `exitY` -> nodo destino.
+  const enteringFromBelow = exitY > tgtB.cy;
+  const tgtPortY = enteringFromBelow ? tgtB.bottom : tgtB.top;
+  if (!vSegBlocked(tgtB.cx, exitY, tgtPortY)) {
+    pts.push({ x: tgtB.cx, y: exitY });
+    pts.push({ x: tgtB.cx, y: tgtPortY });
+  } else {
+    const lastX = pts[pts.length - 1].x;
+    const useLeft = lastX <= tgtB.cx;
+    const gutterX = useLeft ? (tgtFileB.left + 18 + gutterOff) : (tgtFileB.right - 18 + gutterOff);
+    const localY = findClearHorizontalY(tgtB, enteringFromBelow, gutterX, tgtB.cx);
+    pts.push({ x: gutterX, y: exitY });
+    pts.push({ x: gutterX, y: localY });
+    pts.push({ x: tgtB.cx, y: localY });
+    pts.push({ x: tgtB.cx, y: tgtPortY });
+  }
+
+  // Limpiar puntos duplicados o colineales redundantes.
+  const dedup = [];
+  for (const p of pts) {
+    if (dedup.length > 0 && Math.hypot(p.x - dedup[dedup.length - 1].x, p.y - dedup[dedup.length - 1].y) < 0.5) {
+      continue;
+    }
+    dedup.push(p);
+  }
+  const clean = [];
+  for (const p of dedup) {
+    while (clean.length >= 2) {
+      const a = clean[clean.length - 2];
+      const b = clean[clean.length - 1];
+      const sameX = Math.abs(a.x - b.x) < 0.5 && Math.abs(b.x - p.x) < 0.5;
+      const sameY = Math.abs(a.y - b.y) < 0.5 && Math.abs(b.y - p.y) < 0.5;
+      if (sameX || sameY) {
+        clean.pop();
+      } else {
+        break;
+      }
+    }
+    clean.push(p);
+  }
+  return clean.length >= 2 ? clean : null;
+}
+
 async function runElkLayout(visibleNodes, visibleEdges) {
   const isCreationOrder = state.layoutOrderMode === "creation";
-  const elkGraph = buildElkInput(visibleNodes, visibleEdges);
+  let elkGraph;
+  let creationMeta = null;
+  if (isCreationOrder) {
+    const built = buildCreationElkInput(visibleNodes, visibleEdges);
+    elkGraph = built.elkGraph;
+    creationMeta = built.creationMeta;
+  } else {
+    elkGraph = buildElkInput(visibleNodes, visibleEdges);
+  }
   const layouted = await state.elk.layout(elkGraph);
 
   const elkPositions = new Map();
@@ -3388,7 +4441,7 @@ async function runElkLayout(visibleNodes, visibleEdges) {
     staggerMeta = shiftedNodeIds.staggerMeta || null;
   }
 
-  const defaultDirection = isCreationOrder ? "upward" : "downward";
+  const defaultDirection = "downward";
 
   state.cy.batch(() => {
     state.cy.nodes().forEach((cyNode) => {
@@ -3413,11 +4466,17 @@ async function runElkLayout(visibleNodes, visibleEdges) {
       pinnedNodeIds,
       defaultDirection,
       staggerMeta,
+      creationMeta,
     );
   });
 }
 
-function buildElkInput(visibleNodes, visibleEdges) {
+function buildElkInput(visibleNodes, visibleEdges, options) {
+  const forceExecution = Boolean(options && options.forceExecution);
+  if (!forceExecution && state.layoutOrderMode === "creation") {
+    return buildCreationElkInput(visibleNodes, visibleEdges).elkGraph;
+  }
+
   const elkNodes = new Map();
   const dataById = new Map();
   const orderIndexById = new Map();
@@ -3516,27 +4575,15 @@ function buildElkInput(visibleNodes, visibleEdges) {
     return elkEdge;
   });
 
-  const isCreationUp = state.layoutOrderMode === "creation";
-  const elkDirection = isCreationUp ? "UP" : "DOWN";
-  const upSpacingOverrides = isCreationUp
-    ? {
-        "elk.spacing.edgeEdge": "16",
-        "elk.layered.spacing.edgeEdgeBetweenLayers": "16",
-        "elk.layered.spacing.edgeNodeBetweenLayers": "24",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "54",
-      }
-    : {};
   const rootLayoutOptions = hasLayerContainers
     ? {
         ...ELK_LAYOUT_OPTIONS,
-        ...upSpacingOverrides,
-        "elk.direction": elkDirection,
+        "elk.direction": "DOWN",
         "elk.partitioning.activate": "true",
       }
     : {
         ...ELK_LAYOUT_OPTIONS,
-        ...upSpacingOverrides,
-        "elk.direction": elkDirection,
+        "elk.direction": "DOWN",
       };
 
   return {
@@ -3687,8 +4734,12 @@ function convertElkPointsToCytoscapeSegments(points, srcPos, tgtPos) {
 }
 
 function collectAllLayoutedEdges(elkNode, outList) {
+  const ownerContainerId = elkNode && elkNode.id ? elkNode.id : "root";
   if (Array.isArray(elkNode.edges)) {
     for (const edge of elkNode.edges) {
+      if (!edge.container) {
+        edge.container = ownerContainerId;
+      }
       outList.push(edge);
     }
   }
@@ -3707,28 +4758,72 @@ function applyElkEdgeRoutes(
   pinnedNodeIds = new Set(),
   defaultDirection = "downward",
   staggerMeta = null,
+  creationMeta = null,
 ) {
   if (!cy || !layouted) {
     return;
   }
+  cy.edges().removeClass("creation-cross-edge");
+
   const allElkEdges = [];
   collectAllLayoutedEdges(layouted, allElkEdges);
 
+  const isCreationStrict = Boolean(creationMeta && creationMeta.isCreationStrict);
+  const macroPtsByKey = new Map();
+  const macroKeyByEdgeId = new Map();
+  if (isCreationStrict && creationMeta.macroByKey) {
+    for (const [mKey, mInfo] of creationMeta.macroByKey.entries()) {
+      macroKeyByEdgeId.set(mInfo.id, { key: mKey, info: mInfo });
+    }
+  }
+
+  const resolveEdgeTaxiDir = (srcPos, tgtPos) => {
+    if (isCreationStrict && srcPos && tgtPos) {
+      return tgtPos.y < srcPos.y ? "upward" : "downward";
+    }
+    return defaultDirection;
+  };
+
   for (const elkEdge of allElkEdges) {
+    // Recolectar los corredores macro sintéticos calculados por ELK en modo Creación (1 -> N).
+    if (macroKeyByEdgeId.has(elkEdge.id)) {
+      const { key, info } = macroKeyByEdgeId.get(elkEdge.id);
+      const section = Array.isArray(elkEdge.sections) ? elkEdge.sections[0] : null;
+      if (section) {
+        const edgeContainer = elkEdge.container || info.lcaId || "root";
+        const offset = (containerOffsets && containerOffsets.get(edgeContainer)) || { x: 0, y: 0 };
+        const pts = adjustElkSectionPoints(
+          section,
+          edgeContainer,
+          offset,
+          info.fromContainer,
+          info.toContainer,
+          staggerMeta,
+          true,
+        );
+        if (pts.length >= 2) {
+          macroPtsByKey.set(key, pts);
+        }
+      }
+      continue;
+    }
+
     const cyEdge = cy.getElementById(elkEdge.id);
     if (!cyEdge || cyEdge.length === 0) {
       continue;
     }
-    cyEdge.data("taxiDir", defaultDirection);
-    if (cyEdge.isLoop()) {
-      cyEdge.removeClass("elk-routed");
-      continue;
-    }
-
     const srcNode = cyEdge.source();
     const tgtNode = cyEdge.target();
     const srcId = srcNode.id();
     const tgtId = tgtNode.id();
+    const srcPos = elkPositions.get(srcId);
+    const tgtPos = elkPositions.get(tgtId);
+
+    cyEdge.data("taxiDir", resolveEdgeTaxiDir(srcPos, tgtPos));
+    if (cyEdge.isLoop()) {
+      cyEdge.removeClass("elk-routed");
+      continue;
+    }
 
     if (
       srcNode.isParent()
@@ -3741,8 +4836,6 @@ function applyElkEdgeRoutes(
 
     const section = Array.isArray(elkEdge.sections) ? elkEdge.sections[0] : null;
     const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
-    const srcPos = elkPositions.get(srcId);
-    const tgtPos = elkPositions.get(tgtId);
     if (!section || !srcPos || !tgtPos) {
       cyEdge.removeClass("elk-routed");
       continue;
@@ -3769,6 +4862,77 @@ function applyElkEdgeRoutes(
     cyEdge.data("segWeights", segments.weights);
     cyEdge.data("segDistances", segments.distances);
     cyEdge.addClass("elk-routed");
+  }
+
+  // En modo Creación estricto, coser las aristas inter-archivo sobre los corredores macro ortogonales de ELK.
+  if (isCreationStrict && creationMeta.crossEdgeMeta && creationMeta.crossEdgeMeta.size > 0) {
+    const boxes = buildPostStaggerBoxes(layouted, elkPositions, creationMeta.dataById);
+    const macroTotalCounts = new Map();
+    for (const meta of creationMeta.crossEdgeMeta.values()) {
+      macroTotalCounts.set(meta.macroKey, (macroTotalCounts.get(meta.macroKey) || 0) + 1);
+    }
+    const macroLaneCursor = new Map();
+
+    for (const [edgeId, meta] of creationMeta.crossEdgeMeta.entries()) {
+      const cyEdge = cy.getElementById(edgeId);
+      if (!cyEdge || cyEdge.length === 0) {
+        continue;
+      }
+      if (creationMeta.markCrossEdges && cyEdge.data("kind") === "call") {
+        cyEdge.addClass("creation-cross-edge");
+      }
+
+      const srcNode = cyEdge.source();
+      const tgtNode = cyEdge.target();
+      const srcId = srcNode.id();
+      const tgtId = tgtNode.id();
+      const srcPos = elkPositions.get(srcId);
+      const tgtPos = elkPositions.get(tgtId);
+
+      cyEdge.data("taxiDir", resolveEdgeTaxiDir(srcPos, tgtPos));
+      if (
+        cyEdge.isLoop()
+        || srcNode.isParent()
+        || tgtNode.isParent()
+        || !srcPos
+        || !tgtPos
+        || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
+      ) {
+        cyEdge.removeClass("elk-routed");
+        continue;
+      }
+
+      const macroPts = macroPtsByKey.get(meta.macroKey);
+      const laneIdx = macroLaneCursor.get(meta.macroKey) || 0;
+      macroLaneCursor.set(meta.macroKey, laneIdx + 1);
+      const totalLanes = macroTotalCounts.get(meta.macroKey) || 1;
+
+      const absPoints = stitchCrossFileEdgeOntoMacroCorridor(
+        srcId,
+        tgtId,
+        macroPts,
+        meta.reverseMacro,
+        laneIdx,
+        totalLanes,
+        boxes,
+        meta.srcEnclosing,
+        meta.tgtEnclosing,
+      );
+      if (!absPoints || absPoints.length < 2) {
+        cyEdge.removeClass("elk-routed");
+        continue;
+      }
+
+      const segments = convertElkPointsToCytoscapeSegments(absPoints, srcPos, tgtPos);
+      if (!segments) {
+        cyEdge.removeClass("elk-routed");
+        continue;
+      }
+
+      cyEdge.data("segWeights", segments.weights);
+      cyEdge.data("segDistances", segments.distances);
+      cyEdge.addClass("elk-routed");
+    }
   }
 }
 
@@ -6141,13 +7305,13 @@ function updateLayoutOrderButton() {
     return;
   }
   const isCreation = state.layoutOrderMode === "creation";
-  btn.textContent = isCreation ? "Orden: ↑ Creación" : "Orden: ↓ Ejecución";
+  btn.textContent = isCreation ? "Orden: Creación (1→N)" : "Orden: ↓ Ejecución";
   btn.dataset.order = state.layoutOrderMode;
   btn.setAttribute("aria-pressed", String(isCreation));
   btn.classList.toggle("creation-mode", isCreation);
   btn.title = isCreation
-    ? "Orden de Creación activo (helpers arriba, entradas abajo, escalonado por línea). Clic para volver a ↓ Ejecución"
-    : "Orden de Ejecución activo (entradas arriba, destinos abajo). Clic para cambiar a ↑ Creación";
+    ? "Orden de Creación estricto activo (funciones 1→N por línea en bandas y cimientos→ensamblaje). Clic para volver a ↓ Ejecución"
+    : "Orden de Ejecución activo (entradas arriba, destinos abajo). Clic para cambiar a Creación (1→N)";
 }
 
 async function toggleLayoutOrderMode(forceMode = null) {
@@ -6161,6 +7325,16 @@ async function toggleLayoutOrderMode(forceMode = null) {
   state.layoutOrderMode = nextMode;
   updateLayoutOrderButton();
   await refreshGraphView({ fit: true });
+  // Re-layoutar ventanas flotantes abiertas de archivo o módulo para mantener coherencia visual.
+  for (const win of Array.from(state.floatingWindows.values())) {
+    if (win.destroyed || !win.cy || win.isFunctionFlow) {
+      continue;
+    }
+    if (Array.isArray(win.subgraphNodes) && Array.isArray(win.subgraphEdges)) {
+      await runSubElkLayout(win.cy, win.subgraphNodes, win.subgraphEdges, false);
+    }
+  }
+  scheduleBridgeRender();
   if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
     selectNode(state.selectedNodeId, state.activeFlowStepId);
   }
@@ -6856,6 +8030,7 @@ function buildFloatingSubgraph(targetNode) {
         expandedFn: "false",
         flowStepOrder: 0,
         line: rawNode.line || 0,
+        archLayer: getNodeArchLayer(rawNode),
       },
     });
   };
@@ -7047,33 +8222,55 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
   if (!subCy || visibleNodes.length === 0) {
     return;
   }
-  const elkGraph = buildElkInput(visibleNodes, visibleEdges);
-  elkGraph.layoutOptions = isFunctionFlow
-    ? {
-        "elk.algorithm": "layered",
-        "elk.direction": "DOWN",
-        "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-        "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "32",
-        "elk.spacing.nodeNode": "26",
-        "elk.padding": "[top=20,left=20,bottom=20,right=20]",
-      }
-    : {
-        "elk.algorithm": "layered",
-        "elk.direction": "RIGHT",
-        "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-        "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "58",
-        "elk.spacing.nodeNode": "26",
-        "elk.spacing.edgeNode": "20",
-        "elk.padding": "[top=18,left=18,bottom=18,right=18]",
-        "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
-      };
+  const useCreationInSub = !isFunctionFlow && state.layoutOrderMode === "creation";
+  let elkGraph;
+  let creationMeta = null;
+  if (useCreationInSub) {
+    const built = buildCreationElkInput(visibleNodes, visibleEdges, { floatingPorts: true });
+    elkGraph = built.elkGraph;
+    creationMeta = built.creationMeta;
+  } else {
+    elkGraph = buildElkInput(visibleNodes, visibleEdges, { forceExecution: true });
+    elkGraph.layoutOptions = isFunctionFlow
+      ? {
+          "elk.algorithm": "layered",
+          "elk.direction": "DOWN",
+          "elk.hierarchyHandling": "INCLUDE_CHILDREN",
+          "elk.edgeRouting": "ORTHOGONAL",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "32",
+          "elk.spacing.nodeNode": "26",
+          "elk.padding": "[top=20,left=20,bottom=20,right=20]",
+        }
+      : {
+          "elk.algorithm": "layered",
+          "elk.direction": "RIGHT",
+          "elk.hierarchyHandling": "INCLUDE_CHILDREN",
+          "elk.edgeRouting": "ORTHOGONAL",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "58",
+          "elk.spacing.nodeNode": "26",
+          "elk.spacing.edgeNode": "20",
+          "elk.padding": "[top=18,left=18,bottom=18,right=18]",
+          "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+        };
+  }
 
   const layouted = await state.elk.layout(elkGraph);
   const elkPositions = new Map();
   const containerOffsets = new Map([["root", { x: 0, y: 0 }]]);
   collectAbsolutePositions(layouted, 0, 0, elkPositions, containerOffsets);
+
+  let staggerMeta = null;
+  if (useCreationInSub) {
+    const dataById = new Map(visibleNodes.map((item) => [item.data.id, item.data]));
+    const shifted = applyCreationRowStagger(
+      layouted,
+      elkPositions,
+      new Set(),
+      dataById,
+      CREATION_ROW_STAGGER_PX,
+    );
+    staggerMeta = shifted.staggerMeta || null;
+  }
 
   subCy.batch(() => {
     subCy.nodes().forEach((cyNode) => {
@@ -7091,7 +8288,9 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
       elkPositions,
       containerOffsets,
       null,
-      isFunctionFlow ? "downward" : "rightward",
+      isFunctionFlow || useCreationInSub ? "downward" : "rightward",
+      staggerMeta,
+      creationMeta,
     );
   });
   subCy.resize();
@@ -7987,6 +9186,8 @@ async function openFloatingWindow(
     portsMeta: subgraph.portsMeta,
     internalNodeIds: subgraph.internalNodeIds,
     isFunctionFlow: subgraph.isFunctionFlow,
+    subgraphNodes: subgraph.nodes,
+    subgraphEdges: subgraph.edges,
     viewMode: "flow",
     sourceData: null,
     sourceLoaded: false,
@@ -8415,6 +9616,8 @@ async function reconcileFloatingWindowsOnLiveUpdate() {
     win.portsMeta = subgraph.portsMeta;
     win.internalNodeIds = subgraph.internalNodeIds;
     win.isFunctionFlow = subgraph.isFunctionFlow;
+    win.subgraphNodes = subgraph.nodes;
+    win.subgraphEdges = subgraph.edges;
     win.titleSpan.textContent = rawNode.label || rawNode.id;
     win.statsEl.textContent = formatFloatingFooterStats(subgraph);
 

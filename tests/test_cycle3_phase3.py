@@ -23,13 +23,14 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
         self.assertIn('id="btn-layout-order"', self.html)
         self.assertIn("Orden: ↓ Ejecución", self.html)
         self.assertIn("Clic derecho", self.html)
-        self.assertIn("Orden: ↓ / ↑", self.html)
+        self.assertIn("Orden: ↓ Ejecución / Creación (1→N)", self.html)
         self.assertIn(".layout-order-btn", self.css)
         self.assertIn(".layout-order-btn.creation-mode", self.css)
         self.assertIn('"elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES"', self.js)
         self.assertGreaterEqual(self.js.count("line: rawNode.line || 0"), 3)
         self.assertIn('selector: \'edge[taxiDir = "upward"]\'', self.js)
         self.assertIn("function applyCreationRowStagger(", self.js)
+        self.assertIn("function buildCreationElkInput(", self.js)
         self.assertIn("function toggleLayoutOrderMode(", self.js)
 
         check = subprocess.run(
@@ -131,11 +132,17 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
             "  return src.slice(idx, end);\n"
             "};\n"
             "const elkOptMatch = src.match(/const ELK_LAYOUT_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
-            "if (!elkOptMatch) throw new Error('Missing ELK_LAYOUT_OPTIONS');\n"
+            "const creationFileOptMatch = src.match(/const CREATION_FILE_ELK_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
+            "const creationContOptMatch = src.match(/const CREATION_CONTAINER_ELK_OPTIONS = \\{[\\s\\S]*?\\};/);\n"
+            "const macroPrefixMatch = src.match(/const CREATION_MACRO_EDGE_PREFIX = \"[^\"]+\";/);\n"
+            "if (!elkOptMatch || !creationFileOptMatch || !creationContOptMatch || !macroPrefixMatch) throw new Error('Missing ELK constants');\n"
             "const staggerMatch = src.match(/const CREATION_ROW_STAGGER_PX = \\d+;/);\n"
             "const state = { activeLevel: 3, expandedFunctions: new Set(), groupingMode: 'folders', layoutOrderMode: 'execution' };\n"
             "eval([\n"
             "  elkOptMatch[0].replace(/^const /, 'var '),\n"
+            "  creationFileOptMatch[0].replace(/^const /, 'var '),\n"
+            "  creationContOptMatch[0].replace(/^const /, 'var '),\n"
+            "  macroPrefixMatch[0].replace(/^const /, 'var '),\n"
             "  staggerMatch[0].replace(/^const /, 'var '),\n"
             "  extractFn('getCurrentLayoutContextKey'),\n"
             "  extractFn('estimateWrappedTextMetrics'),\n"
@@ -143,6 +150,10 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
             "  extractFn('estimateNodeSize'),\n"
             "  extractFn('estimateCompoundHeaderWidth'),\n"
             "  extractFn('computeElkSubtreeWidth'),\n"
+            "  extractFn('assignCreationBands'),\n"
+            "  extractFn('computeCreationPartition'),\n"
+            "  extractFn('computeIntraTierFoundationDepths'),\n"
+            "  extractFn('buildCreationElkInput'),\n"
             "  extractFn('buildElkInput'),\n"
             "  extractFn('collectAbsolutePositions'),\n"
             "  extractFn('shiftElkSubtreeY'),\n"
@@ -165,18 +176,20 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
             "  state.groupingMode = 'folders';\n"
             "  state.activeLevel = 3;\n"
             "\n"
-            "  // 2. Grafo con 3 helpers hermanas (desordenadas adrede en la entrada) llamadas por `main` (L50).\n"
+            "  // 2. Grafo con 4 helpers hermanas (desordenadas adrede en la entrada) llamadas por `main` (L50) -> banda de 3 (h1,h2,h3) + h4 + main.\n"
             "  const visibleNodes = [\n"
-            "    { data: { id: 'f.js', type: 'file', label: 'f.js', line: 0 } },\n"
+            "    { data: { id: 'f.js', type: 'file', label: 'f.js', line: 0, archLayer: 3 } },\n"
             "    { data: { id: 'f.js::h3', parent: 'f.js', type: 'function', role: 'transform', label: 'h3()', line: 30 } },\n"
             "    { data: { id: 'f.js::main', parent: 'f.js', type: 'function', role: 'entry', label: 'main()', line: 50 } },\n"
             "    { data: { id: 'f.js::h1', parent: 'f.js', type: 'function', role: 'transform', label: 'h1()', line: 10 } },\n"
             "    { data: { id: 'f.js::h2', parent: 'f.js', type: 'function', role: 'transform', label: 'h2()', line: 20 } },\n"
+            "    { data: { id: 'f.js::h4', parent: 'f.js', type: 'function', role: 'transform', label: 'h4()', line: 40 } },\n"
             "  ];\n"
             "  const visibleEdges = [\n"
-            "    { data: { id: 'e1', source: 'f.js::main', target: 'f.js::h1', label: '' } },\n"
-            "    { data: { id: 'e2', source: 'f.js::main', target: 'f.js::h2', label: '' } },\n"
-            "    { data: { id: 'e3', source: 'f.js::main', target: 'f.js::h3', label: '' } },\n"
+            "    { data: { id: 'e1', source: 'f.js::main', target: 'f.js::h1', label: '', kind: 'call' } },\n"
+            "    { data: { id: 'e2', source: 'f.js::main', target: 'f.js::h2', label: '', kind: 'call' } },\n"
+            "    { data: { id: 'e3', source: 'f.js::main', target: 'f.js::h3', label: '', kind: 'call' } },\n"
+            "    { data: { id: 'e4', source: 'f.js::main', target: 'f.js::h4', label: '', kind: 'call' } },\n"
             "  ];\n"
             "\n"
             "  // Modo Ejecución (DOWN): main arriba, helpers abajo.\n"
@@ -187,7 +200,7 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
             "  const downPos = new Map();\n"
             "  collectAbsolutePositions(downLayout, 0, 0, downPos);\n"
             "\n"
-            "  // Modo Creación (UP): helpers arriba escalonadas (+14px) y main abajo sin solaparse.\n"
+            "  // Modo Creación estricto (1->N): banda 0 (h1,h2,h3 escalonadas +14px), banda 1 (h4), banda 2 (main).\n"
             "  state.layoutOrderMode = 'creation';\n"
             "  const upInput = buildElkInput(visibleNodes, visibleEdges);\n"
             "  const upLayout = await elk.layout(upInput);\n"
@@ -215,7 +228,9 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
             "  console.log(JSON.stringify({\n"
             "    contextKeys,\n"
             "    downDirection: downInput.layoutOptions['elk.direction'],\n"
-            "    upDirection: upInput.layoutOptions['elk.direction'],\n"
+            "    creationDirection: upInput.layoutOptions['elk.direction'],\n"
+            "    creationHierarchy: upInput.layoutOptions['elk.hierarchyHandling'],\n"
+            "    creationForceOrder: upInput.children[0].layoutOptions['elk.layered.crossingMinimization.forceNodeModelOrder'],\n"
             "    modelOrderStrategy: upInput.layoutOptions['elk.layered.considerModelOrder.strategy'],\n"
             "    downChildOrder,\n"
             "    flowChildOrder,\n"
@@ -245,25 +260,27 @@ class TestCycle3Phase3FocusAndCreationOrder(unittest.TestCase):
 
         # Opciones ELKjs y ordenación por `line` ascendente (sin alterar pasos intra-función).
         self.assertEqual(res["downDirection"], "DOWN")
-        self.assertEqual(res["upDirection"], "UP")
+        self.assertEqual(res["creationDirection"], "DOWN")
+        self.assertEqual(res["creationHierarchy"], "SEPARATE_CHILDREN")
+        self.assertEqual(res["creationForceOrder"], "true")
         self.assertEqual(res["modelOrderStrategy"], "NODES_AND_EDGES")
-        self.assertEqual(res["downChildOrder"], ["f.js::h1", "f.js::h2", "f.js::h3", "f.js::main"])
+        self.assertEqual(res["downChildOrder"], ["f.js::h1", "f.js::h2", "f.js::h3", "f.js::h4", "f.js::main"])
         self.assertEqual(res["flowChildOrder"], ["fn::s2", "fn::s10"])
 
-        # Dirección vertical invertida entre ↓ Ejecución y ↑ Creación.
+        # Ejecución pone main arriba y helpers abajo; Creación (1→N) pone h1..h4 arriba y main al final.
         self.assertLess(res["downMainY"], res["downH1Y"])
         self.assertLess(res["upH1Y"], res["upMainY"])
 
-        # Escalonamiento exacto de +14px entre hermanas en la misma fila (h1 -> h2 -> h3).
+        # Escalonamiento exacto de +14px entre hermanas en la misma banda (h1 -> h2 -> h3).
         self.assertAlmostEqual(res["upH2Y"] - res["upH1Y"], 14.0, places=2)
         self.assertAlmostEqual(res["upH3Y"] - res["upH2Y"], 14.0, places=2)
 
-        # Capa inferior (`main`) desplazada hacia abajo preservando exactamente el espacio inter-capa original de ELK (sin solaparse).
+        # Bandas inferiores (`h4`, `main`) desplazadas hacia abajo preservando exactamente el espacio inter-capa original.
         self.assertAlmostEqual(res["upMainY"] - res["upH3Y"], res["origLayerGap"], places=2)
         self.assertGreaterEqual(res["upMainY"] - res["upH3Y"], 64.0)
 
-        # Nodos escalonados/desplazados reportados para desactivar `elk-routed` y usar `taxi` dinámico.
-        self.assertEqual(res["shifted"], ["f.js::h2", "f.js::h3", "f.js::main"])
+        # Nodos escalonados/desplazados reportados correctamente.
+        self.assertEqual(res["shifted"], ["f.js::h2", "f.js::h3", "f.js::h4", "f.js::main"])
 
         # Nodo fijado (`h2`) queda intacto; solo las hermanas no fijadas (`h1`, `h3`) se escalonan (+14px).
         self.assertAlmostEqual(res["h2AfterPin"], res["h2BeforePin"], places=2)

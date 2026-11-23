@@ -14,9 +14,9 @@ CodeMap analiza proyectos completos o archivos individuales de **Python** (`.py`
   4. **Nivel 3+ — Intra-función (`4`):** Desglose interno de ramas (`if/switch/match`), bucles (`🔁`), listeners/hooks (`⚡`), bloques `try/except` y llamadas clave.
 - **Resolución semántica avanzada:** Detecta llamadas directas, callbacks pasados por referencia, hooks de arranque top-level, alias de `tsconfig.json` / `jsconfig.json`, `.gitignore` anidados, puentes `servidor → HTML → script` y patrones Observer / Pub-Sub (disparos reactivos).
 - **Escalabilidad visual y ergonomía para proyectos grandes:**
-  - **Orden de Ejecución (`↓`) y Orden de Creación (`↑`):** Alterna desde la barra superior entre `↓ Ejecución` (entradas arriba → callees abajo) y `↑ Creación` (helpers arriba → entradas abajo, respetando orden de declaración con `NODES_AND_EDGES`, escalonamiento vertical `+14px` entre hermanas de la misma fila, preservación del enrutamiento ortogonal ELKjs `elk-routed` sin solapamientos y coordenadas `pinned` independientes `creation_*`).
+  - **Orden de Ejecución (`↓`) y Orden de Creación estricto (`1→N`):** Alterna desde la barra superior entre `↓ Ejecución` (flujo topológico entradas arriba → destinos abajo) y `Creación (1→N)` (orden estricto `1→N` por `line` ascendente en bandas adaptativas de `2–3` funciones con escalonamiento `+14px`, `forceNodeModelOrder: true`, cimientos→ensamblaje en Módulos/Archivos/Capas, corredores macro ELK cosidos sin cruces sobre nodos, atenuación suave en aristas inter-archivo restaurada al 100% en interacción, sincronización en ventanas flotantes y coordenadas `pinned` independientes `creation_*`).
   - **Hilos de Ejecución + Aislamiento real:** Selecciona hilos principales de arranque o hilos por evento/ruta y activa **"Aislar en lienzo"** para reconstruir únicamente el subgrafo activo en un árbol compacto.
-  - **Enrutamiento ortogonal ELKjs:** Las aristas rodean los contenedores en ángulos rectos (`ORTHOGONAL` → `segments` / `taxi`) evitando cruces diagonales sobre nodos no relacionados, tanto en `↓ Ejecución` como en `↑ Creación`.
+  - **Enrutamiento ortogonal ELKjs:** Las aristas rodean los contenedores en ángulos rectos (`ORTHOGONAL` → `segments` / `taxi`) evitando cruces diagonales sobre nodos no relacionados, tanto en `↓ Ejecución` como en `Creación (1→N)`.
   - **Aristas bajo demanda:** Atenúa conexiones no prioritarias (`opacity ~0.10`) y revela al vuelo las entrantes (cian) y salientes (ámbar) al pasar el cursor o seleccionar un nodo.
   - **Exploración por vecindad (`N-hops`):** En proyectos con `> 25` funciones (o bajo demanda desde el Inspector), expande progresivamente `1` o `2` saltos hacia atrás (`callers`) o hacia adelante (`callees`).
   - **Capas de Flujo (*Architectural Slicing*):** Alterna entre agrupación por **Carpetas** y agrupación automática por **Capas topológicas** (*Entradas/UI → Orquestadores → Servicios/Estado → Utilidades/Persistencia*) usando condensación SCC (Tarjan) y particionamiento ELK.
@@ -86,7 +86,7 @@ codemap clean  # Elimina cachés de proyectos que ya no existen en disco
 | --- | --- |
 | `1` / `2` / `3` / `4` | Cambiar nivel: **Módulos → Archivos → Funciones → Intra-función (3+)** |
 | **Carpetas / Capas de Flujo** | Alternar entre jerarquía de directorios y capas topológicas automáticas |
-| **Orden: `↓ Ejecución` / `↑ Creación`** | Alternar dirección del grafo (`DOWN` vs `UP` con escalonamiento por línea y pines independientes) |
+| **Orden: `↓ Ejecución` / `Creación (1→N)`** | Alternar entre flujo topológico (`DOWN`) y orden de creación estricto (`1→N` por línea en bandas + cimientos→ensamblaje en todos los niveles y ventanas flotantes, con pines independientes) |
 | **Clic en nodo / fondo vacío** | Inspeccionar función (firma, llamadas, APIs, nota) o archivo (**Docstring → Lista numerada de funciones → Nota**); clic en fondo vacío muestra el **resumen dinámico del flujo** |
 | **Hover `1 s` en archivo o función** | Mostrar tooltip flotante con su docstring (en el grafo principal y en ventanas flotantes) |
 | **Doble clic en nodo** | Colapsar o expandir módulo, capa, archivo o flujo intra-función |
