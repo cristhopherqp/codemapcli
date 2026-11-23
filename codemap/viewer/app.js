@@ -21,9 +21,10 @@ const ELK_LAYOUT_OPTIONS = {
   "elk.edgeRouting": "ORTHOGONAL",
   "elk.layered.spacing.nodeNodeBetweenLayers": "48",
   "elk.layered.spacing.edgeNodeBetweenLayers": "22",
+  "elk.layered.spacing.edgeEdgeBetweenLayers": "14",
   "elk.spacing.nodeNode": "32",
   "elk.spacing.edgeNode": "20",
-  "elk.spacing.edgeEdge": "12",
+  "elk.spacing.edgeEdge": "14",
   "elk.padding": "[top=38,left=20,bottom=20,right=20]",
   "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
   "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
@@ -1868,6 +1869,8 @@ function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
         ownerFunctionId: fnNode.id,
         stepId: step.id,
         stepCode: step.code || step.label,
+        stepLine: step.line || 0,
+        stepEndLine: step.end_line || step.line || 0,
       },
     });
   }
@@ -3134,13 +3137,32 @@ async function refreshGraphView({ fit = true } = {}) {
   }
 }
 
-function shiftElkSubtreeY(elkNode, deltaY, elkPositions, pinnedNodeIds, shiftedNodeIds) {
+function shiftElkSubtreeY(
+  elkNode,
+  deltaY,
+  elkPositions,
+  pinnedNodeIds,
+  shiftedNodeIds,
+  nodeDeltaY = null,
+  containerBaseShiftY = null,
+) {
   if (!elkNode || !deltaY) {
     return;
   }
   if (elkNode.children && elkNode.children.length > 0) {
+    if (containerBaseShiftY) {
+      containerBaseShiftY.set(elkNode.id, (containerBaseShiftY.get(elkNode.id) || 0) + deltaY);
+    }
     for (const child of elkNode.children) {
-      shiftElkSubtreeY(child, deltaY, elkPositions, pinnedNodeIds, shiftedNodeIds);
+      shiftElkSubtreeY(
+        child,
+        deltaY,
+        elkPositions,
+        pinnedNodeIds,
+        shiftedNodeIds,
+        nodeDeltaY,
+        containerBaseShiftY,
+      );
     }
     return;
   }
@@ -3151,6 +3173,9 @@ function shiftElkSubtreeY(elkNode, deltaY, elkPositions, pinnedNodeIds, shiftedN
   if (pos) {
     pos.y += deltaY;
     shiftedNodeIds.add(elkNode.id);
+    if (nodeDeltaY) {
+      nodeDeltaY.set(elkNode.id, (nodeDeltaY.get(elkNode.id) || 0) + deltaY);
+    }
   }
 }
 
@@ -3162,6 +3187,11 @@ function applyCreationRowStagger(
   stepPx = CREATION_ROW_STAGGER_PX,
 ) {
   const shiftedNodeIds = new Set();
+  const nodeDeltaY = new Map();
+  const containerBaseShiftY = new Map([["root", 0]]);
+  const containerRowBreaks = new Map();
+  shiftedNodeIds.staggerMeta = { nodeDeltaY, containerBaseShiftY, containerRowBreaks };
+
   if (!layouted || !Array.isArray(layouted.children) || stepPx <= 0) {
     return shiftedNodeIds;
   }
@@ -3201,6 +3231,7 @@ function applyCreationRowStagger(
     }
 
     let cumulativeDownShift = 0;
+    const rowBreaks = [];
     for (const row of rows) {
       const rowShift = cumulativeDownShift;
       const staggerCandidates = row.items.filter((child) => {
@@ -3236,7 +3267,15 @@ function applyCreationRowStagger(
         const staggerDelta = staggerById.get(child.id) || 0;
         const totalShift = rowShift + staggerDelta;
         if (totalShift > 0) {
-          shiftElkSubtreeY(child, totalShift, elkPositions, pinnedNodeIds, shiftedNodeIds);
+          shiftElkSubtreeY(
+            child,
+            totalShift,
+            elkPositions,
+            pinnedNodeIds,
+            shiftedNodeIds,
+            nodeDeltaY,
+            containerBaseShiftY,
+          );
         }
         const childNewBottom = (child.y || 0)
           + totalShift
@@ -3248,14 +3287,64 @@ function applyCreationRowStagger(
       }
 
       const rowExtraPush = Math.max(0, newRowMaxBottom - (row.maxBottom + rowShift));
+      if (rowExtraPush > 0) {
+        rowBreaks.push({ origBottom: row.maxBottom, extraPush: rowExtraPush });
+      }
       cumulativeDownShift += rowExtraPush;
     }
 
+    if (rowBreaks.length > 0) {
+      containerRowBreaks.set(container.id, rowBreaks);
+    }
     return cumulativeDownShift;
   };
 
   processContainer(layouted);
   return shiftedNodeIds;
+}
+
+function computeStaggeredChannelShiftY(containerId, localY, staggerMeta) {
+  if (!staggerMeta) {
+    return 0;
+  }
+  let shift = (staggerMeta.containerBaseShiftY && staggerMeta.containerBaseShiftY.get(containerId)) || 0;
+  const breaks = staggerMeta.containerRowBreaks && staggerMeta.containerRowBreaks.get(containerId);
+  if (breaks && breaks.length > 0) {
+    for (const brk of breaks) {
+      if (localY >= brk.origBottom - 0.5) {
+        shift += brk.extraPush;
+      }
+    }
+  }
+  return shift;
+}
+
+function adjustElkSectionPoints(section, edgeContainer, origOffset, srcId, tgtId, staggerMeta) {
+  const srcDy = (staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(srcId)) || 0;
+  const tgtDy = (staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(tgtId)) || 0;
+  const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
+  const absPoints = [];
+
+  if (section && section.startPoint) {
+    absPoints.push({
+      x: section.startPoint.x + origOffset.x,
+      y: section.startPoint.y + origOffset.y + srcDy,
+    });
+  }
+  for (const bp of rawBends) {
+    const channelDy = computeStaggeredChannelShiftY(edgeContainer, bp.y, staggerMeta);
+    absPoints.push({
+      x: bp.x + origOffset.x,
+      y: bp.y + origOffset.y + channelDy,
+    });
+  }
+  if (section && section.endPoint) {
+    absPoints.push({
+      x: section.endPoint.x + origOffset.x,
+      y: section.endPoint.y + origOffset.y + tgtDy,
+    });
+  }
+  return absPoints;
 }
 
 async function runElkLayout(visibleNodes, visibleEdges) {
@@ -3286,7 +3375,7 @@ async function runElkLayout(visibleNodes, visibleEdges) {
     });
   }
 
-  let skipElkRoutingIds = pinnedNodeIds;
+  let staggerMeta = null;
   if (isCreationOrder) {
     const dataById = new Map(visibleNodes.map((item) => [item.data.id, item.data]));
     const shiftedNodeIds = applyCreationRowStagger(
@@ -3296,9 +3385,7 @@ async function runElkLayout(visibleNodes, visibleEdges) {
       dataById,
       CREATION_ROW_STAGGER_PX,
     );
-    if (shiftedNodeIds.size > 0) {
-      skipElkRoutingIds = new Set([...pinnedNodeIds, ...shiftedNodeIds]);
-    }
+    staggerMeta = shiftedNodeIds.staggerMeta || null;
   }
 
   const defaultDirection = isCreationOrder ? "upward" : "downward";
@@ -3318,7 +3405,15 @@ async function runElkLayout(visibleNodes, visibleEdges) {
         cyNode.position(pos);
       }
     });
-    applyElkEdgeRoutes(state.cy, layouted, elkPositions, containerOffsets, skipElkRoutingIds, defaultDirection);
+    applyElkEdgeRoutes(
+      state.cy,
+      layouted,
+      elkPositions,
+      containerOffsets,
+      pinnedNodeIds,
+      defaultDirection,
+      staggerMeta,
+    );
   });
 }
 
@@ -3421,15 +3516,26 @@ function buildElkInput(visibleNodes, visibleEdges) {
     return elkEdge;
   });
 
-  const elkDirection = state.layoutOrderMode === "creation" ? "UP" : "DOWN";
+  const isCreationUp = state.layoutOrderMode === "creation";
+  const elkDirection = isCreationUp ? "UP" : "DOWN";
+  const upSpacingOverrides = isCreationUp
+    ? {
+        "elk.spacing.edgeEdge": "16",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "16",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "24",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "54",
+      }
+    : {};
   const rootLayoutOptions = hasLayerContainers
     ? {
         ...ELK_LAYOUT_OPTIONS,
+        ...upSpacingOverrides,
         "elk.direction": elkDirection,
         "elk.partitioning.activate": "true",
       }
     : {
         ...ELK_LAYOUT_OPTIONS,
+        ...upSpacingOverrides,
         "elk.direction": elkDirection,
       };
 
@@ -3600,6 +3706,7 @@ function applyElkEdgeRoutes(
   containerOffsets,
   pinnedNodeIds = new Set(),
   defaultDirection = "downward",
+  staggerMeta = null,
 ) {
   if (!cy || !layouted) {
     return;
@@ -3634,28 +3741,23 @@ function applyElkEdgeRoutes(
 
     const section = Array.isArray(elkEdge.sections) ? elkEdge.sections[0] : null;
     const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
-    if (!section || rawBends.length === 0) {
-      cyEdge.removeClass("elk-routed");
-      continue;
-    }
-
     const srcPos = elkPositions.get(srcId);
     const tgtPos = elkPositions.get(tgtId);
-    if (!srcPos || !tgtPos) {
+    if (!section || !srcPos || !tgtPos) {
       cyEdge.removeClass("elk-routed");
       continue;
     }
 
-    const offset = (containerOffsets && containerOffsets.get(elkEdge.container || "root")) || { x: 0, y: 0 };
-    const absPoints = [];
-    if (section.startPoint) {
-      absPoints.push({ x: section.startPoint.x + offset.x, y: section.startPoint.y + offset.y });
-    }
-    for (const bp of rawBends) {
-      absPoints.push({ x: bp.x + offset.x, y: bp.y + offset.y });
-    }
-    if (section.endPoint) {
-      absPoints.push({ x: section.endPoint.x + offset.x, y: section.endPoint.y + offset.y });
+    const edgeContainer = elkEdge.container || "root";
+    const offset = (containerOffsets && containerOffsets.get(edgeContainer)) || { x: 0, y: 0 };
+    const absPoints = adjustElkSectionPoints(section, edgeContainer, offset, srcId, tgtId, staggerMeta);
+    const hasPortOffset = absPoints.length >= 2 && (
+      Math.abs(absPoints[0].x - srcPos.x) > 1.5
+      || Math.abs(absPoints[absPoints.length - 1].x - tgtPos.x) > 1.5
+    );
+    if (rawBends.length === 0 && !hasPortOffset) {
+      cyEdge.removeClass("elk-routed");
+      continue;
     }
 
     const segments = convertElkPointsToCytoscapeSegments(absPoints, srcPos, tgtPos);
@@ -4613,6 +4715,12 @@ function syncFlowStepHighlight(fnId, stepId) {
   applyToCy(state.cy);
   for (const win of state.floatingWindows.values()) {
     applyToCy(win.cy);
+    if (win && !win.destroyed && win.isFunctionFlow && win.targetId === fnId) {
+      win.selectedStepId = stepId || null;
+      if (win.viewMode === "split" || win.viewMode === "code") {
+        highlightFloatingCodeForStep(win, stepId, { scroll: true });
+      }
+    }
   }
 }
 
@@ -5725,7 +5833,55 @@ function setSpacePanMode(enabled) {
   }
 }
 
-function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPanMove, onPanEnd } = {}) {
+function hitTestCyNodeAtClientPoint(cyInst, clientX, clientY) {
+  if (!cyInst || typeof cyInst.container !== "function" || typeof cyInst.nodes !== "function") {
+    return null;
+  }
+  const container = cyInst.container();
+  if (!container) {
+    return null;
+  }
+  const rect = container.getBoundingClientRect();
+  const rx = clientX - rect.left;
+  const ry = clientY - rect.top;
+  if (rx < 0 || ry < 0 || rx > rect.width || ry > rect.height) {
+    return null;
+  }
+
+  const hits = [];
+  cyInst.nodes(":visible").forEach((cyNode) => {
+    const bb = cyNode.renderedBoundingBox({ includeLabels: true, includeOverlays: false });
+    if (rx >= bb.x1 && rx <= bb.x2 && ry >= bb.y1 && ry <= bb.y2) {
+      const area = Math.max(1, (bb.x2 - bb.x1) * (bb.y2 - bb.y1));
+      hits.push({
+        node: cyNode,
+        isLeaf: !cyNode.isParent(),
+        depth: cyNode.ancestors().length,
+        area,
+      });
+    }
+  });
+  if (hits.length === 0) {
+    return null;
+  }
+  hits.sort((a, b) => {
+    if (a.isLeaf !== b.isLeaf) {
+      return a.isLeaf ? -1 : 1;
+    }
+    if (a.depth !== b.depth) {
+      return b.depth - a.depth;
+    }
+    return a.area - b.area;
+  });
+  return hits[0].node;
+}
+
+function attachPanControls(
+  getCy,
+  eventTarget,
+  areaContainer,
+  { onPanStart, onPanMove, onPanEnd, onMiddleClick } = {},
+) {
   if (!eventTarget || !areaContainer) {
     return () => {};
   }
@@ -5766,6 +5922,12 @@ function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPa
     event.preventDefault();
   };
 
+  const onAuxClick = (event) => {
+    if (event.button === 1) {
+      event.preventDefault();
+    }
+  };
+
   const onMouseMove = (event) => {
     const cyInst = typeof getCy === "function" ? getCy() : getCy;
     if (!panDrag || !cyInst) {
@@ -5773,7 +5935,7 @@ function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPa
     }
     const dx = event.clientX - panDrag.startX;
     const dy = event.clientY - panDrag.startY;
-    if (!panDrag.didMove && Math.hypot(dx, dy) > 3) {
+    if (!panDrag.didMove && Math.hypot(dx, dy) > 4) {
       panDrag.didMove = true;
     }
     cyInst.pan({ x: panDrag.startPanX + dx, y: panDrag.startPanY + dy });
@@ -5782,11 +5944,12 @@ function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPa
     }
   };
 
-  const finishPanDrag = () => {
+  const finishPanDrag = (upEvent = null) => {
     if (!panDrag) {
       return;
     }
-    const didMove = panDrag.didMove;
+    const completed = panDrag;
+    const didMove = completed.didMove;
     if (didMove) {
       state.suppressNextTap = true;
       setTimeout(() => {
@@ -5798,21 +5961,45 @@ function attachPanControls(getCy, eventTarget, areaContainer, { onPanStart, onPa
     if (typeof onPanEnd === "function") {
       onPanEnd(didMove);
     }
+    if (
+      !didMove
+      && completed.button === 1
+      && upEvent
+      && upEvent.type === "mouseup"
+      && upEvent.button === 1
+      && typeof onMiddleClick === "function"
+    ) {
+      const cyInst = typeof getCy === "function" ? getCy() : getCy;
+      if (cyInst) {
+        onMiddleClick({
+          cy: cyInst,
+          clientX: completed.startX,
+          clientY: completed.startY,
+          originalEvent: upEvent,
+        });
+      }
+    }
+  };
+
+  const onWindowBlur = () => {
+    finishPanDrag(null);
   };
 
   eventTarget.addEventListener("mousedown", onMouseDown, true);
   eventTarget.addEventListener("contextmenu", onContextMenu, true);
+  eventTarget.addEventListener("auxclick", onAuxClick, true);
   window.addEventListener("mousemove", onMouseMove);
   window.addEventListener("mouseup", finishPanDrag);
-  window.addEventListener("blur", finishPanDrag);
+  window.addEventListener("blur", onWindowBlur);
 
   return () => {
-    finishPanDrag();
+    finishPanDrag(null);
     eventTarget.removeEventListener("mousedown", onMouseDown, true);
     eventTarget.removeEventListener("contextmenu", onContextMenu, true);
+    eventTarget.removeEventListener("auxclick", onAuxClick, true);
     window.removeEventListener("mousemove", onMouseMove);
     window.removeEventListener("mouseup", finishPanDrag);
-    window.removeEventListener("blur", finishPanDrag);
+    window.removeEventListener("blur", onWindowBlur);
   };
 }
 
@@ -5823,7 +6010,23 @@ function bindCanvasPanControls() {
   }
   const container = document.getElementById("cy");
   const area = document.getElementById("canvas-area");
-  state.mainPanCleanup = attachPanControls(() => state.cy, container, area);
+  state.mainPanCleanup = attachPanControls(() => state.cy, container, area, {
+    onMiddleClick: ({ cy, clientX, clientY }) => {
+      const hitNode = hitTestCyNodeAtClientPoint(cy, clientX, clientY);
+      if (!hitNode) {
+        return;
+      }
+      const data = hitNode.data();
+      if (!data || data.type === "port") {
+        return;
+      }
+      const targetId = data.ownerFunctionId || data.id;
+      const rawTarget = state.nodesById.get(targetId);
+      if (canOpenInFloatingWindow(rawTarget)) {
+        openFloatingWindow(targetId, { parentWindowId: null });
+      }
+    },
+  });
 }
 
 function fitGraphToScreen() {
@@ -6990,6 +7193,31 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
   const actionsEl = document.createElement("div");
   actionsEl.className = "fw-header-actions";
 
+  let modeSwitcherEl = null;
+  const modeButtons = new Map();
+  if (subgraph.isFunctionFlow) {
+    modeSwitcherEl = document.createElement("div");
+    modeSwitcherEl.className = "fw-mode-switcher";
+    modeSwitcherEl.setAttribute("role", "group");
+    modeSwitcherEl.setAttribute("aria-label", "Modo de vista de función");
+    const modes = [
+      { key: "flow", label: "Solo flujo", title: "Mostrar únicamente el diagrama de flujo interno (3+)" },
+      { key: "code", label: "Solo código", title: "Mostrar el código fuente con números de línea" },
+      { key: "split", label: "Flujo y código", title: "Vista dividida 50/50 sincronizando pasos del flujo y líneas de código" },
+    ];
+    for (const m of modes) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `fw-mode-btn${m.key === "flow" ? " active" : ""}`;
+      btn.dataset.fwMode = m.key;
+      btn.textContent = m.label;
+      btn.title = m.title;
+      btn.setAttribute("aria-pressed", m.key === "flow" ? "true" : "false");
+      modeSwitcherEl.appendChild(btn);
+      modeButtons.set(m.key, btn);
+    }
+  }
+
   const fitBtn = document.createElement("button");
   fitBtn.type = "button";
   fitBtn.className = "fw-btn";
@@ -7013,6 +7241,9 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
   actionsEl.appendChild(closeBtn);
 
   headerEl.appendChild(titleGroup);
+  if (modeSwitcherEl) {
+    headerEl.appendChild(modeSwitcherEl);
+  }
   headerEl.appendChild(actionsEl);
 
   const lockNoticeEl = document.createElement("div");
@@ -7020,11 +7251,50 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
   lockNoticeEl.setAttribute("role", "alert");
 
   const bodyEl = document.createElement("div");
-  bodyEl.className = "fw-body";
+  bodyEl.className = "fw-body mode-flow";
 
   const cyContainer = document.createElement("div");
   cyContainer.className = "fw-cy-container";
   bodyEl.appendChild(cyContainer);
+
+  let codePaneEl = null;
+  let codeMetaEl = null;
+  let copyCodeBtn = null;
+  let codeLinesEl = null;
+  if (subgraph.isFunctionFlow) {
+    codePaneEl = document.createElement("div");
+    codePaneEl.className = "fw-code-pane hidden";
+    codePaneEl.setAttribute("aria-label", "Código fuente de la función");
+
+    const codeToolbar = document.createElement("div");
+    codeToolbar.className = "fw-code-toolbar";
+
+    codeMetaEl = document.createElement("span");
+    codeMetaEl.className = "fw-code-meta";
+    codeMetaEl.textContent = "Código fuente";
+
+    copyCodeBtn = document.createElement("button");
+    copyCodeBtn.type = "button";
+    copyCodeBtn.className = "fw-btn fw-copy-code-btn";
+    copyCodeBtn.textContent = "Copiar";
+    copyCodeBtn.title = "Copiar código fuente de la función";
+
+    codeToolbar.appendChild(codeMetaEl);
+    codeToolbar.appendChild(copyCodeBtn);
+
+    const codeScroll = document.createElement("div");
+    codeScroll.className = "fw-code-scroll";
+
+    codeLinesEl = document.createElement("div");
+    codeLinesEl.className = "fw-code-lines";
+    codeLinesEl.setAttribute("role", "region");
+    codeLinesEl.setAttribute("aria-label", "Líneas de código");
+
+    codeScroll.appendChild(codeLinesEl);
+    codePaneEl.appendChild(codeToolbar);
+    codePaneEl.appendChild(codeScroll);
+    bodyEl.appendChild(codePaneEl);
+  }
 
   const footerEl = document.createElement("footer");
   footerEl.className = "fw-footer";
@@ -7052,15 +7322,377 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     headerEl,
     titleSpan,
     badgeSpan,
+    modeSwitcherEl,
+    modeButtons,
     fitBtn,
     closeChainBtn,
     closeBtn,
     lockNoticeEl,
     bodyEl,
     cyContainer,
+    codePaneEl,
+    codeMetaEl,
+    copyCodeBtn,
+    codeLinesEl,
     statsEl,
     hintEl,
   };
+}
+
+const CODE_KEYWORDS_BY_LANG = {
+  python: new Set([
+    "def", "async", "await", "return", "if", "elif", "else", "for", "while", "in",
+    "try", "except", "finally", "with", "as", "class", "raise", "yield", "match",
+    "case", "pass", "break", "continue", "import", "from", "and", "or", "not", "is",
+    "lambda", "True", "False", "None", "self", "cls",
+  ]),
+  js: new Set([
+    "function", "async", "await", "return", "if", "else", "for", "while", "do", "of",
+    "in", "try", "catch", "finally", "throw", "switch", "case", "default", "break",
+    "continue", "const", "let", "var", "class", "new", "export", "import", "from",
+    "typeof", "instanceof", "true", "false", "null", "undefined", "this",
+  ]),
+};
+
+function appendHighlightedCodeTokens(parentEl, lineText, language) {
+  const isPython = language === "python";
+  const keywords = isPython ? CODE_KEYWORDS_BY_LANG.python : CODE_KEYWORDS_BY_LANG.js;
+  const tokenRe = isPython
+    ? /(#.*$|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_]\w*\b)/gm
+    : /(\/\/.*$|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*\b)/gm;
+
+  let cursor = 0;
+  let match;
+  while ((match = tokenRe.exec(lineText)) !== null) {
+    if (match.index > cursor) {
+      parentEl.appendChild(document.createTextNode(lineText.slice(cursor, match.index)));
+    }
+    const token = match[0];
+    let cls = "";
+    if ((isPython && token.startsWith("#")) || (!isPython && (token.startsWith("//") || token.startsWith("/*")))) {
+      cls = "tok-comment";
+    } else if (token.startsWith('"') || token.startsWith("'") || token.startsWith("`")) {
+      cls = "tok-string";
+    } else if (/^\d/.test(token)) {
+      cls = "tok-number";
+    } else if (keywords.has(token)) {
+      cls = "tok-keyword";
+    }
+
+    if (cls) {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = token;
+      parentEl.appendChild(span);
+    } else {
+      parentEl.appendChild(document.createTextNode(token));
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < lineText.length) {
+    parentEl.appendChild(document.createTextNode(lineText.slice(cursor)));
+  }
+}
+
+function findFlowStepRange(fnId, stepId, cyInst = null) {
+  if (!fnId || !stepId) {
+    return null;
+  }
+  const rawNode = state.nodesById.get(fnId);
+  if (rawNode && Array.isArray(rawNode.internal_flow)) {
+    const step = rawNode.internal_flow.find((item) => item.id === stepId);
+    if (step && step.line > 0) {
+      return {
+        startLine: step.line,
+        endLine: step.end_line && step.end_line >= step.line ? step.end_line : step.line,
+      };
+    }
+  }
+  if (cyInst && typeof cyInst.getElementById === "function") {
+    const cyStep = cyInst.getElementById(`${fnId}::${stepId}`);
+    if (cyStep && cyStep.length > 0) {
+      const line = Number(cyStep.data("stepLine") || 0);
+      const endLine = Number(cyStep.data("stepEndLine") || line);
+      if (line > 0) {
+        return { startLine: line, endLine: Math.max(line, endLine) };
+      }
+    }
+  }
+  return null;
+}
+
+function findBestFlowStepForLine(fnId, lineNum) {
+  const rawNode = state.nodesById.get(fnId);
+  if (!rawNode || !Array.isArray(rawNode.internal_flow) || !lineNum) {
+    return null;
+  }
+  const matching = rawNode.internal_flow.filter((step) => {
+    if (!step.line || step.line <= 0) {
+      return false;
+    }
+    const endLine = step.end_line && step.end_line >= step.line ? step.end_line : step.line;
+    return lineNum >= step.line && lineNum <= endLine;
+  });
+  if (matching.length === 0) {
+    return null;
+  }
+  matching.sort((a, b) => {
+    const spanA = (a.end_line && a.end_line >= a.line ? a.end_line : a.line) - a.line;
+    const spanB = (b.end_line && b.end_line >= b.line ? b.end_line : b.line) - b.line;
+    if (spanA !== spanB) {
+      return spanA - spanB;
+    }
+    if (Boolean(a.is_container) !== Boolean(b.is_container)) {
+      return a.is_container ? 1 : -1;
+    }
+    return b.line - a.line;
+  });
+  return matching[0];
+}
+
+function highlightFloatingCodeForStep(win, stepId, { scroll = true } = {}) {
+  if (!win || win.destroyed || !win.codeLinesEl) {
+    return;
+  }
+  const rows = win.codeLinesEl.querySelectorAll(".fw-code-line");
+  rows.forEach((row) => row.classList.remove("highlighted-step"));
+
+  if (!stepId) {
+    return;
+  }
+  const range = findFlowStepRange(win.targetId, stepId, win.cy);
+  if (!range) {
+    return;
+  }
+
+  let firstMatch = null;
+  rows.forEach((row) => {
+    const lineNum = Number(row.dataset.line || "0");
+    if (lineNum >= range.startLine && lineNum <= range.endLine) {
+      row.classList.add("highlighted-step");
+      if (!firstMatch) {
+        firstMatch = row;
+      }
+    }
+  });
+  if (scroll && firstMatch && typeof firstMatch.scrollIntoView === "function") {
+    firstMatch.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+function renderFloatingWindowSource(win, sourceData) {
+  if (!win || win.destroyed || !win.codeLinesEl) {
+    return;
+  }
+  win.codeLinesEl.replaceChildren();
+
+  if (!sourceData || !Array.isArray(sourceData.lines)) {
+    const empty = document.createElement("div");
+    empty.className = "fw-code-status";
+    empty.textContent = "Sin código fuente disponible.";
+    win.codeLinesEl.appendChild(empty);
+    return;
+  }
+
+  if (win.codeMetaEl) {
+    const fileBase = (sourceData.file_id || "").split("/").pop() || sourceData.file_id || "";
+    const langTag = sourceData.language ? ` · ${sourceData.language}` : "";
+    win.codeMetaEl.textContent = `${fileBase} · L${sourceData.start_line}–L${sourceData.end_line}${langTag}`;
+    win.codeMetaEl.title = `${sourceData.file_id || ""} (líneas ${sourceData.start_line}-${sourceData.end_line})`;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const lineObj of sourceData.lines) {
+    const row = document.createElement("div");
+    row.className = "fw-code-line";
+    row.dataset.line = String(lineObj.number);
+
+    const numSpan = document.createElement("span");
+    numSpan.className = "fw-code-lineno";
+    numSpan.textContent = String(lineObj.number);
+
+    const textSpan = document.createElement("span");
+    textSpan.className = "fw-code-text";
+    appendHighlightedCodeTokens(textSpan, lineObj.text || "", sourceData.language || "");
+
+    row.appendChild(numSpan);
+    row.appendChild(textSpan);
+
+    row.addEventListener("click", () => {
+      if (win.destroyed) {
+        return;
+      }
+      focusFloatingWindow(win.id);
+      const matchedStep = findBestFlowStepForLine(win.targetId, lineObj.number);
+      if (matchedStep) {
+        win.selectedStepId = matchedStep.id;
+        selectNode(win.targetId, matchedStep.id);
+        highlightFloatingCodeForStep(win, matchedStep.id, { scroll: false });
+        if (win.viewMode === "split" && win.cy) {
+          const cyStep = win.cy.getElementById(`${win.targetId}::${matchedStep.id}`);
+          if (cyStep && cyStep.length > 0) {
+            win.cy.animate({ center: { eles: cyStep }, duration: 160 });
+          }
+        }
+      } else {
+        win.codeLinesEl.querySelectorAll(".fw-code-line").forEach((el) => el.classList.remove("highlighted-step"));
+        row.classList.add("highlighted-step");
+      }
+    });
+
+    fragment.appendChild(row);
+  }
+  win.codeLinesEl.appendChild(fragment);
+
+  if (win.selectedStepId) {
+    highlightFloatingCodeForStep(win, win.selectedStepId, { scroll: true });
+  }
+}
+
+async function loadFloatingWindowSource(win, { force = false } = {}) {
+  if (!win || win.destroyed || !win.isFunctionFlow || !win.codeLinesEl) {
+    return null;
+  }
+  if (!force && win.sourceLoaded && win.sourceData) {
+    return win.sourceData;
+  }
+  if (win.sourceLoading) {
+    return win.sourceLoading;
+  }
+
+  win.codeLinesEl.replaceChildren();
+  const loadingEl = document.createElement("div");
+  loadingEl.className = "fw-code-status";
+  loadingEl.textContent = "Cargando código fuente…";
+  win.codeLinesEl.appendChild(loadingEl);
+
+  const requestPromise = (async () => {
+    try {
+      const response = await fetch(`/source?node_id=${encodeURIComponent(win.targetId)}`, {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        let errText = `HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          if (body && body.error) {
+            errText = body.error;
+          }
+        } catch (_err) {
+          // Mantener texto de estado HTTP.
+        }
+        throw new Error(errText);
+      }
+      const data = await response.json();
+      if (win.destroyed) {
+        return null;
+      }
+      win.sourceData = data;
+      win.sourceLoaded = true;
+      renderFloatingWindowSource(win, data);
+      return data;
+    } catch (error) {
+      if (!win.destroyed && win.codeLinesEl) {
+        win.codeLinesEl.replaceChildren();
+        const errEl = document.createElement("div");
+        errEl.className = "fw-code-status error";
+        errEl.textContent = `No se pudo cargar el código: ${error.message || error}`;
+        win.codeLinesEl.appendChild(errEl);
+      }
+      return null;
+    } finally {
+      win.sourceLoading = null;
+    }
+  })();
+
+  win.sourceLoading = requestPromise;
+  return requestPromise;
+}
+
+async function setFloatingWindowViewMode(win, mode) {
+  if (!win || win.destroyed || !win.isFunctionFlow) {
+    return;
+  }
+  const nextMode = mode === "code" || mode === "split" ? mode : "flow";
+  const prevMode = win.viewMode || "flow";
+  win.viewMode = nextMode;
+
+  win.bodyEl.classList.remove("mode-flow", "mode-code", "mode-split");
+  win.bodyEl.classList.add(`mode-${nextMode}`);
+
+  win.cyContainer.classList.toggle("hidden", nextMode === "code");
+  if (win.codePaneEl) {
+    win.codePaneEl.classList.toggle("hidden", nextMode === "flow");
+  }
+  if (win.fitBtn) {
+    win.fitBtn.classList.toggle("hidden", nextMode === "code");
+  }
+
+  if (win.modeButtons) {
+    for (const [key, btn] of win.modeButtons.entries()) {
+      const active = key === nextMode;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    }
+  }
+
+  if (win.hintEl) {
+    if (nextMode === "code") {
+      win.hintEl.textContent = "Clic en línea: resaltar paso · Copiar arriba";
+    } else if (nextMode === "split") {
+      win.hintEl.textContent = "Clic en paso o línea: sincronizar flujo ↔ código";
+    } else {
+      win.hintEl.textContent = "Clic en paso: inspeccionar código";
+    }
+  }
+
+  // Auto-ensanchamiento ergonómico para vista dividida 50/50.
+  const area = document.getElementById("canvas-area");
+  const areaW = area ? area.clientWidth : window.innerWidth;
+  if (nextMode === "split" && prevMode !== "split") {
+    const currentW = win.el.offsetWidth || parseFloat(win.el.style.width) || 460;
+    const targetW = Math.min(840, Math.max(660, Math.round(areaW * 0.72)), Math.max(360, areaW - 24));
+    if (targetW > currentW) {
+      win.preSplitWidth = currentW;
+      win.splitExpandedWidth = targetW;
+      win.el.style.width = `${targetW}px`;
+      const curLeft = parseFloat(win.el.style.left) || 12;
+      const maxLeft = Math.max(12, areaW - targetW - 12);
+      if (curLeft > maxLeft) {
+        win.el.style.left = `${Math.round(maxLeft)}px`;
+      }
+    }
+  } else if (prevMode === "split" && nextMode !== "split") {
+    const currentW = win.el.offsetWidth || parseFloat(win.el.style.width) || 0;
+    if (
+      win.preSplitWidth
+      && win.splitExpandedWidth
+      && Math.abs(currentW - win.splitExpandedWidth) < 24
+    ) {
+      win.el.style.width = `${win.preSplitWidth}px`;
+    }
+    win.preSplitWidth = null;
+    win.splitExpandedWidth = null;
+  }
+
+  if (nextMode === "code" || nextMode === "split") {
+    await loadFloatingWindowSource(win);
+    if (!win.destroyed && win.selectedStepId) {
+      highlightFloatingCodeForStep(win, win.selectedStepId, { scroll: true });
+    }
+  }
+
+  if (nextMode === "flow" || nextMode === "split") {
+    requestAnimationFrame(() => {
+      if (!win.destroyed && win.cy) {
+        win.cy.resize();
+        win.cy.fit(undefined, 18);
+        scheduleBridgeRender();
+      }
+    });
+  } else {
+    scheduleBridgeRender();
+  }
 }
 
 function bindFloatingWindowDrag(win) {
@@ -7337,17 +7969,32 @@ async function openFloatingWindow(
     headerEl: dom.headerEl,
     titleSpan: dom.titleSpan,
     badgeSpan: dom.badgeSpan,
+    modeSwitcherEl: dom.modeSwitcherEl,
+    modeButtons: dom.modeButtons,
+    fitBtn: dom.fitBtn,
     closeChainBtn: dom.closeChainBtn,
     closeBtn: dom.closeBtn,
     lockNoticeEl: dom.lockNoticeEl,
     bodyEl: dom.bodyEl,
     cyContainer: dom.cyContainer,
+    codePaneEl: dom.codePaneEl,
+    codeMetaEl: dom.codeMetaEl,
+    copyCodeBtn: dom.copyCodeBtn,
+    codeLinesEl: dom.codeLinesEl,
     statsEl: dom.statsEl,
     hintEl: dom.hintEl,
     cy: subCy,
     portsMeta: subgraph.portsMeta,
     internalNodeIds: subgraph.internalNodeIds,
     isFunctionFlow: subgraph.isFunctionFlow,
+    viewMode: "flow",
+    sourceData: null,
+    sourceLoaded: false,
+    sourceLoading: null,
+    selectedStepId: null,
+    preSplitWidth: null,
+    splitExpandedWidth: null,
+    copyFeedbackTimer: null,
     resizeObserver: null,
     lockNoticeTimer: null,
     pulseTimer: null,
@@ -7380,6 +8027,42 @@ async function openFloatingWindow(
     }
   });
 
+  if (dom.modeButtons && dom.modeButtons.size > 0) {
+    for (const [modeKey, modeBtn] of dom.modeButtons.entries()) {
+      modeBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        focusFloatingWindow(win.id);
+        setFloatingWindowViewMode(win, modeKey);
+      });
+    }
+  }
+
+  if (dom.copyCodeBtn) {
+    dom.copyCodeBtn.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      focusFloatingWindow(win.id);
+      const data = win.sourceData || (await loadFloatingWindowSource(win));
+      if (!data || typeof data.code !== "string") {
+        return;
+      }
+      const copied = await copyTextToClipboard(data.code);
+      if (!win.destroyed && copied) {
+        dom.copyCodeBtn.textContent = "✓ Copiado";
+        dom.copyCodeBtn.classList.add("copied");
+        if (win.copyFeedbackTimer) {
+          clearTimeout(win.copyFeedbackTimer);
+        }
+        win.copyFeedbackTimer = setTimeout(() => {
+          if (!win.destroyed && dom.copyCodeBtn) {
+            dom.copyCodeBtn.textContent = "Copiar";
+            dom.copyCodeBtn.classList.remove("copied");
+          }
+          win.copyFeedbackTimer = null;
+        }, 1600);
+      }
+    });
+  }
+
   dom.closeBtn.addEventListener("click", (event) => {
     event.stopPropagation();
     closeFloatingWindow(win.id, { forceCascade: false });
@@ -7403,7 +8086,13 @@ async function openFloatingWindow(
     }
     const selTargetId = data.ownerFunctionId || data.id;
     const stepId = data.type === "flow" ? (data.stepId || null) : null;
+    if (win.isFunctionFlow) {
+      win.selectedStepId = stepId;
+    }
     selectNode(selTargetId, stepId);
+    if (win.isFunctionFlow && (win.viewMode === "split" || win.viewMode === "code")) {
+      highlightFloatingCodeForStep(win, stepId, { scroll: true });
+    }
   });
 
   subCy.on("dbltap", "node", async (event) => {
@@ -7442,6 +8131,24 @@ async function openFloatingWindow(
     {
       onPanStart: () => focusFloatingWindow(win.id),
       onPanMove: () => scheduleBridgeRender(),
+      onMiddleClick: ({ cy, clientX, clientY }) => {
+        const hitNode = hitTestCyNodeAtClientPoint(cy, clientX, clientY);
+        if (!hitNode) {
+          return;
+        }
+        const data = hitNode.data();
+        if (!data || data.type === "port") {
+          return;
+        }
+        const targetId = data.ownerFunctionId || data.id;
+        if (targetId === win.targetId) {
+          return;
+        }
+        const rawTarget = state.nodesById.get(targetId);
+        if (canOpenInFloatingWindow(rawTarget)) {
+          openFloatingWindow(targetId, { parentWindowId: win.id });
+        }
+      },
     },
   );
   if (state.spacePanning) {
@@ -7557,6 +8264,10 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
   if (win.pulseTimer) {
     clearTimeout(win.pulseTimer);
     win.pulseTimer = null;
+  }
+  if (win.copyFeedbackTimer) {
+    clearTimeout(win.copyFeedbackTimer);
+    win.copyFeedbackTimer = null;
   }
   if (win.activeDragCleanup) {
     win.activeDragCleanup();
@@ -7711,6 +8422,13 @@ async function reconcileFloatingWindowsOnLiveUpdate() {
     win.cy.add([...subgraph.nodes, ...subgraph.edges]);
     await runSubElkLayout(win.cy, subgraph.nodes, subgraph.edges, subgraph.isFunctionFlow);
     updateFloatingWindowHeaderState(win);
+    if (win.isFunctionFlow) {
+      win.sourceData = null;
+      win.sourceLoaded = false;
+      if (win.viewMode === "code" || win.viewMode === "split") {
+        await loadFloatingWindowSource(win, { force: true });
+      }
+    }
   }
 
   scheduleBridgeRender();

@@ -43,6 +43,7 @@ from codemap.parsers.common import (
     collapse_whitespace,
     contains_type,
     dedent_code,
+    end_line_of,
     extract_html_path_from_string,
     find_enclosing_key,
     first_capture,
@@ -254,6 +255,8 @@ class FunctionNode:
     callback_via: str = ""
     callback_hook_label: str = ""
     callback_hook_code: str = ""
+    callback_hook_line: int = 0
+    callback_hook_end_line: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +442,8 @@ def collect_module_callbacks(
             callback_via=outer_callee,
             callback_hook_label=hook_label,
             callback_hook_code=hook_code,
+            callback_hook_line=line_of(call),
+            callback_hook_end_line=max(line_of(call), line_of(callback)),
         )
 
 
@@ -556,12 +561,17 @@ def build_function(
         entry_kind_hint = None
         is_entry_hint = False
 
+    fn_line = line_of(node)
+    fn_end_line = end_line_of(node)
+    header_end = end_line_of(params_node) if params_node is not None else fn_line
+
     return FunctionInfo(
         qualname=".".join(scope_names + [candidate.name]),
         short_name=candidate.name,
         class_name=class_name,
         container=container,
-        line=line_of(node),
+        line=fn_line,
+        end_line=fn_end_line,
         signature=signature_text(source, candidate.anchor, body),
         docstring=extract_jsdoc(candidate.anchor, source, file_doc_key=file_doc_key),
         param_count=len(params),
@@ -573,6 +583,10 @@ def build_function(
             functions,
             hook_label=candidate.callback_hook_label if candidate.is_callback else "",
             hook_code=candidate.callback_hook_code if candidate.is_callback else "",
+            hook_line=candidate.callback_hook_line if candidate.is_callback else 0,
+            hook_end_line=candidate.callback_hook_end_line if candidate.is_callback else 0,
+            entry_line=fn_line,
+            entry_end_line=header_end,
         ),
         branch_count=metrics.branch_count,
         return_count=metrics.return_count,
@@ -1004,6 +1018,10 @@ def build_flow(
     *,
     hook_label: str = "",
     hook_code: str = "",
+    hook_line: int = 0,
+    hook_end_line: int = 0,
+    entry_line: int = 0,
+    entry_end_line: int = 0,
 ) -> list[FlowStep]:
     builder = FlowGraphBuilder(FLOW_MAX_STEPS)
     pending: list[PendingExit] = []
@@ -1014,10 +1032,17 @@ def build_flow(
             flow_label(hook_label),
             code=hook_code or hook_label,
             kind="event",
+            line=hook_line,
+            end_line=hook_end_line,
         )
     param_summary = ", ".join(params) or "∅"
     _, pending = builder.emit_sequential(
-        pending, ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+        pending,
+        ROLE_ENTRY,
+        f"in: {param_summary}",
+        code=f"({param_summary})",
+        line=entry_line,
+        end_line=entry_end_line,
     )
     if body is None:
         return builder.steps
@@ -1049,6 +1074,8 @@ def walk_flow_expr_body(
         label,
         code=dedent_code(node_text(body, source)),
         parent_id=parent_id,
+        line=line_of(body),
+        end_line=end_line_of(body),
     )
     return next_pending
 
@@ -1170,6 +1197,8 @@ def _flush_js_compact_buffer(
         label,
         code=code,
         parent_id=parent_id,
+        line=line_of(buffer[0][0]),
+        end_line=end_line_of(buffer[-1][0]),
     )
     buffer.clear()
     return next_pending
@@ -1273,6 +1302,8 @@ def walk_flow_statement(
         flow_label(node_text(node, source)),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=line_of(node),
+        end_line=end_line_of(node),
     )
     return next_pending
 
@@ -1293,6 +1324,8 @@ def walk_loop_statement(
         parent_id=parent_id,
         is_container=True,
         kind="loop",
+        line=line_of(node),
+        end_line=end_line_of(node),
     )
     if loop_step is None:
         return next_pending
@@ -1314,12 +1347,16 @@ def walk_if_statement(
     pending: list[PendingExit],
     parent_id: str | None,
 ) -> list[PendingExit]:
+    if_cond = node.child_by_field_name("condition")
+    if_line = line_of(node)
     if_step, _ = builder.emit_sequential(
         pending,
         ROLE_DECISION,
         header_text(node, source),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=if_line,
+        end_line=end_line_of(if_cond) if if_cond is not None else if_line,
     )
     if if_step is None:
         return pending
@@ -1353,12 +1390,16 @@ def walk_switch_statement(
     pending: list[PendingExit],
     parent_id: str | None,
 ) -> list[PendingExit]:
+    sw_val = node.child_by_field_name("value")
+    sw_line = line_of(node)
     sw_step, _ = builder.emit_sequential(
         pending,
         ROLE_DECISION,
         header_text(node, source),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=sw_line,
+        end_line=end_line_of(sw_val) if sw_val is not None else sw_line,
     )
     if sw_step is None:
         return pending
@@ -1407,6 +1448,8 @@ def walk_try_statement(
             "try",
             code=dedent_code(node_text(try_body, source)) or "try",
             parent_id=parent_id,
+            line=line_of(node),
+            end_line=end_line_of(try_body) if try_body is not None else line_of(node),
         )
         try_anchor_id = anchor_step.id if anchor_step else None
     else:
@@ -1435,6 +1478,8 @@ def walk_try_statement(
                 code=dedent_code(node_text(handler, source)),
                 parent_id=parent_id,
                 kind="except",
+                line=line_of(handler),
+                end_line=end_line_of(handler),
             )
             if exc_step is None:
                 catch_exits = catch_start
@@ -1604,6 +1649,8 @@ def emit_callback_steps(
             parent_id=parent_id,
             is_container=True,
             kind=step_kind,
+            line=line_of(code_node),
+            end_line=end_line_of(code_node),
         )
         if cb_step is None:
             return current

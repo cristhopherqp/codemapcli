@@ -78,6 +78,15 @@ def line_of(node: Node) -> int:
     return node.start_point[0] + 1
 
 
+def end_line_of(node: Node) -> int:
+    """Línea final 1-based inclusive (evita sumar 1 si end_point termina en columna 0)."""
+    start_row = node.start_point[0]
+    end_row, end_col = node.end_point
+    if end_col == 0 and end_row > start_row:
+        return end_row
+    return end_row + 1
+
+
 def collapse_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -269,6 +278,8 @@ class FlowGraphBuilder:
         parent_id: str | None = None,
         is_container: bool = False,
         kind: str = "step",
+        line: int = 0,
+        end_line: int = 0,
     ) -> FlowStep | None:
         if len(self.steps) > self.max_steps:
             return None
@@ -278,6 +289,10 @@ class FlowGraphBuilder:
             code = ""
             is_container = False
             kind = "step"
+            line = 0
+            end_line = 0
+        resolved_line = line if line > 0 else 0
+        resolved_end = end_line if end_line >= resolved_line else resolved_line
         step = FlowStep(
             id=f"n{len(self.steps) + 1}",
             role=role,
@@ -286,6 +301,8 @@ class FlowGraphBuilder:
             parent_id=parent_id,
             is_container=is_container,
             kind=kind,
+            line=resolved_line,
+            end_line=resolved_end,
         )
         self.steps.append(step)
         self._by_id[step.id] = step
@@ -320,6 +337,8 @@ class FlowGraphBuilder:
         parent_id: str | None = None,
         is_container: bool = False,
         kind: str = "step",
+        line: int = 0,
+        end_line: int = 0,
     ) -> tuple[FlowStep | None, list[PendingExit]]:
         step = self.add_step(
             role,
@@ -328,6 +347,8 @@ class FlowGraphBuilder:
             parent_id=parent_id,
             is_container=is_container,
             kind=kind,
+            line=line,
+            end_line=end_line,
         )
         if step is None:
             return None, pending

@@ -50,6 +50,8 @@ class FlowStep:
     parent_id: str | None = None
     is_container: bool = False
     kind: str = "step"  # "step" | "loop" | "event" | "merge" | "except"
+    line: int = 0
+    end_line: int = 0
     edges: list[FlowEdge] = field(default_factory=list)
 
 
@@ -101,6 +103,7 @@ class FunctionInfo:
     signature: str
     docstring: str
     param_count: int
+    end_line: int = 0
     calls: list[CallSite] = field(default_factory=list)
     internal_flow: list[FlowStep] = field(default_factory=list)
     branch_count: int = 0      # if / elif / case ...

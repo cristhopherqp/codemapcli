@@ -440,20 +440,28 @@ def _load_js_path_config(
     config_path: Path,
     cache: dict[str, JsPathConfig | None],
     depth: int = 0,
+    root_dir: Path | None = None,
 ) -> JsPathConfig | None:
-    key = config_path.resolve().as_posix()
+    try:
+        resolved_config = config_path.resolve()
+    except OSError:
+        return None
+    key = resolved_config.as_posix()
     if key in cache:
         return cache[key]
-    if depth > MAX_TSCONFIG_EXTENDS_DEPTH or not config_path.is_file():
+    if root_dir is not None and not resolved_config.is_relative_to(root_dir):
+        cache[key] = None
+        return None
+    if depth > MAX_TSCONFIG_EXTENDS_DEPTH or not resolved_config.is_file():
         cache[key] = None
         return None
 
-    data = _read_jsonc_object(config_path)
+    data = _read_jsonc_object(resolved_config)
     if data is None:
         cache[key] = None
         return None
 
-    config_dir = config_path.resolve().parent
+    config_dir = resolved_config.parent
     merged_paths: dict[str, list[str]] = {}
     base_dir = config_dir
     has_base_url = False
@@ -466,8 +474,16 @@ def _load_js_path_config(
             if not ext_spec.endswith(".json"):
                 ext_candidates.append(config_dir / f"{ext_spec}.json")
             for ext_path in ext_candidates:
-                if ext_path.is_file():
-                    parent_cfg = _load_js_path_config(ext_path, cache, depth + 1)
+                try:
+                    resolved_ext = ext_path.resolve()
+                except OSError:
+                    continue
+                if root_dir is not None and not resolved_ext.is_relative_to(root_dir):
+                    continue
+                if resolved_ext.is_file():
+                    parent_cfg = _load_js_path_config(
+                        resolved_ext, cache, depth + 1, root_dir=root_dir
+                    )
                     if parent_cfg is not None:
                         base_dir = parent_cfg.base_dir
                         has_base_url = parent_cfg.has_base_url
@@ -522,7 +538,7 @@ def _find_js_path_config(importer_path: str, index: ProjectIndex) -> JsPathConfi
         for cfg_name in ("tsconfig.json", "jsconfig.json"):
             candidate = cursor / cfg_name
             if candidate.is_file():
-                found = _load_js_path_config(candidate, index._js_config_cache)
+                found = _load_js_path_config(candidate, index._js_config_cache, root_dir=root)
                 break
         if found is not None:
             break

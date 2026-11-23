@@ -5,6 +5,7 @@ Sirve:
   /graph.json     -> grafo estructural vigente en memoria / disco
   /export.ai.json -> grafo minificado/podado para modelos de IA (?include_flow=0|1)
   /export.ai.md   -> resumen estructurado Markdown con Mermaid (?include_flow=0|1)
+  /source         -> código fuente en solo lectura de un nodo (?node_id=<id>)
   /notes.json     -> GET carga notes.json; POST aplica cambios parciales
   /known-apis     -> GET carga ~/.codemap/known_apis.json; POST marca/desmarca APIs
   /ws             -> WebSocket bidireccional (push de recarga en vivo + guardado)
@@ -138,6 +139,7 @@ def create_app(
     app.router.add_get("/graph.json", handle_get_graph)
     app.router.add_get("/export.ai.json", handle_export_ai_json)
     app.router.add_get("/export.ai.md", handle_export_ai_markdown)
+    app.router.add_get("/source", handle_get_source)
     app.router.add_get("/notes.json", handle_get_notes)
     app.router.add_post("/notes.json", handle_post_notes)
     app.router.add_get("/known-apis", handle_get_known_apis)
@@ -186,6 +188,103 @@ async def handle_export_ai_markdown(request: web.Request) -> web.Response:
         text=markdown,
         content_type="text/markdown",
         charset="utf-8",
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _is_within_project_target(file_path: Path, target_path: str) -> bool:
+    """Confirma que `file_path` permanece estrictamente confinado al proyecto analizado."""
+    try:
+        resolved_file = file_path.resolve()
+        resolved_target = Path(target_path).resolve()
+    except OSError:
+        return False
+    if resolved_target.is_file():
+        return resolved_file == resolved_target
+    return resolved_file.is_relative_to(resolved_target)
+
+
+def _read_source_slice(file_path: Path, start_line: int, end_line: int | None) -> tuple[int, int, str, list[dict]]:
+    raw = file_path.read_text(encoding="utf-8", errors="replace")
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    all_lines = normalized.split("\n")
+    if all_lines and all_lines[-1] == "":
+        all_lines.pop()
+    total = len(all_lines)
+    if total == 0:
+        return 1, 1, "", []
+
+    clamped_start = max(1, min(start_line, total))
+    requested_end = total if end_line is None or end_line <= 0 else end_line
+    clamped_end = max(clamped_start, min(requested_end, total))
+    sliced = all_lines[clamped_start - 1 : clamped_end]
+    lines_payload = [
+        {"number": clamped_start + offset, "text": text}
+        for offset, text in enumerate(sliced)
+    ]
+    return clamped_start, clamped_end, "\n".join(sliced), lines_payload
+
+
+async def handle_get_source(request: web.Request) -> web.Response:
+    """Sirve en solo lectura el fragmento de código fuente de un nodo del grafo actual."""
+    node_id = request.query.get("node_id", "").strip()
+    if not node_id:
+        return web.json_response({"error": "Parámetro node_id requerido"}, status=400, headers=NO_STORE_HEADERS)
+
+    graph = request.app[APP_GRAPH]
+    nodes_by_id = {n["id"]: n for n in graph.get("nodes", []) if isinstance(n, dict) and "id" in n}
+    node = nodes_by_id.get(node_id)
+    if node is None:
+        return web.json_response({"error": "Nodo no encontrado"}, status=404, headers=NO_STORE_HEADERS)
+
+    node_type = node.get("type")
+    if node_type == "function":
+        file_node = nodes_by_id.get(node.get("parent") or "")
+        file_path_str = file_node.get("file_path") if isinstance(file_node, dict) else None
+        file_id = file_node.get("id", "") if isinstance(file_node, dict) else ""
+        language = file_node.get("language", "") if isinstance(file_node, dict) else ""
+        req_start = max(1, int(node.get("line") or 1))
+        raw_end = int(node.get("end_line") or 0)
+        req_end: int | None = raw_end if raw_end >= req_start else req_start
+    elif node_type == "file":
+        file_path_str = node.get("file_path")
+        file_id = node.get("id", "")
+        language = node.get("language", "")
+        req_start = 1
+        req_end = None
+    else:
+        return web.json_response(
+            {"error": "El nodo seleccionado no tiene código fuente asociado"},
+            status=400,
+            headers=NO_STORE_HEADERS,
+        )
+
+    if not file_path_str:
+        return web.json_response({"error": "Ruta de archivo no disponible"}, status=404, headers=NO_STORE_HEADERS)
+
+    file_path = Path(file_path_str)
+    if not _is_within_project_target(file_path, request.app[APP_TARGET_PATH]):
+        return web.json_response({"error": "Archivo fuera del proyecto analizado"}, status=403, headers=NO_STORE_HEADERS)
+    if not file_path.is_file():
+        return web.json_response({"error": "Archivo no encontrado en disco"}, status=404, headers=NO_STORE_HEADERS)
+
+    try:
+        start_line, end_line, code, lines_payload = await asyncio.to_thread(
+            _read_source_slice, file_path, req_start, req_end
+        )
+    except OSError:
+        return web.json_response({"error": "No se pudo leer el archivo fuente"}, status=500, headers=NO_STORE_HEADERS)
+
+    return web.json_response(
+        {
+            "node_id": node_id,
+            "file_id": file_id,
+            "language": language,
+            "start_line": start_line,
+            "end_line": end_line,
+            "code": code,
+            "lines": lines_payload,
+        },
         headers=NO_STORE_HEADERS,
     )
 

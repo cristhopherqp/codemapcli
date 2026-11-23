@@ -849,6 +849,7 @@ def build_function_nodes(
                     "signature": function.signature,
                     "docstring": function.docstring,
                     "line": function.line,
+                    "end_line": function.end_line or function.line,
                     "fingerprint": function.fingerprint,
                     "external_calls": collect_external_calls(function, analysis, index),
                     "internal_flow": [
@@ -860,6 +861,8 @@ def build_function_nodes(
                             "parent_id": step.parent_id,
                             "is_container": step.is_container,
                             "kind": step.kind,
+                            "line": step.line,
+                            "end_line": step.end_line or step.line,
                             "edges": [
                                 {"target": edge.target, "label": edge.label, "kind": edge.kind}
                                 for edge in step.edges

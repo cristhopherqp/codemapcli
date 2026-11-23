@@ -43,6 +43,7 @@ from codemap.parsers.common import (
     collapse_whitespace,
     contains_type,
     dedent_code,
+    end_line_of,
     extract_html_path_from_string,
     find_enclosing_key,
     first_capture,
@@ -281,17 +282,30 @@ def build_function(
         entry_kind_hint = None
         is_entry_hint = False
 
+    fn_line = line_of(node)
+    fn_end_line = end_line_of(node)
+    params_node = node.child_by_field_name("parameters")
+    header_end = end_line_of(params_node) if params_node is not None else fn_line
+
     return FunctionInfo(
         qualname=qualname,
         short_name=short_name,
         class_name=class_name,
         container=container,
-        line=line_of(node),
+        line=fn_line,
+        end_line=fn_end_line,
         signature=signature_text(source, node, body),
         docstring=extract_docstring(body, source),
         param_count=len(params),
         calls=calls,
-        internal_flow=build_flow(params, body, source, function_nodes),
+        internal_flow=build_flow(
+            params,
+            body,
+            source,
+            function_nodes,
+            entry_line=fn_line,
+            entry_end_line=header_end,
+        ),
         branch_count=metrics.branch_count,
         return_count=metrics.return_count,
         has_io=has_io,
@@ -675,6 +689,10 @@ def build_flow(
     *,
     hook_label: str = "",
     hook_code: str = "",
+    hook_line: int = 0,
+    hook_end_line: int = 0,
+    entry_line: int = 0,
+    entry_end_line: int = 0,
 ) -> list[FlowStep]:
     """Construye el grafo intra-función con sub-contenedores, ramas Sí/No y try/except."""
     builder = FlowGraphBuilder(FLOW_MAX_STEPS)
@@ -686,10 +704,17 @@ def build_flow(
             flow_label(hook_label),
             code=hook_code or hook_label,
             kind="event",
+            line=hook_line,
+            end_line=hook_end_line,
         )
     param_summary = ", ".join(params) or "∅"
     _, pending = builder.emit_sequential(
-        pending, ROLE_ENTRY, f"in: {param_summary}", code=f"({param_summary})"
+        pending,
+        ROLE_ENTRY,
+        f"in: {param_summary}",
+        code=f"({param_summary})",
+        line=entry_line,
+        end_line=entry_end_line,
     )
     if body is not None:
         pending = walk_flow_block(body, source, function_nodes, builder, pending, parent_id=None)
@@ -763,6 +788,8 @@ def _flush_py_compact_buffer(
         label,
         code=code,
         parent_id=parent_id,
+        line=line_of(buffer[0][0]),
+        end_line=end_line_of(buffer[-1][0]),
     )
     buffer.clear()
     return next_pending
@@ -879,6 +906,8 @@ def emit_lambda_steps(
             parent_id=parent_id,
             is_container=True,
             kind=step_kind,
+            line=line_of(code_node),
+            end_line=end_line_of(code_node),
         )
         if lam_step is None:
             return current
@@ -891,6 +920,8 @@ def emit_lambda_steps(
                 flow_label(node_text(body_node, source)),
                 code=dedent_code(node_text(body_node, source)),
                 parent_id=lam_step.id,
+                line=line_of(body_node),
+                end_line=end_line_of(body_node),
             )
         builder.finalize_container(lam_step)
     return current
@@ -923,14 +954,18 @@ def walk_flow_statement(
         return walk_try_statement(node, source, function_nodes, builder, pending, parent_id)
 
     if node.type == "with_statement":
+        body = next((c for c in node.named_children if c.type == "block"), None)
+        with_start = line_of(node)
+        with_end = max(with_start, line_of(body) - 1) if body is not None and line_of(body) > with_start else with_start
         _, next_pending = builder.emit_sequential(
             pending,
             step_role(node, source, function_nodes),
             header_text(node, source),
             code=dedent_code(node_text(node, source)),
             parent_id=parent_id,
+            line=with_start,
+            end_line=with_end,
         )
-        body = next((c for c in node.named_children if c.type == "block"), None)
         return walk_flow_block(body, source, function_nodes, builder, next_pending, parent_id)
 
     lambdas = collect_inline_lambdas(node, function_nodes)
@@ -950,6 +985,8 @@ def walk_flow_statement(
         flow_label(node_text(node, source)),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=line_of(node),
+        end_line=end_line_of(node),
     )
     return next_pending
 
@@ -970,6 +1007,8 @@ def walk_loop_statement(
         parent_id=parent_id,
         is_container=True,
         kind="loop",
+        line=line_of(node),
+        end_line=end_line_of(node),
     )
     if loop_step is None:
         return next_pending
@@ -999,12 +1038,16 @@ def walk_if_statement(
     pending: list[PendingExit],
     parent_id: str | None,
 ) -> list[PendingExit]:
+    if_cond = node.child_by_field_name("condition")
+    if_line = line_of(node)
     if_step, _ = builder.emit_sequential(
         pending,
         ROLE_DECISION,
         header_text(node, source),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=if_line,
+        end_line=end_line_of(if_cond) if if_cond is not None else if_line,
     )
     if if_step is None:
         return pending
@@ -1022,12 +1065,16 @@ def walk_if_statement(
 
     for alt in node.children_by_field_name("alternative"):
         if alt.type == "elif_clause":
+            elif_cond = alt.child_by_field_name("condition")
+            elif_line = line_of(alt)
             elif_step, _ = builder.emit_sequential(
                 no_pending,
                 ROLE_DECISION,
                 header_text(alt, source),
                 code=dedent_code(node_text(alt, source)),
                 parent_id=parent_id,
+                line=elif_line,
+                end_line=end_line_of(elif_cond) if elif_cond is not None else elif_line,
             )
             if elif_step is None:
                 continue
@@ -1069,12 +1116,16 @@ def walk_match_statement(
     pending: list[PendingExit],
     parent_id: str | None,
 ) -> list[PendingExit]:
+    match_subj = node.child_by_field_name("subject")
+    match_line = line_of(node)
     match_step, _ = builder.emit_sequential(
         pending,
         ROLE_DECISION,
         header_text(node, source),
         code=dedent_code(node_text(node, source)),
         parent_id=parent_id,
+        line=match_line,
+        end_line=end_line_of(match_subj) if match_subj is not None else match_line,
     )
     if match_step is None:
         return pending
@@ -1126,6 +1177,8 @@ def walk_try_statement(
             "try",
             code=dedent_code(node_text(try_body, source)) or "try",
             parent_id=parent_id,
+            line=line_of(node),
+            end_line=end_line_of(try_body) if try_body is not None else line_of(node),
         )
         try_anchor_id = anchor_step.id if anchor_step else None
     else:
@@ -1151,6 +1204,8 @@ def walk_try_statement(
                 code=dedent_code(node_text(child, source)),
                 parent_id=parent_id,
                 kind="except",
+                line=line_of(child),
+                end_line=end_line_of(child),
             )
             if exc_step is None:
                 exc_exits = exc_start
