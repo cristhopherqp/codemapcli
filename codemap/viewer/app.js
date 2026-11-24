@@ -1888,21 +1888,98 @@ function buildVisibleElements() {
 
 function estimateFlowStepSize(role, kind, label) {
   if (kind === "merge") {
-    return { width: 62, height: 28 };
+    return { width: 68, height: 36, innerWidth: 58, innerHeight: 26 };
   }
+
+  const maxTextWidth = role === "decision" ? 185 : 265;
+  const maxCharsFallback = role === "decision" ? 25 : 35;
+
+  const measureWrapped = (text, maxPx, maxChars) => {
+    const rawText = String(text || "");
+    if (typeof document !== "undefined" && typeof document.createElement === "function") {
+      if (!estimateFlowStepSize._measureCtx) {
+        const c = document.createElement("canvas");
+        const ctx = c && c.getContext ? c.getContext("2d") : null;
+        if (ctx) {
+          ctx.font = '11px "Helvetica Neue", Helvetica, Arial, sans-serif';
+          estimateFlowStepSize._measureCtx = ctx;
+        }
+      }
+      const ctx = estimateFlowStepSize._measureCtx;
+      if (ctx) {
+        let lineCount = 0;
+        let maxLineW = 0;
+        for (const para of rawText.split("\n")) {
+          const trimmed = para.trim();
+          if (!trimmed) {
+            lineCount += 1;
+            continue;
+          }
+          const words = trimmed.split(/\s+/);
+          let curLine = "";
+          for (const word of words) {
+            const candidate = curLine ? `${curLine} ${word}` : word;
+            const w = ctx.measureText(candidate).width;
+            if (curLine && w > maxPx) {
+              maxLineW = Math.max(maxLineW, ctx.measureText(curLine).width);
+              lineCount += 1;
+              curLine = word;
+            } else {
+              curLine = candidate;
+            }
+          }
+          if (curLine) {
+            const finalW = ctx.measureText(curLine).width;
+            if (finalW > maxPx) {
+              const chunks = Math.max(1, Math.ceil(finalW / maxPx));
+              lineCount += chunks;
+              maxLineW = Math.max(maxLineW, maxPx);
+            } else {
+              lineCount += 1;
+              maxLineW = Math.max(maxLineW, finalW);
+            }
+          }
+        }
+        return { lineCount: Math.max(1, lineCount), maxLineW };
+      }
+    }
+    const { lineCount, longestLine } = estimateWrappedTextMetrics(rawText, maxChars);
+    return { lineCount, maxLineW: Math.min(maxPx, longestLine * 7.2) };
+  };
+
+  const { lineCount, maxLineW } = measureWrapped(label, maxTextWidth, maxCharsFallback);
+
   if (role === "decision") {
-    const { lineCount, longestLine } = estimateWrappedTextMetrics(label, 27);
-    const w = Math.max(92, Math.min(195, longestLine * 7.2));
-    const h = Math.max(18, lineCount * 15);
+    const textW = Math.max(78, Math.min(maxTextWidth, Math.ceil(maxLineW)));
+    const textH = Math.max(16, Math.ceil(lineCount * 14.5));
+    // En round-diamond el texto cabe dentro del rombo si textW/W + textH/H <= 1.
+    // El stylesheet aplica padding 0 y border-width 2, por lo que outer = inner + 2.
+    const innerWidth = Math.max(150, Math.min(340, Math.round(textW * 1.85 + 44)));
+    const innerHeight = Math.max(76, Math.min(180, Math.round(textH * 1.9 + 38)));
     return {
-      width: Math.round(w * 1.65 + 54),
-      height: Math.max(72, Math.round(h * 1.65 + 42)),
+      width: innerWidth + 2,
+      height: innerHeight + 2,
+      innerWidth,
+      innerHeight,
     };
   }
-  const { lineCount, longestLine } = estimateWrappedTextMetrics(label, 36);
-  const width = Math.max(140, Math.min(295, longestLine * 7.2 + 30));
-  const height = Math.max(46, lineCount * 16 + 24);
-  return { width, height };
+
+  const borderW = role === "entry" ? 2.5 : 2;
+  const padTotal = 24;
+  let innerWidth = Math.max(114, Math.min(272, Math.ceil(maxLineW + 14)));
+  let innerHeight = Math.max(24, Math.ceil(lineCount * 15 + 8));
+  if (role === "entry") {
+    innerWidth = Math.max(128, Math.min(284, Math.ceil(maxLineW * 1.18 + 20)));
+    innerHeight = Math.max(30, Math.ceil(lineCount * 15 + 14));
+  } else if (role === "io") {
+    innerHeight = Math.max(28, Math.ceil(lineCount * 15 + 12));
+  }
+  return {
+    width: Math.ceil(innerWidth + padTotal + borderW),
+    height: Math.ceil(innerHeight + padTotal + borderW),
+    innerWidth,
+    innerHeight,
+  };
 }
 
 function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
@@ -1930,8 +2007,10 @@ function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
         role: step.role,
         flowKind: stepKind,
         flowContainer: step.is_container ? "true" : "false",
-        nodeWidth: stepSize.width,
-        nodeHeight: stepSize.height,
+        nodeWidth: stepSize.innerWidth,
+        nodeHeight: stepSize.innerHeight,
+        elkWidth: stepSize.width,
+        elkHeight: stepSize.height,
         flowEdges: Array.isArray(step.edges) ? step.edges : null,
         pinned: "false",
         hasNote: "false",
@@ -2732,6 +2811,13 @@ function buildStylesheet() {
       },
     },
     {
+      selector: 'node[type = "flow"][flowContainer != "true"][nodeWidth][nodeHeight]',
+      style: {
+        "width": "data(nodeWidth)",
+        "height": "data(nodeHeight)",
+      },
+    },
+    {
       selector: 'node[type = "flow"].selected-step',
       style: {
         "border-width": 3,
@@ -2771,8 +2857,8 @@ function buildStylesheet() {
         "shape": "round-diamond",
         "width": "data(nodeWidth)",
         "height": "data(nodeHeight)",
-        "text-max-width": 195,
-        "padding": 22,
+        "text-max-width": 185,
+        "padding": 0,
       },
     },
     {
@@ -2904,6 +2990,20 @@ function buildStylesheet() {
       },
     },
     {
+      selector: "edge.elk-routed[srcEndpoint][tgtEndpoint]",
+      style: {
+        "edge-distances": "endpoints",
+        "source-endpoint": "data(srcEndpoint)",
+        "target-endpoint": "data(tgtEndpoint)",
+      },
+    },
+    {
+      selector: "edge.compound-incident",
+      style: {
+        "z-compound-depth": "top",
+      },
+    },
+    {
       selector: "edge:loop",
       style: {
         "curve-style": "bezier",
@@ -2981,7 +3081,13 @@ function buildStylesheet() {
     },
     {
       selector: 'edge[kind = "flow"]',
-      style: { "width": 1.4, "line-color": "#475569", "target-arrow-color": "#475569" },
+      style: {
+        "width": 1.8,
+        "line-color": "#94a3b8",
+        "target-arrow-color": "#94a3b8",
+        "arrow-scale": 0.95,
+        "z-compound-depth": "top",
+      },
     },
     {
       selector: 'edge[flowEdgeKind = "branch_yes"]',
@@ -3432,12 +3538,24 @@ function adjustElkSectionPoints(
   staggerMeta,
   useChannelShiftForEndpoints = false,
 ) {
+  const resolveEndpointDeltaY = (nodeId) => {
+    if (!staggerMeta) {
+      return 0;
+    }
+    if (staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.has(nodeId)) {
+      return staggerMeta.nodeDeltaY.get(nodeId) || 0;
+    }
+    if (staggerMeta.containerBaseShiftY && staggerMeta.containerBaseShiftY.has(nodeId)) {
+      return staggerMeta.containerBaseShiftY.get(nodeId) || 0;
+    }
+    return 0;
+  };
   const srcDy = useChannelShiftForEndpoints && section && section.startPoint
     ? computeStaggeredChannelShiftY(edgeContainer, section.startPoint.y, staggerMeta)
-    : ((staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(srcId)) || 0);
+    : resolveEndpointDeltaY(srcId);
   const tgtDy = useChannelShiftForEndpoints && section && section.endPoint
     ? computeStaggeredChannelShiftY(edgeContainer, section.endPoint.y, staggerMeta)
-    : ((staggerMeta && staggerMeta.nodeDeltaY && staggerMeta.nodeDeltaY.get(tgtId)) || 0);
+    : resolveEndpointDeltaY(tgtId);
   const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
   const absPoints = [];
 
@@ -3608,11 +3726,13 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
         "elk.direction": "DOWN",
         "elk.hierarchyHandling": "INCLUDE_CHILDREN",
         "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "30",
-        "elk.spacing.nodeNode": "26",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "44",
+        "elk.spacing.nodeNode": "28",
+        "elk.spacing.edgeNode": "18",
+        "elk.spacing.edgeEdge": "14",
         "elk.padding": d.flowContainer === "true"
-          ? "[top=38,left=24,bottom=22,right=24]"
-          : "[top=44,left=24,bottom=22,right=24]",
+          ? "[top=40,left=24,bottom=24,right=24]"
+          : "[top=46,left=24,bottom=24,right=24]",
       };
     }
     elkNodes.set(d.id, {
@@ -3725,9 +3845,28 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
     return "root";
   };
 
-  // Pre-agrupar aristas directas entre hermanos de cada contenedor y aristas de flujo intra-función.
+  const findFlowEdgeContainer = (srcId, tgtId) => {
+    const sParent = parentOf.get(srcId) || null;
+    const tParent = parentOf.get(tgtId) || null;
+    if (sParent && sParent === tParent) {
+      return sParent;
+    }
+    const sAnc = sParent ? getAncestorsFromRoot(sParent) : [];
+    const tAnc = tParent ? getAncestorsFromRoot(tParent) : [];
+    let lca = null;
+    for (let i = 0; i < sAnc.length && i < tAnc.length; i += 1) {
+      if (sAnc[i] === tAnc[i]) {
+        lca = sAnc[i];
+      } else {
+        break;
+      }
+    }
+    return lca || findEnclosingFlowFn(srcId) || findEnclosingFlowFn(tgtId) || "root";
+  };
+
+  // Pre-agrupar aristas directas entre hermanos de cada contenedor y aristas de flujo intra-función por LCA exacto.
   const directEdgesByContainer = new Map();
-  const flowEdgesByFn = new Map();
+  const flowEdgesByContainer = new Map();
   const crossEdges = [];
 
   for (const edge of visibleEdges) {
@@ -3737,13 +3876,11 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
       continue;
     }
     if (edge.data.kind === "flow") {
-      const ownerFn = findEnclosingFlowFn(src) || findEnclosingFlowFn(tgt);
-      if (ownerFn) {
-        if (!flowEdgesByFn.has(ownerFn)) {
-          flowEdgesByFn.set(ownerFn, []);
-        }
-        flowEdgesByFn.get(ownerFn).push(edge);
+      const ownerContainer = findFlowEdgeContainer(src, tgt);
+      if (!flowEdgesByContainer.has(ownerContainer)) {
+        flowEdgesByContainer.set(ownerContainer, []);
       }
+      flowEdgesByContainer.get(ownerContainer).push(edge);
       continue;
     }
     const pSrc = parentOf.get(src) || "root";
@@ -3899,8 +4036,8 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
     }
     const isFlowBox = d.expandedFn === "true" || d.flowContainer === "true";
     if (isFlowBox) {
-      if (d.expandedFn === "true") {
-        const fEdges = flowEdgesByFn.get(id) || [];
+      const fEdges = flowEdgesByContainer.get(id) || [];
+      if (fEdges.length > 0 && elkNode.children.length > 0) {
         elkNode.edges = fEdges.map(makeElkEdge);
       } else {
         delete elkNode.edges;
@@ -3956,7 +4093,10 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
     computeElkSubtreeWidth(rootChild, dataById);
   }
 
-  const rootElkEdges = (directEdgesByContainer.get("root") || []).map(makeElkEdge);
+  const rootElkEdges = [
+    ...(directEdgesByContainer.get("root") || []),
+    ...(flowEdgesByContainer.get("root") || []),
+  ].map(makeElkEdge);
   const rootLayoutOptions = rootHasOnlyFunctions
     ? {
         ...CREATION_FILE_ELK_OPTIONS,
@@ -4458,6 +4598,10 @@ async function runElkLayout(visibleNodes, visibleEdges) {
         cyNode.position(pos);
       }
     });
+  });
+  // Ejecutar el enrutamiento en un segundo batch sincrónico para leer las cajas
+  // reales ya actualizadas de contenedores compuestos (expandedFn / flowContainer).
+  state.cy.batch(() => {
     applyElkEdgeRoutes(
       state.cy,
       layouted,
@@ -4480,6 +4624,7 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
   const elkNodes = new Map();
   const dataById = new Map();
   const orderIndexById = new Map();
+  const parentOf = new Map();
   let hasLayerContainers = false;
 
   visibleNodes.forEach((item, idx) => {
@@ -4497,12 +4642,17 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
       };
     } else if (isFlowBox) {
       nodeLayoutOptions = {
+        "elk.algorithm": "layered",
         "elk.direction": "DOWN",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "30",
-        "elk.spacing.nodeNode": "26",
+        "elk.hierarchyHandling": "INCLUDE_CHILDREN",
+        "elk.edgeRouting": "ORTHOGONAL",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "44",
+        "elk.spacing.nodeNode": "28",
+        "elk.spacing.edgeNode": "18",
+        "elk.spacing.edgeEdge": "14",
         "elk.padding": item.data.flowContainer === "true"
-          ? "[top=38,left=24,bottom=22,right=24]"
-          : "[top=44,left=24,bottom=22,right=24]",
+          ? "[top=40,left=24,bottom=24,right=24]"
+          : "[top=46,left=24,bottom=24,right=24]",
       };
     }
     elkNodes.set(item.data.id, {
@@ -4517,8 +4667,9 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
   const rootChildren = [];
   for (const item of visibleNodes) {
     const elkNode = elkNodes.get(item.data.id);
-    const parentId = item.data.parent;
-    if (parentId && elkNodes.has(parentId)) {
+    const parentId = item.data.parent && elkNodes.has(item.data.parent) ? item.data.parent : null;
+    parentOf.set(item.data.id, parentId);
+    if (parentId) {
       elkNodes.get(parentId).children.push(elkNode);
     } else {
       rootChildren.push(elkNode);
@@ -4556,7 +4707,38 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
     computeElkSubtreeWidth(rootChild, dataById);
   }
 
-  const elkEdges = visibleEdges.map((edge) => {
+  const getAncestorsFromRoot = (id) => {
+    const chain = [];
+    let cur = id;
+    const seen = new Set();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      chain.push(cur);
+      cur = parentOf.get(cur) || null;
+    }
+    return chain.reverse();
+  };
+
+  const findFlowEdgeContainer = (srcId, tgtId) => {
+    const sParent = parentOf.get(srcId) || null;
+    const tParent = parentOf.get(tgtId) || null;
+    if (sParent && sParent === tParent) {
+      return sParent;
+    }
+    const sAnc = sParent ? getAncestorsFromRoot(sParent) : [];
+    const tAnc = tParent ? getAncestorsFromRoot(tParent) : [];
+    let lca = null;
+    for (let i = 0; i < sAnc.length && i < tAnc.length; i += 1) {
+      if (sAnc[i] === tAnc[i]) {
+        lca = sAnc[i];
+      } else {
+        break;
+      }
+    }
+    return lca || "root";
+  };
+
+  const makeElkEdge = (edge) => {
     const elkEdge = {
       id: edge.data.id,
       sources: [edge.data.source],
@@ -4573,7 +4755,25 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
       ];
     }
     return elkEdge;
-  });
+  };
+
+  const elkEdges = [];
+  for (const edge of visibleEdges) {
+    const src = edge.data.source;
+    const tgt = edge.data.target;
+    if (edge.data.kind === "flow" && elkNodes.has(src) && elkNodes.has(tgt) && src !== tgt) {
+      const ownerId = findFlowEdgeContainer(src, tgt);
+      const ownerNode = ownerId !== "root" ? elkNodes.get(ownerId) : null;
+      if (ownerNode && Array.isArray(ownerNode.children) && ownerNode.children.length > 0) {
+        if (!Array.isArray(ownerNode.edges)) {
+          ownerNode.edges = [];
+        }
+        ownerNode.edges.push(makeElkEdge(edge));
+        continue;
+      }
+    }
+    elkEdges.push(makeElkEdge(edge));
+  }
 
   const rootLayoutOptions = hasLayerContainers
     ? {
@@ -4658,6 +4858,9 @@ function estimateNodeSize(data) {
   if (data.type === "port") {
     const textLen = String(data.label || "").length;
     return { width: Math.max(135, Math.min(265, Math.round(textLen * 6.8 + 28))), height: 34 };
+  }
+  if (typeof data.elkWidth === "number" && typeof data.elkHeight === "number") {
+    return { width: data.elkWidth, height: data.elkHeight };
   }
   if (typeof data.nodeWidth === "number" && typeof data.nodeHeight === "number") {
     return { width: data.nodeWidth, height: data.nodeHeight };
@@ -4763,7 +4966,12 @@ function applyElkEdgeRoutes(
   if (!cy || !layouted) {
     return;
   }
-  cy.edges().removeClass("creation-cross-edge");
+  cy.edges().removeClass("creation-cross-edge compound-incident");
+  // Forzar recálculo inmediato de cajas compuestas (flowContainer / expandedFn) incluso dentro de cy.batch().
+  const parentNodes = cy.nodes(":parent");
+  if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
+    parentNodes.updateCompoundBounds(true);
+  }
 
   const allElkEdges = [];
   collectAllLayoutedEdges(layouted, allElkEdges);
@@ -4776,6 +4984,171 @@ function applyElkEdgeRoutes(
       macroKeyByEdgeId.set(mInfo.id, { key: mKey, info: mInfo });
     }
   }
+
+  const clearElkRoute = (cyEdge) => {
+    cyEdge.removeClass("elk-routed");
+    cyEdge.removeData("srcEndpoint tgtEndpoint");
+  };
+
+  const isContainmentPair = (a, b) => {
+    if (!a || !b || a.length === 0 || b.length === 0) {
+      return false;
+    }
+    return a.ancestors().anySame(b) || b.ancestors().anySame(a);
+  };
+
+  const getNodeGeom = (cyNode) => {
+    if (!cyNode || cyNode.length === 0) {
+      return null;
+    }
+    const id = cyNode.id();
+    const isParent = cyNode.isParent();
+    const rawPos = isParent ? cyNode.position() : (elkPositions.get(id) || cyNode.position());
+    if (!rawPos || !Number.isFinite(rawPos.x) || !Number.isFinite(rawPos.y)) {
+      return null;
+    }
+    const ow = cyNode.outerWidth();
+    const oh = cyNode.outerHeight();
+    const width = Number.isFinite(ow) && ow > 2 ? ow : 140;
+    const height = Number.isFinite(oh) && oh > 2 ? oh : 44;
+    const shape = String(cyNode.style("shape") || "round-rectangle");
+    return {
+      cx: rawPos.x,
+      cy: rawPos.y,
+      hw: width / 2,
+      hh: height / 2,
+      shape,
+      isParent,
+    };
+  };
+
+  const clampVal = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const round1 = (v) => Math.round(v * 10) / 10;
+
+  const projectPointOntoNodeBorder = (pt, refPt, geom) => {
+    const segDx = refPt.x - pt.x;
+    const segDy = refPt.y - pt.y;
+    let dx = 0;
+    let dy = 0;
+
+    if (Math.abs(segDx) <= 1.5 && Math.abs(segDy) > 0.5) {
+      const dirY = segDy >= 0 ? 1 : -1;
+      dx = clampVal(pt.x - geom.cx, -geom.hw + 1, geom.hw - 1);
+      if (geom.shape === "round-diamond" || geom.shape === "diamond") {
+        const frac = Math.min(0.96, Math.abs(dx) / Math.max(1, geom.hw));
+        dy = dirY * geom.hh * (1 - frac);
+      } else if (geom.shape === "ellipse") {
+        const frac = Math.min(0.98, Math.abs(dx) / Math.max(1, geom.hw));
+        dy = dirY * geom.hh * Math.sqrt(Math.max(0.04, 1 - frac * frac));
+      } else {
+        dy = dirY * geom.hh;
+      }
+    } else if (Math.abs(segDy) <= 1.5 && Math.abs(segDx) > 0.5) {
+      const dirX = segDx >= 0 ? 1 : -1;
+      dy = clampVal(pt.y - geom.cy, -geom.hh + 1, geom.hh - 1);
+      if (geom.shape === "round-diamond" || geom.shape === "diamond") {
+        const frac = Math.min(0.96, Math.abs(dy) / Math.max(1, geom.hh));
+        dx = dirX * geom.hw * (1 - frac);
+      } else if (geom.shape === "ellipse") {
+        const frac = Math.min(0.98, Math.abs(dy) / Math.max(1, geom.hh));
+        dx = dirX * geom.hw * Math.sqrt(Math.max(0.04, 1 - frac * frac));
+      } else {
+        dx = dirX * geom.hw;
+      }
+    } else {
+      const rx = refPt.x - geom.cx;
+      const ry = refPt.y - geom.cy;
+      if (Math.abs(rx) < 0.001 && Math.abs(ry) < 0.001) {
+        dx = 0;
+        dy = geom.hh;
+      } else if (geom.shape === "round-diamond" || geom.shape === "diamond") {
+        const denom = Math.abs(rx) / Math.max(1, geom.hw) + Math.abs(ry) / Math.max(1, geom.hh);
+        const t = denom > 0 ? 1 / denom : 0;
+        dx = rx * t;
+        dy = ry * t;
+      } else if (geom.shape === "ellipse") {
+        const denom = Math.hypot(rx / Math.max(1, geom.hw), ry / Math.max(1, geom.hh));
+        const t = denom > 0 ? 1 / denom : 0;
+        dx = rx * t;
+        dy = ry * t;
+      } else {
+        const denom = Math.max(Math.abs(rx) / Math.max(1, geom.hw), Math.abs(ry) / Math.max(1, geom.hh));
+        const t = denom > 0 ? 1 / denom : 0;
+        dx = rx * t;
+        dy = ry * t;
+      }
+    }
+
+    const rdx = round1(dx);
+    const rdy = round1(dy);
+    return {
+      x: geom.cx + rdx,
+      y: geom.cy + rdy,
+      dx: rdx,
+      dy: rdy,
+      endpointStr: `${rdx}px ${rdy}px`,
+    };
+  };
+
+  const applySafeElkSegments = (cyEdge, absPoints, srcGeom, tgtGeom) => {
+    if (!absPoints || absPoints.length < 2 || !srcGeom || !tgtGeom) {
+      return false;
+    }
+    const firstPt = absPoints[0];
+    const lastPt = absPoints[absPoints.length - 1];
+    const srcRef = absPoints[1];
+    const tgtRef = absPoints[absPoints.length - 2];
+
+    const srcEnd = projectPointOntoNodeBorder(firstPt, srcRef, srcGeom);
+    const tgtEnd = projectPointOntoNodeBorder(lastPt, tgtRef, tgtGeom);
+
+    if (
+      !Number.isFinite(srcEnd.x)
+      || !Number.isFinite(srcEnd.y)
+      || !Number.isFinite(tgtEnd.x)
+      || !Number.isFinite(tgtEnd.y)
+      || Math.hypot(tgtEnd.x - srcEnd.x, tgtEnd.y - srcEnd.y) < 2
+    ) {
+      return false;
+    }
+
+    // Pasar únicamente puntos estrictamente interiores para evitar colapso de endpoints en Cytoscape 3.30 (`badLine`).
+    let interior = [];
+    for (let i = 1; i < absPoints.length - 1; i += 1) {
+      const pt = absPoints[i];
+      if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) {
+        continue;
+      }
+      if (Math.hypot(pt.x - srcEnd.x, pt.y - srcEnd.y) < 1.5) {
+        continue;
+      }
+      if (Math.hypot(pt.x - tgtEnd.x, pt.y - tgtEnd.y) < 1.5) {
+        continue;
+      }
+      interior.push(pt);
+    }
+
+    if (interior.length === 0) {
+      interior = [
+        {
+          x: (srcEnd.x + tgtEnd.x) / 2,
+          y: (srcEnd.y + tgtEnd.y) / 2,
+        },
+      ];
+    }
+
+    const segments = convertElkPointsToCytoscapeSegments(interior, srcEnd, tgtEnd);
+    if (!segments) {
+      return false;
+    }
+
+    cyEdge.data("srcEndpoint", srcEnd.endpointStr);
+    cyEdge.data("tgtEndpoint", tgtEnd.endpointStr);
+    cyEdge.data("segWeights", segments.weights);
+    cyEdge.data("segDistances", segments.distances);
+    cyEdge.addClass("elk-routed");
+    return true;
+  };
 
   const resolveEdgeTaxiDir = (srcPos, tgtPos) => {
     if (isCreationStrict && srcPos && tgtPos) {
@@ -4816,52 +5189,42 @@ function applyElkEdgeRoutes(
     const tgtNode = cyEdge.target();
     const srcId = srcNode.id();
     const tgtId = tgtNode.id();
-    const srcPos = elkPositions.get(srcId);
-    const tgtPos = elkPositions.get(tgtId);
+    const srcGeom = getNodeGeom(srcNode);
+    const tgtGeom = getNodeGeom(tgtNode);
+    const srcPos = srcGeom ? { x: srcGeom.cx, y: srcGeom.cy } : null;
+    const tgtPos = tgtGeom ? { x: tgtGeom.cx, y: tgtGeom.cy } : null;
+
+    if (srcNode.isParent() || tgtNode.isParent()) {
+      cyEdge.addClass("compound-incident");
+    }
 
     cyEdge.data("taxiDir", resolveEdgeTaxiDir(srcPos, tgtPos));
     if (cyEdge.isLoop()) {
-      cyEdge.removeClass("elk-routed");
+      clearElkRoute(cyEdge);
       continue;
     }
 
     if (
-      srcNode.isParent()
-      || tgtNode.isParent()
+      isContainmentPair(srcNode, tgtNode)
       || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
     ) {
-      cyEdge.removeClass("elk-routed");
+      clearElkRoute(cyEdge);
       continue;
     }
 
     const section = Array.isArray(elkEdge.sections) ? elkEdge.sections[0] : null;
-    const rawBends = section && Array.isArray(section.bendPoints) ? section.bendPoints : [];
-    if (!section || !srcPos || !tgtPos) {
-      cyEdge.removeClass("elk-routed");
+    if (!section || !srcGeom || !tgtGeom) {
+      clearElkRoute(cyEdge);
       continue;
     }
 
     const edgeContainer = elkEdge.container || "root";
     const offset = (containerOffsets && containerOffsets.get(edgeContainer)) || { x: 0, y: 0 };
     const absPoints = adjustElkSectionPoints(section, edgeContainer, offset, srcId, tgtId, staggerMeta);
-    const hasPortOffset = absPoints.length >= 2 && (
-      Math.abs(absPoints[0].x - srcPos.x) > 1.5
-      || Math.abs(absPoints[absPoints.length - 1].x - tgtPos.x) > 1.5
-    );
-    if (rawBends.length === 0 && !hasPortOffset) {
-      cyEdge.removeClass("elk-routed");
-      continue;
-    }
 
-    const segments = convertElkPointsToCytoscapeSegments(absPoints, srcPos, tgtPos);
-    if (!segments) {
-      cyEdge.removeClass("elk-routed");
-      continue;
+    if (!applySafeElkSegments(cyEdge, absPoints, srcGeom, tgtGeom)) {
+      clearElkRoute(cyEdge);
     }
-
-    cyEdge.data("segWeights", segments.weights);
-    cyEdge.data("segDistances", segments.distances);
-    cyEdge.addClass("elk-routed");
   }
 
   // En modo Creación estricto, coser las aristas inter-archivo sobre los corredores macro ortogonales de ELK.
@@ -4886,19 +5249,24 @@ function applyElkEdgeRoutes(
       const tgtNode = cyEdge.target();
       const srcId = srcNode.id();
       const tgtId = tgtNode.id();
-      const srcPos = elkPositions.get(srcId);
-      const tgtPos = elkPositions.get(tgtId);
+      const srcGeom = getNodeGeom(srcNode);
+      const tgtGeom = getNodeGeom(tgtNode);
+      const srcPos = srcGeom ? { x: srcGeom.cx, y: srcGeom.cy } : null;
+      const tgtPos = tgtGeom ? { x: tgtGeom.cx, y: tgtGeom.cy } : null;
+
+      if (srcNode.isParent() || tgtNode.isParent()) {
+        cyEdge.addClass("compound-incident");
+      }
 
       cyEdge.data("taxiDir", resolveEdgeTaxiDir(srcPos, tgtPos));
       if (
         cyEdge.isLoop()
-        || srcNode.isParent()
-        || tgtNode.isParent()
-        || !srcPos
-        || !tgtPos
+        || isContainmentPair(srcNode, tgtNode)
+        || !srcGeom
+        || !tgtGeom
         || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
       ) {
-        cyEdge.removeClass("elk-routed");
+        clearElkRoute(cyEdge);
         continue;
       }
 
@@ -4919,19 +5287,13 @@ function applyElkEdgeRoutes(
         meta.tgtEnclosing,
       );
       if (!absPoints || absPoints.length < 2) {
-        cyEdge.removeClass("elk-routed");
+        clearElkRoute(cyEdge);
         continue;
       }
 
-      const segments = convertElkPointsToCytoscapeSegments(absPoints, srcPos, tgtPos);
-      if (!segments) {
-        cyEdge.removeClass("elk-routed");
-        continue;
+      if (!applySafeElkSegments(cyEdge, absPoints, srcGeom, tgtGeom)) {
+        clearElkRoute(cyEdge);
       }
-
-      cyEdge.data("segWeights", segments.weights);
-      cyEdge.data("segDistances", segments.distances);
-      cyEdge.addClass("elk-routed");
     }
   }
 }
@@ -8237,9 +8599,11 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
           "elk.direction": "DOWN",
           "elk.hierarchyHandling": "INCLUDE_CHILDREN",
           "elk.edgeRouting": "ORTHOGONAL",
-          "elk.layered.spacing.nodeNodeBetweenLayers": "32",
-          "elk.spacing.nodeNode": "26",
-          "elk.padding": "[top=20,left=20,bottom=20,right=20]",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "44",
+          "elk.spacing.nodeNode": "28",
+          "elk.spacing.edgeNode": "18",
+          "elk.spacing.edgeEdge": "14",
+          "elk.padding": "[top=22,left=22,bottom=22,right=22]",
         }
       : {
           "elk.algorithm": "layered",
@@ -8282,6 +8646,8 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
         cyNode.position(pos);
       }
     });
+  });
+  subCy.batch(() => {
     applyElkEdgeRoutes(
       subCy,
       layouted,
