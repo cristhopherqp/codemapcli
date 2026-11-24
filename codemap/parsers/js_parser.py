@@ -32,6 +32,8 @@ from codemap.models import (
     FunctionInfo,
     HtmlRef,
     ImportBinding,
+    VariableInfo,
+    VarRefSite,
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
@@ -42,6 +44,7 @@ from codemap.parsers.common import (
     PendingExit,
     collect_metrics,
     collapse_whitespace,
+    compute_variable_fingerprint,
     contains_type,
     dedent_code,
     end_line_of,
@@ -50,6 +53,7 @@ from codemap.parsers.common import (
     first_capture,
     flow_label,
     format_compacted_step_label,
+    format_value_preview,
     iter_body_nodes,
     line_of,
     node_key,
@@ -308,6 +312,12 @@ def parse_js_file(path: str, source: bytes, language: str) -> FileAnalysis:
         file_doc_key=file_doc_key,
     )
     analysis.class_names = {cls.qualname for cls in analysis.classes}
+    analysis.variables = collect_top_level_variables(
+        root,
+        source,
+        function_nodes,
+        file_doc_key=file_doc_key,
+    )
     analysis.imports = collect_imports(root, source, language)
     analysis.default_export = default_name
     analysis.module_calls = module_calls
@@ -611,6 +621,399 @@ def collect_class_names(
 
 
 # ---------------------------------------------------------------------------
+# Variables / constantes top-level JS/TS y lecturas léxicas con anti-sombreado
+# ---------------------------------------------------------------------------
+
+_JS_NON_VAR_IDENTS = frozenset(
+    {
+        "true", "false", "null", "undefined", "this", "super", "arguments",
+        "NaN", "Infinity", "console", "Math", "JSON", "Object", "Array",
+        "Promise", "Number", "String", "Boolean", "Date", "RegExp", "Symbol",
+        "Reflect", "Map", "Set", "WeakMap", "WeakSet", "Error", "TypeError",
+        "RangeError", "SyntaxError", "URL", "URLSearchParams", "Intl",
+        "window", "document", "globalThis", "global", "process", "navigator",
+        "localStorage", "sessionStorage", "fetch", "setTimeout", "setInterval",
+        "clearTimeout", "clearInterval", "requestAnimationFrame", "module", "exports",
+    }
+)
+_JS_FUNCTION_OR_CLASS_VALUE_TYPES = frozenset(
+    {"arrow_function", "function_expression", "generator_function", "class"}
+)
+
+
+def _is_require_call(val_node: Node | None, source: bytes) -> bool:
+    if val_node is None or val_node.type != "call_expression":
+        return False
+    fn = val_node.child_by_field_name("function")
+    return fn is not None and fn.type == "identifier" and node_text(fn, source) == "require"
+
+
+def _collect_js_pattern_idents(node: Node | None, source: bytes, out: list[str]) -> None:
+    """Extrae los nombres enlazados en un patrón JS/TS (identifier, destructuring objeto/array, rest, default)."""
+    if node is None:
+        return
+    ntype = node.type
+    if ntype in ("identifier", "shorthand_property_identifier_pattern"):
+        name = node_text(node, source)
+        if name:
+            out.append(name)
+        return
+    if ntype in ("assignment_pattern", "required_parameter", "optional_parameter"):
+        target = node.child_by_field_name("left") or node.child_by_field_name("pattern")
+        if target is None:
+            for ch in node.named_children:
+                if ch.type not in ("type_annotation", "accessibility_modifier", "override_modifier"):
+                    target = ch
+                    break
+        _collect_js_pattern_idents(target, source, out)
+        return
+    if ntype == "pair_pattern":
+        _collect_js_pattern_idents(node.child_by_field_name("value"), source, out)
+        return
+    if ntype in ("rest_pattern", "object_pattern", "array_pattern", "formal_parameters"):
+        for ch in node.named_children:
+            if ch.type not in ("comment", "type_annotation"):
+                _collect_js_pattern_idents(ch, source, out)
+
+
+def collect_top_level_variables(
+    root: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, FunctionNode],
+    *,
+    file_doc_key: NodeKey | None = None,
+) -> list[VariableInfo]:
+    """Extrae únicamente constantes/variables/enums declarados en la raíz del programa JS/TS."""
+    variables: list[VariableInfo] = []
+    seen: set[str] = set()
+
+    for child in root.named_children:
+        stmt = child
+        anchor_outer = child
+        if stmt.type == "export_statement":
+            inner_decl = stmt.child_by_field_name("declaration")
+            if inner_decl is None:
+                continue
+            stmt = inner_decl
+
+        if stmt.type == "enum_declaration":
+            name_node = stmt.child_by_field_name("name")
+            if name_node is None:
+                continue
+            short_name = node_text(name_node, source)
+            if not short_name or short_name in seen:
+                continue
+            seen.add(short_name)
+            body = stmt.child_by_field_name("body")
+            preview = format_value_preview(short_name, node_text(body, source) if body is not None else "enum")
+            doc = extract_jsdoc(stmt, source, file_doc_key=file_doc_key)
+            variables.append(
+                VariableInfo(
+                    qualname=short_name,
+                    short_name=short_name,
+                    kind="constant",
+                    line=line_of(anchor_outer),
+                    end_line=end_line_of(stmt),
+                    value_preview=preview,
+                    docstring=doc,
+                    type_annotation="enum",
+                    fingerprint=compute_variable_fingerprint(short_name, "constant", "enum", preview),
+                )
+            )
+            continue
+
+        if stmt.type not in ("lexical_declaration", "variable_declaration"):
+            continue
+
+        decl_head = node_text(stmt, source).lstrip()
+        is_const = decl_head.startswith("const ") or decl_head.startswith("const\t") or decl_head.startswith("const\n")
+        var_kind = "constant" if is_const else "variable"
+
+        for decl in stmt.named_children:
+            if decl.type != "variable_declarator":
+                continue
+            name_node = decl.child_by_field_name("name")
+            val_node = decl.child_by_field_name("value")
+            type_node = decl.child_by_field_name("type")
+            if name_node is None:
+                continue
+            if _is_require_call(val_node, source):
+                continue
+            if val_node is not None and (
+                node_key(val_node) in function_nodes or val_node.type in _JS_FUNCTION_OR_CLASS_VALUE_TYPES
+            ):
+                continue
+
+            bound_names: list[str] = []
+            _collect_js_pattern_idents(name_node, source, bound_names)
+            if not bound_names:
+                continue
+
+            type_ann = ""
+            if type_node is not None:
+                type_ann = collapse_whitespace(node_text(type_node, source)).lstrip(":").strip()
+            raw_val = node_text(val_node, source) if val_node is not None else ""
+            doc = extract_jsdoc(decl, source, file_doc_key=file_doc_key)
+            start_line = line_of(decl)
+            end_line = end_line_of(decl)
+
+            for short_name in bound_names:
+                if short_name in seen:
+                    continue
+                seen.add(short_name)
+                preview = format_value_preview(short_name, raw_val)
+                variables.append(
+                    VariableInfo(
+                        qualname=short_name,
+                        short_name=short_name,
+                        kind=var_kind,
+                        line=start_line,
+                        end_line=end_line,
+                        value_preview=preview,
+                        docstring=doc,
+                        type_annotation=type_ann,
+                        fingerprint=compute_variable_fingerprint(short_name, var_kind, type_ann, preview),
+                    )
+                )
+
+    return variables
+
+
+def _collect_js_hoisted_var_bindings(
+    body: Node | None,
+    source: bytes,
+    function_nodes: dict[NodeKey, FunctionNode],
+) -> set[str]:
+    """Recolecta declaraciones `var` y `function` hoisted en el ámbito de la función sin bajar a anidadas."""
+    hoisted: set[str] = set()
+    if body is None:
+        return hoisted
+    stack: list[Node] = [body]
+    while stack:
+        cur = stack.pop()
+        ctype = cur.type
+        if ctype == "variable_declaration":
+            for decl in cur.named_children:
+                if decl.type == "variable_declarator":
+                    names: list[str] = []
+                    _collect_js_pattern_idents(decl.child_by_field_name("name"), source, names)
+                    hoisted.update(names)
+        elif ctype in ("function_declaration", "generator_function_declaration") and cur is not body:
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None:
+                hoisted.add(node_text(name_node, source))
+            continue
+        elif ctype in CLASS_TYPES:
+            continue
+        for ch in reversed(cur.named_children):
+            if node_key(ch) in function_nodes:
+                if ch.type in ("function_declaration", "generator_function_declaration"):
+                    name_node = ch.child_by_field_name("name")
+                    if name_node is not None:
+                        hoisted.add(node_text(name_node, source))
+                continue
+            stack.append(ch)
+    return hoisted
+
+
+def _collect_js_block_direct_bindings(block_node: Node, source: bytes) -> set[str]:
+    """Nombres `const`/`let`/`class`/`function`/`catch` declarados directamente en este bloque."""
+    bindings: set[str] = set()
+    if block_node.type == "catch_clause":
+        param = block_node.child_by_field_name("parameter")
+        names: list[str] = []
+        _collect_js_pattern_idents(param, source, names)
+        bindings.update(names)
+        return bindings
+
+    for ch in block_node.named_children:
+        if ch.type == "lexical_declaration":
+            for decl in ch.named_children:
+                if decl.type == "variable_declarator":
+                    names = []
+                    _collect_js_pattern_idents(decl.child_by_field_name("name"), source, names)
+                    bindings.update(names)
+        elif ch.type in ("class_declaration", "abstract_class_declaration", "function_declaration", "generator_function_declaration"):
+            name_node = ch.child_by_field_name("name")
+            if name_node is not None:
+                bindings.add(node_text(name_node, source))
+    return bindings
+
+
+def collect_js_var_refs(
+    fn_node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, FunctionNode],
+) -> list[VarRefSite]:
+    """Recolecta lecturas libres a constantes/variables top-level respetando pila de ámbitos JS/TS."""
+    body = fn_node.child_by_field_name("body")
+    if body is None:
+        return []
+
+    param_list: list[str] = []
+    params_node = fn_node.child_by_field_name("parameters") or fn_node.child_by_field_name("parameter")
+    _collect_js_pattern_idents(params_node, source, param_list)
+    hoisted = _collect_js_hoisted_var_bindings(body, source, function_nodes)
+    fn_scope = set(param_list) | hoisted
+
+    refs: list[VarRefSite] = []
+    seen: set[tuple[str, int]] = set()
+    scope_stack: list[set[str]] = [fn_scope]
+
+    def is_shadowed(ident: str) -> bool:
+        return any(ident in scope for scope in scope_stack)
+
+    def emit(name: str, line: int, *, is_write: bool = False) -> None:
+        if not name or name in _JS_NON_VAR_IDENTS:
+            return
+        key = (name, line)
+        if key not in seen:
+            seen.add(key)
+            refs.append(VarRefSite(name=name, line=line, is_write=is_write))
+
+    def walk(node: Node) -> None:
+        if node_key(node) in function_nodes and node is not fn_node:
+            return
+        ntype = node.type
+        if ntype in (
+            "comment",
+            "type_annotation",
+            "type_arguments",
+            "type_parameters",
+            "type_identifier",
+            "property_identifier",
+            "import_statement",
+            "class_declaration",
+            "abstract_class_declaration",
+            "class",
+        ):
+            return
+
+        if ntype == "statement_block":
+            scope_stack.append(_collect_js_block_direct_bindings(node, source))
+            try:
+                for ch in node.named_children:
+                    walk(ch)
+            finally:
+                scope_stack.pop()
+            return
+
+        if ntype in ("for_statement", "for_in_statement"):
+            loop_scope: set[str] = set()
+            init = node.child_by_field_name("initializer") or node.child_by_field_name("left")
+            if init is not None:
+                if init.type == "lexical_declaration":
+                    for decl in init.named_children:
+                        if decl.type == "variable_declarator":
+                            names: list[str] = []
+                            _collect_js_pattern_idents(decl.child_by_field_name("name"), source, names)
+                            loop_scope.update(names)
+                elif init.type in ("identifier", "object_pattern", "array_pattern"):
+                    # `for (const x of ARR)` puede exponer `left` como `identifier` con keyword `const`/`let` hermano.
+                    raw_head = node_text(node, source)
+                    if re.match(r"^for\s*(?:await\s*)?\(\s*(?:const|let)\b", raw_head):
+                        names = []
+                        _collect_js_pattern_idents(init, source, names)
+                        loop_scope.update(names)
+            scope_stack.append(loop_scope)
+            try:
+                for ch in node.named_children:
+                    if ntype == "for_in_statement" and ch == init:
+                        continue
+                    walk(ch)
+            finally:
+                scope_stack.pop()
+            return
+
+        if ntype == "catch_clause":
+            scope_stack.append(_collect_js_block_direct_bindings(node, source))
+            try:
+                cbody = node.child_by_field_name("body")
+                if cbody is not None:
+                    walk(cbody)
+            finally:
+                scope_stack.pop()
+            return
+
+        if ntype == "variable_declarator":
+            val = node.child_by_field_name("value")
+            if val is not None:
+                walk(val)
+            return
+
+        if ntype == "pair":
+            # En `{ key: val }`, `key` literal no es lectura (salvo `computed_property_name`), solo `value`.
+            key_node = node.child_by_field_name("key")
+            val_node = node.child_by_field_name("value")
+            if key_node is not None and key_node.type == "computed_property_name":
+                walk(key_node)
+            if val_node is not None:
+                walk(val_node)
+            return
+
+        if ntype == "shorthand_property_identifier":
+            name = node_text(node, source)
+            if not is_shadowed(name):
+                emit(name, line_of(node))
+            return
+
+        if ntype in ("call_expression", "new_expression"):
+            fn_expr = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+            args = node.child_by_field_name("arguments")
+            if fn_expr is not None and fn_expr.type != "identifier":
+                walk(fn_expr)
+            if args is not None:
+                walk(args)
+            return
+
+        if ntype == "member_expression":
+            obj = node.child_by_field_name("object")
+            prop = node.child_by_field_name("property")
+            if obj is not None and obj.type == "identifier":
+                obj_name = node_text(obj, source)
+                if obj_name not in _JS_NON_VAR_IDENTS and not is_shadowed(obj_name):
+                    ln = line_of(node)
+                    if prop is not None and prop.type in ("property_identifier", "identifier"):
+                        emit(f"{obj_name}.{node_text(prop, source)}", ln)
+                    emit(obj_name, ln)
+            elif obj is not None:
+                walk(obj)
+            return
+
+        if ntype in ("as_expression", "satisfies_expression"):
+            expr = node.named_children[0] if node.named_child_count > 0 else None
+            if expr is not None:
+                walk(expr)
+            return
+
+        if ntype == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None:
+                if left.type == "identifier":
+                    name = node_text(left, source)
+                    if not is_shadowed(name):
+                        emit(name, line_of(left), is_write=True)
+                else:
+                    walk(left)
+            if right is not None:
+                walk(right)
+            return
+
+        if ntype == "identifier":
+            name = node_text(node, source)
+            if not is_shadowed(name):
+                emit(name, line_of(node))
+            return
+
+        for ch in node.named_children:
+            walk(ch)
+
+    walk(body)
+    return refs
+
+
+# ---------------------------------------------------------------------------
 # Ámbitos y construcción de FunctionInfo
 # ---------------------------------------------------------------------------
 
@@ -698,6 +1101,7 @@ def build_function(
         docstring=extract_jsdoc(candidate.anchor, source, file_doc_key=file_doc_key),
         param_count=len(params),
         calls=calls,
+        var_refs=collect_js_var_refs(node, source, functions),
         internal_flow=build_flow(
             params,
             body,
@@ -761,12 +1165,23 @@ def _node_declares_function_or_class(node: Node, function_nodes: dict[NodeKey, F
     return False
 
 
+def _node_declares_top_level_variable_or_enum(node: Node) -> bool:
+    """True si la sentencia declara una constante/variable/enum top-level que reclamaría un JSDoc `/**`."""
+    stmt = node
+    if stmt.type == "export_statement":
+        inner = stmt.child_by_field_name("declaration")
+        if inner is None:
+            return False
+        stmt = inner
+    return stmt.type in ("lexical_declaration", "variable_declaration", "enum_declaration")
+
+
 def extract_file_docstring(
     root: Node | None,
     source: bytes,
     function_nodes: dict[NodeKey, FunctionNode],
 ) -> tuple[str, NodeKey | None]:
-    """Extrae el docstring/comentario JSDoc o de cabecera de un archivo JS/TS sin robar JSDoc de funciones."""
+    """Extrae el docstring/comentario JSDoc o de cabecera de un archivo JS/TS sin robar JSDoc de declaraciones."""
     if root is None or root.named_child_count == 0:
         return "", None
 
@@ -797,8 +1212,11 @@ def extract_file_docstring(
 
     if not has_file_tag and next_sib is not None:
         line_gap = next_sib.start_point[0] - candidate.end_point[0]
-        if line_gap < 2 and _node_declares_function_or_class(next_sib, function_nodes):
-            return "", None
+        if line_gap < 2:
+            if _node_declares_function_or_class(next_sib, function_nodes):
+                return "", None
+            if raw.startswith("/**") and _node_declares_top_level_variable_or_enum(next_sib):
+                return "", None
 
     inner = raw[3:-2] if raw.startswith("/**") else raw[2:-2]
     cleaned_lines: list[str] = []

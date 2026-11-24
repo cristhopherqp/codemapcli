@@ -81,6 +81,7 @@ const ROLE_LABELS = {
   io: "I/O",
   module: "Módulo",
   file: "Archivo",
+  variable: "Constante / Variable",
   flow: "Paso",
 };
 
@@ -92,6 +93,7 @@ const EDGE_TYPE_META = {
   reactive_trigger: { label: "Disparo reactivo", short: "reactivo", icon: "↻" },
   serves_html: { label: "Sirve documento HTML", short: "HTML", icon: "🌐" },
   loads_script: { label: "Carga script", short: "script", icon: "📜" },
+  reads_var: { label: "Lectura de variable/constante", short: "lee", icon: "🔖" },
 };
 
 const EDGE_TYPE_PRIORITY = {
@@ -102,6 +104,7 @@ const EDGE_TYPE_PRIORITY = {
   reactive_subscribe: 4,
   callback_ref: 5,
   reactive_trigger: 6,
+  reads_var: 7,
 };
 
 const ENTRY_KIND_LABELS = {
@@ -178,6 +181,8 @@ const state = {
   utilityNodeIds: new Set(),
   utilityDetectionMode: "strict",
   hideUtilities: false,
+  showVariables: false,
+  totalVariables: 0,
   utilityCalleesByNode: new Map(),
   collapsedContainers: new Set(),
   expandedFunctions: new Set(),
@@ -241,6 +246,7 @@ async function initViewer() {
   renderHeader(state.rawGraph.meta, state.rawGraph.edges.length);
   populateFlowSelector();
   updateUtilitiesButton();
+  updateVariablesButton();
   updateOrphansBadge();
   updateKnownApisButton();
   updateLayoutOrderButton();
@@ -312,6 +318,7 @@ async function applyLiveUpdate(newGraph, newNotes) {
   renderHeader(state.rawGraph.meta, state.rawGraph.edges.length);
   populateFlowSelector();
   updateUtilitiesButton();
+  updateVariablesButton();
   updateOrphansBadge();
   updateKnownApisButton();
 
@@ -378,6 +385,7 @@ function indexGraph(graph) {
       state.flowsById.set(flow.id, flow);
     }
   }
+  state.totalVariables = (graph.nodes || []).filter((n) => n.type === "variable").length;
   computeUtilityNodes(graph);
 }
 
@@ -512,6 +520,48 @@ async function toggleHideUtilities() {
   await refreshGraphView({ fit: false });
   if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
     selectNode(state.selectedNodeId, state.activeFlowStepId);
+  }
+}
+
+function updateVariablesButton() {
+  const btn = document.getElementById("btn-toggle-variables");
+  const labelEl = document.getElementById("variables-label-text");
+  const badgeEl = document.getElementById("variables-count-badge");
+  if (!btn) {
+    return;
+  }
+  const count = state.totalVariables || 0;
+  if (labelEl) {
+    labelEl.textContent = state.showVariables
+      ? `Ocultar constantes (${count})`
+      : `Mostrar constantes (${count})`;
+  }
+  if (badgeEl) {
+    badgeEl.textContent = count > 0 ? String(count) : "";
+    badgeEl.classList.toggle("hidden", count === 0);
+  }
+  btn.classList.toggle("active", state.showVariables);
+  btn.setAttribute("aria-pressed", state.showVariables ? "true" : "false");
+  btn.disabled = count === 0 && !state.showVariables;
+  btn.title = count > 0
+    ? `${state.showVariables ? "Ocultar" : "Mostrar"} ${count} constantes y variables top-level en el lienzo`
+    : "No se detectaron constantes ni variables top-level en este proyecto";
+}
+
+async function toggleShowVariables() {
+  if ((state.totalVariables || 0) === 0 && !state.showVariables) {
+    return;
+  }
+  state.showVariables = !state.showVariables;
+  updateVariablesButton();
+  await refreshGraphView({ fit: false });
+  if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+    const selectedRaw = state.nodesById.get(state.selectedNodeId);
+    if (!state.showVariables && selectedRaw && selectedRaw.type === "variable") {
+      clearSelectionPanel();
+    } else {
+      selectNode(state.selectedNodeId, state.activeFlowStepId);
+    }
   }
 }
 
@@ -955,6 +1005,9 @@ function computeNHopsSubgraph() {
     if (src === tgt) {
       continue;
     }
+    if (!state.showVariables && edge.edge_type === "reads_var" && !anchorSet.has(src) && !anchorSet.has(tgt)) {
+      continue;
+    }
     if (!anchorSet.has(src) && isUtilityNodeHidden(src, activeFlowNodeSet)) {
       continue;
     }
@@ -1044,7 +1097,7 @@ function updateExploreNHopsButton(node) {
   if (!btn) {
     return;
   }
-  if (!node || (node.type !== "function" && node.type !== "file")) {
+  if (!node || (node.type !== "function" && node.type !== "file" && node.type !== "variable")) {
     btn.disabled = true;
     btn.textContent = "🔭 Vecindad";
     btn.classList.remove("active");
@@ -1062,6 +1115,16 @@ async function activateNHops(anchorIds, { forwardDepth = 1, backwardDepth = 1, a
   const validAnchors = (anchorIds || []).filter((id) => state.nodesById.has(id));
   if (validAnchors.length === 0) {
     return;
+  }
+  if (
+    !state.showVariables
+    && validAnchors.some((id) => {
+      const n = state.nodesById.get(id);
+      return n && n.type === "variable";
+    })
+  ) {
+    state.showVariables = true;
+    updateVariablesButton();
   }
   state.nhops = {
     active: true,
@@ -1679,6 +1742,10 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
     if (rawNode.type === "module") {
       continue;
     }
+    if (rawNode.type === "variable" && !state.showVariables) {
+      hiddenNodeIds.add(rawNode.id);
+      continue;
+    }
     if (subgraphFilter && !subgraphFilter.allowedNodeIds.has(rawNode.id)) {
       continue;
     }
@@ -1697,15 +1764,19 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
       if (rawNode.type === "file") {
         membersByLayer.get(layerIdx).push(rawNode);
         fnCountByLayer.set(layerIdx, fnCountByLayer.get(layerIdx) + Math.max(1, countDescendantFunctions(rawNode.id)));
-      } else if (rawNode.type === "function") {
-        // Si el usuario expandió manualmente un archivo en N2, mostramos sus funciones dentro del archivo.
+      } else if (rawNode.type === "function" || rawNode.type === "variable") {
+        // Si el usuario expandió manualmente un archivo en N2, mostramos sus hijos dentro del archivo.
         const parentFile = state.nodesById.get(rawNode.parent);
         if (parentFile && !state.collapsedContainers.has(parentFile.id)) {
           const parentLayer = getNodeArchLayer(parentFile);
           membersByLayer.get(parentLayer).push(rawNode);
         }
       }
-    } else if (rawNode.type === "function" || (rawNode.type === "file" && directEdgeFileIds.has(rawNode.id))) {
+    } else if (
+      rawNode.type === "function"
+      || rawNode.type === "variable"
+      || (rawNode.type === "file" && directEdgeFileIds.has(rawNode.id))
+    ) {
       membersByLayer.get(layerIdx).push(rawNode);
       if (rawNode.type === "function") {
         fnCountByLayer.set(layerIdx, fnCountByLayer.get(layerIdx) + 1);
@@ -1757,7 +1828,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
       const isPinnedHere = !subgraphFilter && isPinnedInCurrentContext(noteEntry);
 
       let parentId = layer.id;
-      if (isFileTier && rawNode.type === "function" && visibleNodeIds.has(rawNode.parent)) {
+      if (isFileTier && (rawNode.type === "function" || rawNode.type === "variable") && visibleNodeIds.has(rawNode.parent)) {
         parentId = rawNode.parent;
       }
 
@@ -1769,7 +1840,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
         stepOrder,
         activeFlowNodeSet,
       );
-      if (!isFileTier && rawNode.type === "function" && rawNode.parent) {
+      if (!isFileTier && (rawNode.type === "function" || rawNode.type === "variable") && rawNode.parent) {
         const fileBase = rawNode.parent.split("/").pop() || rawNode.parent;
         displayLabel = `${fileBase} :: ${displayLabel}`;
       }
@@ -1782,6 +1853,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
           label: displayLabel,
           type: rawNode.type,
           role: effectiveRole,
+          varKind: rawNode.var_kind || "constant",
           entryKind: rawNode.entry_kind || "",
           fileLang: rawNode.language || "",
           mainEntry: rawNode.is_main_entry ? "true" : "false",
@@ -1827,6 +1899,10 @@ function buildVisibleElements() {
   const nodes = [];
 
   for (const rawNode of state.rawGraph.nodes) {
+    if (rawNode.type === "variable" && !state.showVariables) {
+      hiddenNodeIds.add(rawNode.id);
+      continue;
+    }
     if (subgraphFilter && !subgraphFilter.allowedNodeIds.has(rawNode.id)) {
       continue;
     }
@@ -1860,6 +1936,7 @@ function buildVisibleElements() {
         ),
         type: rawNode.type,
         role: effectiveRole,
+        varKind: rawNode.var_kind || "constant",
         entryKind: rawNode.entry_kind || "",
         fileLang: rawNode.language || "",
         mainEntry: rawNode.is_main_entry ? "true" : "false",
@@ -2205,6 +2282,9 @@ function projectEdges(
   const grouped = new Map();
 
   for (const edge of state.rawGraph.edges) {
+    if (!state.showVariables && edge.edge_type === "reads_var") {
+      continue;
+    }
     if (allowedRawEdgeIds && !allowedRawEdgeIds.has(edge.id)) {
       continue;
     }
@@ -2423,15 +2503,16 @@ function resolveTooltipNode(cyNode) {
     return null;
   }
   const data = cyNode.data();
-  if (data.type !== "function" && data.type !== "file") {
+  if (data.type !== "function" && data.type !== "file" && data.type !== "variable") {
     return null;
   }
   const raw = state.nodesById.get(data.id);
-  if (!raw || (raw.type !== "function" && raw.type !== "file")) {
+  if (!raw || (raw.type !== "function" && raw.type !== "file" && raw.type !== "variable")) {
     return null;
   }
   const doc = (raw.docstring || "").trim();
-  if (!doc) {
+  const preview = raw.type === "variable" ? (raw.value_preview || "").trim() : "";
+  if (!doc && !preview) {
     return null;
   }
   return raw;
@@ -2444,19 +2525,28 @@ function showNodeTooltip(rawNode, renderedPos, containerEl = null) {
     return;
   }
   const doc = (rawNode.docstring || "").trim();
-  if (!doc) {
+  const preview = rawNode.type === "variable" ? (rawNode.value_preview || "").trim() : "";
+  const bodyText = doc && preview
+    ? `${doc}\n\n= ${preview}`
+    : (doc || (preview ? `= ${preview}` : ""));
+  if (!bodyText) {
     hideNodeTooltip();
     return;
   }
 
   hideEdgeTooltip();
-  const kindLabel = rawNode.type === "file" ? "Archivo" : "Función";
+  let kindLabel = "Función";
+  if (rawNode.type === "file") {
+    kindLabel = "Archivo";
+  } else if (rawNode.type === "variable") {
+    kindLabel = rawNode.var_kind === "variable" ? "Variable" : "Constante";
+  }
   tip.innerHTML = `
     <div class="node-tooltip-header">
       <span class="node-tooltip-kind">${escapeHtml(kindLabel)}</span>
       <span class="node-tooltip-title">${escapeHtml(rawNode.label || rawNode.id)}</span>
     </div>
-    <div class="node-tooltip-body">${escapeHtml(doc)}</div>
+    <div class="node-tooltip-body">${escapeHtml(bodyText)}</div>
   `;
   tip.classList.remove("hidden");
 
@@ -3385,6 +3475,35 @@ function buildStylesheet() {
       },
     },
     {
+      selector: 'node[type = "variable"]',
+      style: {
+        "shape": "round-rectangle",
+        "label": "data(label)",
+        "color": "#a5f3fc",
+        "font-size": 10.5,
+        "font-family": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        "text-valign": "center",
+        "text-halign": "center",
+        "text-wrap": "wrap",
+        "text-max-width": 165,
+        "background-color": "#0e2230",
+        "border-color": "#06b6d4",
+        "border-style": "dashed",
+        "border-width": 1.6,
+        "width": "label",
+        "height": "label",
+        "padding": 7,
+      },
+    },
+    {
+      selector: 'node[type = "variable"][varKind = "variable"]',
+      style: {
+        "color": "#fef08a",
+        "background-color": "#231e0d",
+        "border-color": "#eab308",
+      },
+    },
+    {
       selector: 'node[type = "flow"]',
       style: {
         "label": "data(label)",
@@ -3679,6 +3798,27 @@ function buildStylesheet() {
         "target-arrow-shape": "chevron",
         "color": "#a7f3d0",
         "font-weight": "bold",
+      },
+    },
+    {
+      selector: 'edge[kind = "call"][edgeType = "reads_var"]',
+      style: {
+        "width": 1.3,
+        "line-style": "dotted",
+        "line-color": "#22d3ee",
+        "target-arrow-color": "#22d3ee",
+        "target-arrow-shape": "vee",
+        "arrow-scale": 0.78,
+        "opacity": 0.58,
+        "color": "#a5f3fc",
+      },
+    },
+    {
+      selector: 'edge[kind = "call"][edgeType = "reads_var"]:selected',
+      style: {
+        "opacity": 1,
+        "width": 2.2,
+        "z-index": 25,
       },
     },
     {
@@ -4056,7 +4196,7 @@ function applyCreationRowStagger(
           return false;
         }
         const d = dataById.get(child.id);
-        return Boolean(d && d.type === "function");
+        return Boolean(d && (d.type === "function" || d.type === "variable"));
       });
 
       const staggerById = new Map();
@@ -4241,7 +4381,10 @@ function computeCreationPartition(nodeId, dataById, childrenByParent = null) {
         if (childData && childData.type === "file" && typeof childData.archLayer === "number") {
           allFileLayers.push(childData.archLayer);
           const fileKids = childrenByParent.get(child.id) || [];
-          if (fileKids.some((k) => (dataById.get(k.id) || {}).type === "function")) {
+          if (fileKids.some((k) => {
+            const t = (dataById.get(k.id) || {}).type;
+            return t === "function" || t === "variable";
+          })) {
             nonEmptyFileLayers.push(childData.archLayer);
           }
         } else {
@@ -4625,7 +4768,10 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
   // Configurar contenedores jerárquicos (root, module, layer, file, expandedFn).
   const rootNonPort = rootChildren.filter((c) => (dataById.get(c.id) || {}).type !== "port");
   const rootHasOnlyFunctions = rootNonPort.length > 0
-    && rootNonPort.every((c) => (dataById.get(c.id) || {}).type === "function");
+    && rootNonPort.every((c) => {
+      const t = (dataById.get(c.id) || {}).type;
+      return t === "function" || t === "variable";
+    });
 
   if (rootHasOnlyFunctions) {
     configureFunctionContainer("root", rootChildren, null);
@@ -4658,7 +4804,7 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
     if (elkNode.children.length > 0) {
       const childTypes = elkNode.children.map((c) => (dataById.get(c.id) || {}).type);
       const isFileOrFnLayer = d.type === "file"
-        || (d.type === "layer" && childTypes.some((t) => t === "function"));
+        || (d.type === "layer" && childTypes.some((t) => t === "function" || t === "variable"));
       if (isFileOrFnLayer) {
         configureFunctionContainer(id, elkNode.children, d.type === "layer" ? 4 : null);
         const directEdges = directEdgesByContainer.get(id) || [];
@@ -5574,6 +5720,13 @@ function estimateNodeSize(data) {
   }
   if (data.type === "flow") {
     return estimateFlowStepSize(data.role, data.flowKind || "step", data.label);
+  }
+  if (data.type === "variable") {
+    const textLen = String(data.label || "").length;
+    return {
+      width: Math.max(94, Math.min(200, Math.round(textLen * 7 + 28))),
+      height: 30,
+    };
   }
   const { lineCount, longestLine } = estimateWrappedTextMetrics(data.label, 25);
   const width = Math.max(125, Math.min(245, longestLine * 7.5 + 36));
@@ -6768,6 +6921,179 @@ function updateFileFunctionsBlock(node) {
   block.classList.remove("hidden");
 }
 
+function updateFileVariablesBlock(node) {
+  const block = document.getElementById("detail-file-variables-block");
+  const titleEl = document.getElementById("detail-file-variables-title");
+  const list = document.getElementById("detail-file-variables-list");
+  if (!block || !list) {
+    return;
+  }
+  list.innerHTML = "";
+  if (!node || node.type !== "file" || !state.rawGraph) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  const fileVars = (state.rawGraph.nodes || [])
+    .filter((item) => item.type === "variable" && item.parent === node.id)
+    .sort((a, b) => (a.line || 0) - (b.line || 0) || a.id.localeCompare(b.id));
+
+  if (fileVars.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  if (titleEl) {
+    titleEl.textContent = `Constantes / Variables en "${node.label}" (${fileVars.length})`;
+  }
+
+  fileVars.forEach((varNode, idx) => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "file-fn-item";
+    btn.title = varNode.value_preview
+      ? `${varNode.label} = ${varNode.value_preview}`
+      : varNode.id;
+
+    const indexSpan = document.createElement("span");
+    indexSpan.className = "file-fn-index";
+    indexSpan.textContent = `${idx + 1}.`;
+
+    const roleDot = document.createElement("span");
+    roleDot.className = `file-fn-role-dot role-${varNode.var_kind === "variable" ? "variable" : "constant"}`;
+    roleDot.setAttribute("aria-hidden", "true");
+
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "file-fn-name";
+    nameSpan.textContent = varNode.label || varNode.id;
+
+    const lineSpan = document.createElement("span");
+    lineSpan.className = "file-fn-line";
+    lineSpan.textContent = varNode.line ? `L${varNode.line}` : "";
+
+    btn.appendChild(indexSpan);
+    btn.appendChild(roleDot);
+    btn.appendChild(nameSpan);
+    if (varNode.line) {
+      btn.appendChild(lineSpan);
+    }
+    btn.addEventListener("click", () => {
+      navigateToNode(varNode.id);
+    });
+    li.appendChild(btn);
+    list.appendChild(li);
+  });
+
+  block.classList.remove("hidden");
+}
+
+function updateVarPreviewBlock(node) {
+  const block = document.getElementById("detail-var-preview-block");
+  const titleEl = document.getElementById("detail-var-preview-title");
+  const previewEl = document.getElementById("detail-var-preview");
+  const btn = document.getElementById("btn-var-load-source");
+  const sourceWrap = document.getElementById("detail-var-source-wrap");
+  const sourceEl = document.getElementById("detail-var-source");
+  if (!block || !previewEl) {
+    return;
+  }
+  if (!node || node.type !== "variable") {
+    block.classList.add("hidden");
+    if (sourceWrap) {
+      sourceWrap.classList.add("hidden");
+    }
+    if (sourceEl) {
+      sourceEl.textContent = "";
+    }
+    if (btn) {
+      btn.dataset.loadedNodeId = "";
+      btn.textContent = "Ver código";
+    }
+    return;
+  }
+
+  if (titleEl) {
+    const lineRange = node.line
+      ? (node.end_line && node.end_line > node.line ? `L${node.line}–L${node.end_line}` : `L${node.line}`)
+      : "";
+    titleEl.textContent = lineRange ? `Valor / Declaración (${lineRange})` : "Valor / Declaración";
+  }
+
+  const typeSuffix = node.type_annotation ? `: ${node.type_annotation}` : "";
+  const valuePart = node.value_preview ? ` = ${node.value_preview}` : "";
+  previewEl.textContent = `${node.label}${typeSuffix}${valuePart}`;
+
+  if (btn && btn.dataset.loadedNodeId !== node.id) {
+    btn.dataset.loadedNodeId = "";
+    btn.textContent = "Ver código";
+    btn.disabled = false;
+    if (sourceWrap) {
+      sourceWrap.classList.add("hidden");
+    }
+    if (sourceEl) {
+      sourceEl.textContent = "";
+    }
+  }
+  block.classList.remove("hidden");
+}
+
+async function toggleSelectedVariableSource() {
+  const nodeId = state.selectedNodeId;
+  const node = nodeId ? state.nodesById.get(nodeId) : null;
+  const btn = document.getElementById("btn-var-load-source");
+  const sourceWrap = document.getElementById("detail-var-source-wrap");
+  const sourceEl = document.getElementById("detail-var-source");
+  if (!node || node.type !== "variable" || !btn || !sourceWrap || !sourceEl) {
+    return;
+  }
+
+  if (btn.dataset.loadedNodeId === node.id) {
+    const isNowHidden = sourceWrap.classList.toggle("hidden");
+    btn.textContent = isNowHidden ? "Ver código" : "Ocultar código";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Cargando…";
+  try {
+    const response = await fetch(`/source?node_id=${encodeURIComponent(node.id)}`, { cache: "no-store" });
+    if (state.selectedNodeId !== node.id) {
+      return;
+    }
+    if (!response.ok) {
+      sourceEl.textContent = `No se pudo cargar el código (HTTP ${response.status}).`;
+      sourceWrap.classList.remove("hidden");
+      btn.textContent = "Reintentar";
+      return;
+    }
+    const payload = await response.json();
+    if (state.selectedNodeId !== node.id) {
+      return;
+    }
+    const startLine = Number(payload.start_line || node.line || 1);
+    const lines = String(payload.code || "").replace(/\r\n/g, "\n").split("\n");
+    const padWidth = String(startLine + Math.max(0, lines.length - 1)).length;
+    sourceEl.textContent = lines
+      .map((lineText, idx) => `${String(startLine + idx).padStart(padWidth, " ")} │ ${lineText}`)
+      .join("\n");
+    sourceWrap.classList.remove("hidden");
+    btn.dataset.loadedNodeId = node.id;
+    btn.textContent = "Ocultar código";
+  } catch (err) {
+    if (state.selectedNodeId !== node.id) {
+      return;
+    }
+    sourceEl.textContent = `Error al cargar el código: ${err.message || err}`;
+    sourceWrap.classList.remove("hidden");
+    btn.textContent = "Reintentar";
+  } finally {
+    if (state.selectedNodeId === node.id) {
+      btn.disabled = false;
+    }
+  }
+}
+
 function selectNode(nodeId, stepId = undefined) {
   const node = state.nodesById.get(nodeId);
   if (!node) {
@@ -6814,9 +7140,11 @@ function selectNode(nodeId, stepId = undefined) {
     docstringTitle.textContent = node.type === "file" ? `Docstring "${node.label}"` : "Docstring";
   }
 
+  updateVarPreviewBlock(node);
   updateOptionalBlock("detail-signature-block", "detail-signature", node.signature);
   updateOptionalBlock("detail-docstring-block", "detail-docstring", node.docstring);
   updateFileFunctionsBlock(node);
+  updateFileVariablesBlock(node);
   updateInternalCallsBlock(node);
   updateExternalCallsBlock(node);
   updateOptionalBlock("detail-fingerprint-block", "detail-fingerprint", node.fingerprint);
@@ -6929,6 +7257,17 @@ function updateFlowBadges(node, effectiveRole) {
     }
     return;
   }
+  if (node.type === "variable") {
+    if (node.var_kind === "variable") {
+      appendBadge("VARIABLE", "flow-badge-variable");
+    } else {
+      appendBadge("CONSTANTE", "flow-badge-constant");
+    }
+    if (node.type_annotation) {
+      appendBadge(node.type_annotation, "flow-badge-vartype");
+    }
+    return;
+  }
   if (node.type !== "function") {
     return;
   }
@@ -6959,7 +7298,7 @@ function resolveNodeFilePath(node) {
   if (node.file_path) {
     return node.file_path;
   }
-  if (node.type === "function" && node.parent) {
+  if ((node.type === "function" || node.type === "variable") && node.parent) {
     const fileNode = state.nodesById.get(node.parent);
     return fileNode ? fileNode.file_path : null;
   }
@@ -7343,6 +7682,11 @@ function createInternalCallCard(targetNode, edge = null) {
     sig.className = "call-signature";
     sig.textContent = targetNode.signature;
     li.appendChild(sig);
+  } else if (targetNode.type === "variable" && targetNode.value_preview) {
+    const sig = document.createElement("pre");
+    sig.className = "call-signature";
+    sig.textContent = `= ${targetNode.value_preview}`;
+    li.appendChild(sig);
   }
 
   if (targetNode.docstring) {
@@ -7386,6 +7730,7 @@ function createInternalCallCard(targetNode, edge = null) {
 
 function updateInternalCallsBlock(node) {
   const block = document.getElementById("detail-internal-calls-block");
+  const titleEl = document.getElementById("detail-internal-calls-title");
   const list = document.getElementById("detail-internal-calls-list");
   const hiddenBox = document.getElementById("detail-hidden-utilities");
   const hiddenChips = document.getElementById("detail-hidden-utilities-chips");
@@ -7395,6 +7740,42 @@ function updateInternalCallsBlock(node) {
   }
   if (hiddenBox) {
     hiddenBox.classList.add("hidden");
+  }
+
+  if (node.type === "variable") {
+    if (!state.rawGraph || !Array.isArray(state.rawGraph.edges)) {
+      block.classList.add("hidden");
+      return;
+    }
+    const seenReaders = new Set();
+    const readers = [];
+    for (const edge of state.rawGraph.edges) {
+      if (edge.target !== node.id || edge.source === node.id || seenReaders.has(edge.source)) {
+        continue;
+      }
+      const srcNode = state.nodesById.get(edge.source);
+      if (!srcNode) {
+        continue;
+      }
+      seenReaders.add(edge.source);
+      readers.push({ targetNode: srcNode, edge });
+    }
+    if (readers.length === 0) {
+      block.classList.add("hidden");
+      return;
+    }
+    if (titleEl) {
+      titleEl.textContent = `Leída por (${readers.length})`;
+    }
+    for (const { targetNode, edge } of readers) {
+      list.appendChild(createInternalCallCard(targetNode, edge));
+    }
+    block.classList.remove("hidden");
+    return;
+  }
+
+  if (titleEl) {
+    titleEl.textContent = "Llamadas internas";
   }
 
   const canHaveOutgoing = node.type === "function" || node.type === "file";
@@ -7408,24 +7789,30 @@ function updateInternalCallsBlock(node) {
 
   const seenTargets = new Set();
   const visibleItems = [];
+  const variableItems = [];
   const hiddenUtilityItems = [];
   for (const edge of state.rawGraph.edges) {
     if (edge.source !== node.id || edge.target === node.id || seenTargets.has(edge.target)) {
       continue;
     }
     const targetNode = state.nodesById.get(edge.target);
-    if (!targetNode || (targetNode.type !== "function" && targetNode.type !== "file")) {
+    if (
+      !targetNode
+      || (targetNode.type !== "function" && targetNode.type !== "file" && targetNode.type !== "variable")
+    ) {
       continue;
     }
     seenTargets.add(edge.target);
-    if (isUtilityNodeHidden(targetNode.id, activeFlowNodeSet)) {
+    if (targetNode.type === "variable") {
+      variableItems.push({ targetNode, edge });
+    } else if (isUtilityNodeHidden(targetNode.id, activeFlowNodeSet)) {
       hiddenUtilityItems.push({ targetNode, edge });
     } else {
       visibleItems.push({ targetNode, edge });
     }
   }
 
-  if (visibleItems.length === 0 && hiddenUtilityItems.length === 0) {
+  if (visibleItems.length === 0 && variableItems.length === 0 && hiddenUtilityItems.length === 0) {
     block.classList.add("hidden");
     return;
   }
@@ -7448,6 +7835,9 @@ function updateInternalCallsBlock(node) {
   }
 
   for (const { targetNode, edge } of visibleItems) {
+    list.appendChild(createInternalCallCard(targetNode, edge));
+  }
+  for (const { targetNode, edge } of variableItems) {
     list.appendChild(createInternalCallCard(targetNode, edge));
   }
   block.classList.remove("hidden");
@@ -7734,7 +8124,7 @@ function renderSearchResults(query) {
   const matches = [];
   for (const node of state.rawGraph.nodes) {
     const noteText = (getNoteEntry(node.id).note || "").trim();
-    const haystack = `${node.label} ${node.id} ${node.signature || ""} ${noteText}`.toLowerCase();
+    const haystack = `${node.label} ${node.id} ${node.signature || ""} ${node.value_preview || ""} ${noteText}`.toLowerCase();
     if (!term || haystack.includes(term)) {
       matches.push({ node, noteText });
       if (matches.length >= 25) {
@@ -7752,7 +8142,10 @@ function renderSearchResults(query) {
 
     const title = document.createElement("div");
     title.className = "search-item-title";
-    title.innerHTML = `<span>${escapeHtml(item.node.label)}</span><span>${escapeHtml(item.node.type)}</span>`;
+    const typeBadge = item.node.type === "variable"
+      ? (item.node.var_kind === "variable" ? "variable" : "constante")
+      : item.node.type;
+    title.innerHTML = `<span>${escapeHtml(item.node.label)}</span><span>${escapeHtml(typeBadge)}</span>`;
     li.appendChild(title);
 
     const sub = document.createElement("div");
@@ -7775,6 +8168,11 @@ function renderSearchResults(query) {
 async function navigateToNode(nodeId) {
   let changed = false;
   let current = state.nodesById.get(nodeId);
+  if (current && current.type === "variable" && !state.showVariables) {
+    state.showVariables = true;
+    updateVariablesButton();
+    changed = true;
+  }
   while (current && current.parent) {
     if (state.collapsedContainers.delete(current.parent)) {
       changed = true;
@@ -8750,6 +9148,14 @@ function bindControls() {
   document.getElementById("btn-fit").addEventListener("click", fitGraphToScreen);
   document.getElementById("btn-trace").addEventListener("click", toggleTraceMode);
   document.getElementById("btn-hide-utilities").addEventListener("click", toggleHideUtilities);
+  const toggleVarsBtn = document.getElementById("btn-toggle-variables");
+  if (toggleVarsBtn) {
+    toggleVarsBtn.addEventListener("click", toggleShowVariables);
+  }
+  const varSourceBtn = document.getElementById("btn-var-load-source");
+  if (varSourceBtn) {
+    varSourceBtn.addEventListener("click", toggleSelectedVariableSource);
+  }
   const onDemandBtn = document.getElementById("btn-on-demand-edges");
   if (onDemandBtn) {
     onDemandBtn.addEventListener("click", toggleOnDemandEdges);
@@ -9318,7 +9724,7 @@ function resolveExternalContainerId(externalNode) {
   if (externalNode.type === "file" || externalNode.type === "module") {
     return externalNode.id;
   }
-  if (externalNode.type === "function") {
+  if (externalNode.type === "function" || externalNode.type === "variable") {
     if (externalNode.parent && state.nodesById.has(externalNode.parent)) {
       return externalNode.parent;
     }
@@ -9334,14 +9740,16 @@ function formatPortLabel(direction, externalNode) {
   if (!externalNode) {
     return arrow;
   }
-  if (externalNode.type === "function") {
+  if (externalNode.type === "function" || externalNode.type === "variable") {
     const parentFile = externalNode.parent ? state.nodesById.get(externalNode.parent) : null;
-    const rawFn = String(externalNode.label || externalNode.id);
-    const fnName = rawFn.endsWith(")") ? rawFn : `${rawFn}()`;
+    const rawName = String(externalNode.label || externalNode.id);
+    const displayName = externalNode.type === "function" && !rawName.endsWith(")")
+      ? `${rawName}()`
+      : rawName;
     if (parentFile && parentFile.label) {
-      return `${arrow} ${parentFile.label} :: ${fnName}`;
+      return `${arrow} ${parentFile.label} :: ${displayName}`;
     }
-    return `${arrow} ${fnName}`;
+    return `${arrow} ${displayName}`;
   }
   return `${arrow} ${externalNode.label || externalNode.id}`;
 }
@@ -9378,6 +9786,9 @@ function buildFloatingSubgraph(targetNode) {
   const descendants = [];
   for (const rawNode of state.rawGraph.nodes) {
     if (rawNode.id !== targetNode.id && internalNodeIds.has(rawNode.id)) {
+      if (rawNode.type === "variable" && !state.showVariables) {
+        continue;
+      }
       descendants.push(rawNode);
     }
   }
@@ -9402,6 +9813,7 @@ function buildFloatingSubgraph(targetNode) {
         label: baseLabel,
         type: rawNode.type,
         role: effectiveRole,
+        varKind: rawNode.var_kind || "constant",
         entryKind: rawNode.entry_kind || "",
         fileLang: rawNode.language || "",
         mainEntry: rawNode.is_main_entry ? "true" : "false",
@@ -9534,6 +9946,9 @@ function buildFloatingSubgraph(targetNode) {
   };
 
   for (const rawEdge of state.rawGraph.edges) {
+    if (!state.showVariables && rawEdge.edge_type === "reads_var") {
+      continue;
+    }
     const srcInside = internalNodeIds.has(rawEdge.source);
     const tgtInside = internalNodeIds.has(rawEdge.target);
 

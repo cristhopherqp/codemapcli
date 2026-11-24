@@ -23,6 +23,7 @@ from codemap.models import (
     EDGE_LOADS_SCRIPT,
     EDGE_REACTIVE_SUBSCRIBE,
     EDGE_REACTIVE_TRIGGER,
+    EDGE_READS_VAR,
     EDGE_SERVES_HTML,
 )
 
@@ -36,6 +37,7 @@ _EDGE_SHORT_TAG: dict[str, str] = {
     EDGE_REACTIVE_TRIGGER: "trigger",
     EDGE_LOADS_SCRIPT: "script",
     EDGE_SERVES_HTML: "html",
+    EDGE_READS_VAR: "lee",
 }
 
 _ENTRY_BADGE: dict[str, str] = {
@@ -156,6 +158,21 @@ def _compact_node(node: dict, *, include_flow: bool) -> dict:
             }
         )
 
+    if node_type == "variable":
+        return _prune_neutral(
+            {
+                "id": node.get("id"),
+                "type": node_type,
+                "parent": node.get("parent"),
+                "label": node.get("label"),
+                "var_kind": node.get("var_kind"),
+                "type_annotation": node.get("type_annotation"),
+                "value_preview": node.get("value_preview"),
+                "docstring": node.get("docstring"),
+                "line": node.get("line"),
+            }
+        )
+
     # Función / método / callback
     ext_calls = [_compact_external_call(c) for c in node.get("external_calls", [])]
     compact = {
@@ -232,6 +249,7 @@ def build_ai_graph(graph: dict, *, include_flow: bool = False) -> dict:
         {
             "project_name": raw_meta.get("project_name", ""),
             "total_functions": raw_meta.get("total_functions", 0),
+            "total_variables": raw_meta.get("total_variables", 0) or None,
             "recommended_level": raw_meta.get("recommended_level"),
             "main_entry_files": raw_meta.get("main_entry_files", []),
             "main_entry_functions": raw_meta.get("main_entry_functions", []),
@@ -342,12 +360,19 @@ def build_ai_markdown(graph: dict, *, include_flow: bool = False) -> str:
 
     file_nodes = sorted((n for n in nodes if n.get("type") == "file"), key=lambda n: n["id"])
     fn_nodes = [n for n in nodes if n.get("type") == "function"]
+    var_nodes = [n for n in nodes if n.get("type") == "variable"]
 
     fns_by_file: dict[str, list[dict]] = defaultdict(list)
     for fn in fn_nodes:
         fns_by_file[fn.get("parent", "")].append(fn)
     for fn_list in fns_by_file.values():
         fn_list.sort(key=lambda n: (n.get("line", 0), n["id"]))
+
+    vars_by_file: dict[str, list[dict]] = defaultdict(list)
+    for var in var_nodes:
+        vars_by_file[var.get("parent", "")].append(var)
+    for var_list in vars_by_file.values():
+        var_list.sort(key=lambda n: (n.get("line", 0), n["id"]))
 
     out_edges_by_src: dict[str, list[dict]] = defaultdict(list)
     for edge in edges:
@@ -444,6 +469,14 @@ def build_ai_markdown(graph: dict, *, include_flow: bool = False) -> str:
                     cls_doc = _collapse_ws(cls.get("docstring", ""))
                     doc_suffix = f" — {cls_doc[:140].rstrip() + '…' if len(cls_doc) > 140 else cls_doc}" if cls_doc else ""
                     lines.append(f"- `L{cls_line}` **`{decl}`** [clase]{doc_suffix}")
+
+            file_vars = vars_by_file.get(fid, [])
+            for var in file_vars:
+                v_line = var.get("line", 0)
+                v_kind = "constante" if var.get("var_kind") == "constant" else "variable"
+                v_type = f": {var['type_annotation']}" if var.get("type_annotation") else ""
+                v_prev = f" = `{var['value_preview']}`" if var.get("value_preview") else ""
+                lines.append(f"- `L{v_line}` **`{var.get('label', var['id'])}{v_type}`** [{v_kind}]{v_prev}")
 
             file_fns = fns_by_file.get(fid, [])
             if not file_fns:

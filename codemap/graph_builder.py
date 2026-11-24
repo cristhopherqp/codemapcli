@@ -21,6 +21,7 @@ from codemap.models import (
     EDGE_LOADS_SCRIPT,
     EDGE_REACTIVE_SUBSCRIBE,
     EDGE_REACTIVE_TRIGGER,
+    EDGE_READS_VAR,
     EDGE_SERVES_HTML,
     ENTRY_KIND_EVENT,
     ENTRY_KIND_MAIN,
@@ -31,6 +32,7 @@ from codemap.models import (
     FileAnalysis,
     FunctionInfo,
     ImportBinding,
+    VariableInfo,
 )
 from codemap.resolver import (
     CONFIRMED,
@@ -49,6 +51,7 @@ from codemap.resolver import (
     resolve_module_calls,
     resolve_project,
     resolve_reactive_triggers,
+    resolve_variable_refs,
 )
 from codemap.roles import (
     classify_role,
@@ -287,6 +290,7 @@ EDGE_TYPE_PRIORITY: dict[str, int] = {
     EDGE_REACTIVE_SUBSCRIBE: 4,
     EDGE_CALLBACK_REF: 5,
     EDGE_REACTIVE_TRIGGER: 6,
+    EDGE_READS_VAR: 7,
 }
 
 
@@ -401,6 +405,18 @@ def build_graph(
         execution_flows=execution_flows,
     )
 
+    # Variables/constantes top-level y aristas `reads_var` (aisladas de `execution_flows`, `is_terminal` y `arch_layer`).
+    file_arch_layers = {f["id"]: f.get("arch_layer", 3) for f in file_nodes}
+    visible_var_ids = visible_variable_ids(index, include_private, exclude_ids=visible_ids)
+    variable_nodes = build_variable_nodes(index, visible_var_ids, file_arch_layers=file_arch_layers)
+    var_read_calls = resolve_variable_refs(index)
+    var_edges = aggregate_edges(
+        var_read_calls,
+        visible_ids | visible_var_ids,
+        start_index=len(edges) + 1,
+    )
+    all_edges = edges + var_edges
+
     total_functions = len(function_nodes)
     return {
         "meta": {
@@ -408,6 +424,7 @@ def build_graph(
             "root_path": target_path,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "total_functions": total_functions,
+            "total_variables": len(variable_nodes),
             "large_project_threshold": LARGE_PROJECT_FUNCTIONS,
             "recommended_level": recommended_level(
                 total_functions,
@@ -418,8 +435,8 @@ def build_graph(
             "main_entry_functions": sorted(entry_meta["main_entry_fn_ids"]),
             "architectural_layers": [dict(layer) for layer in ARCHITECTURAL_LAYERS],
         },
-        "nodes": module_nodes + file_nodes + function_nodes,
-        "edges": edges,
+        "nodes": module_nodes + file_nodes + function_nodes + variable_nodes,
+        "edges": all_edges,
         "execution_flows": execution_flows,
     }
 
@@ -463,6 +480,66 @@ def visible_function_ids(index: ProjectIndex, include_private: bool) -> set[str]
             if include_private or not is_private(function):
                 visible.add(function_id(index.file_ids[path], function.qualname))
     return visible
+
+
+def is_private_variable(variable: VariableInfo) -> bool:
+    """_VAR o #var top-level se ocultan sin --include-private."""
+    return variable.short_name.startswith(("_", "#"))
+
+
+def visible_variable_ids(
+    index: ProjectIndex,
+    include_private: bool,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> set[str]:
+    excluded = exclude_ids or set()
+    visible: set[str] = set()
+    for path, analysis in index.files.items():
+        file_id = index.file_ids[path]
+        for variable in analysis.variables:
+            if not include_private and is_private_variable(variable):
+                continue
+            vid = function_id(file_id, variable.qualname)
+            if vid not in excluded:
+                visible.add(vid)
+    return visible
+
+
+def build_variable_nodes(
+    index: ProjectIndex,
+    visible_var_ids: set[str],
+    *,
+    file_arch_layers: dict[str, int] | None = None,
+) -> list[dict]:
+    layers_map = file_arch_layers or {}
+    nodes: list[dict] = []
+    for path in sorted(index.files, key=lambda p: index.file_ids[p]):
+        file_id = index.file_ids[path]
+        analysis = index.files[path]
+        sorted_vars = sorted(analysis.variables, key=lambda v: (v.line, v.qualname))
+        for variable in sorted_vars:
+            vid = function_id(file_id, variable.qualname)
+            if vid not in visible_var_ids:
+                continue
+            nodes.append(
+                {
+                    "id": vid,
+                    "type": "variable",
+                    "parent": file_id,
+                    "label": variable.qualname,
+                    "role": "variable",
+                    "var_kind": variable.kind,
+                    "value_preview": variable.value_preview,
+                    "type_annotation": variable.type_annotation,
+                    "docstring": variable.docstring,
+                    "line": variable.line,
+                    "end_line": variable.end_line or variable.line,
+                    "fingerprint": variable.fingerprint,
+                    "arch_layer": layers_map.get(file_id, 3),
+                }
+            )
+    return nodes
 
 
 def build_module_nodes(file_ids) -> list[dict]:
@@ -1217,7 +1294,12 @@ def _pick_primary_edge_type(current: str, candidate: str) -> str:
     return candidate if cand_prio < cur_prio else current
 
 
-def aggregate_edges(calls: list[ResolvedCall], valid_ids: set[str]) -> list[dict]:
+def aggregate_edges(
+    calls: list[ResolvedCall],
+    valid_ids: set[str],
+    *,
+    start_index: int = 1,
+) -> list[dict]:
     """Una arista por par (origen, destino). Preserva campos base y añade `edge_type`."""
     grouped: dict[tuple[str, str], dict] = {}
     edge_types_seen: dict[tuple[str, str], list[str]] = {}
@@ -1253,7 +1335,7 @@ def aggregate_edges(calls: list[ResolvedCall], valid_ids: set[str]) -> list[dict
             edge_types_seen[key].append(call.edge_type)
 
     edges = []
-    for number, (key, edge) in enumerate(grouped.items(), start=1):
+    for number, (key, edge) in enumerate(grouped.items(), start=start_index):
         extra_types = edge_types_seen[key]
         if len(extra_types) > 1:
             edge["edge_types"] = sorted(extra_types, key=lambda t: EDGE_TYPE_PRIORITY.get(t, 99))

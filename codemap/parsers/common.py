@@ -8,6 +8,7 @@ Convenciones:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import textwrap
 from collections.abc import Iterator
@@ -28,6 +29,29 @@ FLOW_MAX_STEPS = 96
 FLOW_COMPACT_MIN_RUN = 3
 
 _HTML_FILE_PATTERN = re.compile(r"^[./\\\w\-@]+\.(?:html?|HTM|HTML)$")
+_SECRET_VAR_NAME_RE = re.compile(
+    r"(?:^|_)(?:secret|token|password|passwd|pwd|api_?key|private_?key|access_?key|auth_?key|credential|client_?secret)(?:$|_)",
+    re.IGNORECASE,
+)
+_QUOTED_SECRET_LITERAL_RE = re.compile(r"""^(?:[bBrRuUfF]{0,2})(?:["'`]).*(?:["'`])$""")
+
+
+def format_value_preview(var_name: str, raw_value: str, max_chars: int = 80) -> str:
+    """Resume en 1 línea (<= 80 chars) el valor de una constante/variable redactando literales sensibles."""
+    cleaned = collapse_whitespace(raw_value)
+    if not cleaned:
+        return ""
+    if _SECRET_VAR_NAME_RE.search(var_name) and _QUOTED_SECRET_LITERAL_RE.match(cleaned):
+        return '"[REDACTED]"'
+    if len(cleaned) > max_chars:
+        return cleaned[: max_chars - 1].rstrip() + "…"
+    return cleaned
+
+
+def compute_variable_fingerprint(name: str, kind: str, type_annotation: str, value_preview: str) -> str:
+    """Huella estable ligera para nodos `type: 'variable'`."""
+    payload = f"var|{name}|{kind}|{type_annotation}|{value_preview}".encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()[:12]
 
 
 def extract_html_path_from_string(raw: str) -> str | None:

@@ -32,6 +32,8 @@ from codemap.models import (
     FunctionInfo,
     HtmlRef,
     ImportBinding,
+    VariableInfo,
+    VarRefSite,
 )
 from codemap.parsers.common import (
     DOCSTRING_MAX_CHARS,
@@ -42,6 +44,7 @@ from codemap.parsers.common import (
     PendingExit,
     collect_metrics,
     collapse_whitespace,
+    compute_variable_fingerprint,
     contains_type,
     dedent_code,
     end_line_of,
@@ -50,6 +53,7 @@ from codemap.parsers.common import (
     first_capture,
     flow_label,
     format_compacted_step_label,
+    format_value_preview,
     iter_body_nodes,
     line_of,
     node_key,
@@ -180,6 +184,7 @@ def parse_python_file(path: str, source: bytes) -> FileAnalysis:
 
     analysis.classes = collect_classes(root, source)
     analysis.class_names = {cls.qualname for cls in analysis.classes}
+    analysis.variables = collect_top_level_variables(root, source)
     analysis.imports = collect_imports(root, source)
     analysis.module_calls = module_calls
     analysis.html_refs = collect_html_refs(root, source, function_nodes, qualname_by_key)
@@ -271,6 +276,385 @@ def collect_class_names(root: Node, source: bytes) -> set[str]:
     return {cls.qualname for cls in collect_classes(root, source)}
 
 
+# ---------------------------------------------------------------------------
+# Variables / constantes top-level y lecturas léxicas con anti-sombreado
+# ---------------------------------------------------------------------------
+
+_PY_NON_VAR_IDENTS = frozenset({"True", "False", "None", "self", "cls", "super", "Ellipsis", "NotImplemented"})
+
+
+def _extract_py_comment_doc(stmt: Node, source: bytes) -> str:
+    """Extrae comentarios `#` contiguos arriba de una declaración top-level o inline en la misma línea."""
+    above: list[str] = []
+    cur = stmt.prev_named_sibling
+    expected_line = line_of(stmt)
+    while cur is not None and cur.type == "comment":
+        cur_end = end_line_of(cur)
+        if expected_line - cur_end > 1:
+            break
+        raw = node_text(cur, source).strip()
+        if raw.startswith("#!"):
+            break
+        cleaned = raw.lstrip("#").strip()
+        if cleaned:
+            above.append(cleaned)
+        expected_line = line_of(cur)
+        cur = cur.prev_named_sibling
+    if above:
+        above.reverse()
+        return "\n".join(above)[:DOCSTRING_MAX_CHARS]
+
+    nxt = stmt.next_named_sibling
+    if nxt is not None and nxt.type == "comment" and line_of(nxt) == line_of(stmt):
+        return node_text(nxt, source).strip().lstrip("#").strip()[:DOCSTRING_MAX_CHARS]
+    return ""
+
+
+def _py_top_level_target_names(left: Node | None, source: bytes) -> list[str]:
+    """Devuelve nombres simples asignados en el LHS (`X = 1` o `HOST, PORT = ...`). Omite atributos/subscripts."""
+    if left is None:
+        return []
+    if left.type == "identifier":
+        name = node_text(left, source)
+        return [name] if name else []
+    if left.type in ("pattern_list", "tuple_pattern", "list_pattern"):
+        names: list[str] = []
+        for child in left.named_children:
+            if child.type == "identifier":
+                name = node_text(child, source)
+                if name:
+                    names.append(name)
+            elif child.type in ("pattern_list", "tuple_pattern", "list_pattern"):
+                names.extend(_py_top_level_target_names(child, source))
+            else:
+                return []
+        return names
+    return []
+
+
+def _is_py_constant_name(name: str, type_annotation: str) -> bool:
+    if "Final" in type_annotation:
+        return True
+    stripped = name.lstrip("_")
+    return bool(stripped) and any(ch.isalpha() for ch in stripped) and stripped == stripped.upper()
+
+
+def collect_top_level_variables(root: Node, source: bytes) -> list[VariableInfo]:
+    """Extrae únicamente asignaciones top-level directas en `module.named_children`."""
+    variables: list[VariableInfo] = []
+    seen: set[str] = set()
+
+    for child in root.named_children:
+        stmt = child
+        if stmt.type == "expression_statement" and stmt.named_child_count == 1:
+            stmt = stmt.named_children[0]
+        if stmt.type != "assignment":
+            continue
+
+        left = stmt.child_by_field_name("left")
+        right = stmt.child_by_field_name("right")
+        type_node = stmt.child_by_field_name("type")
+        if right is None and type_node is None:
+            continue
+        if right is not None and right.type == "lambda":
+            continue
+
+        target_names = _py_top_level_target_names(left, source)
+        if not target_names:
+            continue
+
+        type_ann = collapse_whitespace(node_text(type_node, source)) if type_node is not None else ""
+        raw_val = node_text(right, source) if right is not None else ""
+        doc = _extract_py_comment_doc(child, source)
+        start_line = line_of(stmt)
+        end_line = end_line_of(stmt)
+
+        rhs_items: list[str] | None = None
+        if len(target_names) > 1 and right is not None and right.type in ("expression_list", "tuple", "list"):
+            rhs_children = [c for c in right.named_children if c.type != "comment"]
+            if len(rhs_children) == len(target_names):
+                rhs_items = [node_text(c, source) for c in rhs_children]
+
+        for idx, short_name in enumerate(target_names):
+            if short_name in seen:
+                continue
+            seen.add(short_name)
+            item_val = rhs_items[idx] if rhs_items is not None else raw_val
+            preview = format_value_preview(short_name, item_val)
+            kind = "constant" if _is_py_constant_name(short_name, type_ann) else "variable"
+            variables.append(
+                VariableInfo(
+                    qualname=short_name,
+                    short_name=short_name,
+                    kind=kind,
+                    line=start_line,
+                    end_line=end_line,
+                    value_preview=preview,
+                    docstring=doc,
+                    type_annotation=type_ann,
+                    fingerprint=compute_variable_fingerprint(short_name, kind, type_ann, preview),
+                )
+            )
+    return variables
+
+
+def _collect_py_pattern_idents(node: Node | None, source: bytes, out: set[str]) -> None:
+    """Extrae todos los identificadores enlazados en un patrón LHS / parámetro Python (sin leer valores default ni tipos)."""
+    if node is None:
+        return
+    ntype = node.type
+    if ntype == "identifier":
+        out.add(node_text(node, source))
+        return
+    if ntype in ("attribute", "subscript"):
+        return
+    if ntype in ("default_parameter", "typed_default_parameter"):
+        _collect_py_pattern_idents(node.child_by_field_name("name"), source, out)
+        return
+    if ntype == "typed_parameter":
+        for child in node.named_children:
+            if child.type != "type":
+                _collect_py_pattern_idents(child, source, out)
+        return
+    if ntype in ("list_splat_pattern", "dictionary_splat_pattern", "as_pattern_target"):
+        for child in node.named_children:
+            _collect_py_pattern_idents(child, source, out)
+        return
+    if ntype in ("pattern_list", "tuple_pattern", "list_pattern", "parameters", "lambda_parameters"):
+        for child in node.named_children:
+            if child.type not in ("comment", "type"):
+                _collect_py_pattern_idents(child, source, out)
+
+
+def _collect_py_fn_local_bindings(
+    body: Node | None,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+) -> tuple[set[str], set[str]]:
+    """Recorre el cuerpo de una función Python (sin entrar en anidadas) y devuelve `(local_defs, global_names)`."""
+    local_defs: set[str] = set()
+    global_names: set[str] = set()
+    if body is None:
+        return local_defs, global_names
+
+    stack: list[Node] = [body]
+    while stack:
+        cur = stack.pop()
+        ctype = cur.type
+        if ctype in ("global_statement", "nonlocal_statement"):
+            for ch in cur.named_children:
+                if ch.type == "identifier":
+                    global_names.add(node_text(ch, source))
+            continue
+        if ctype in ("list_comprehension", "dict_comprehension", "set_comprehension", "generator_expression", "lambda"):
+            continue
+        if ctype == "assignment":
+            _collect_py_pattern_idents(cur.child_by_field_name("left"), source, local_defs)
+        elif ctype == "augmented_assignment":
+            left = cur.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                local_defs.add(node_text(left, source))
+        elif ctype == "named_expression":
+            _collect_py_pattern_idents(cur.child_by_field_name("name"), source, local_defs)
+        elif ctype == "for_statement":
+            _collect_py_pattern_idents(cur.child_by_field_name("left"), source, local_defs)
+        elif ctype == "as_pattern":
+            _collect_py_pattern_idents(cur.child_by_field_name("alias"), source, local_defs)
+        elif ctype == "except_clause":
+            for ch in cur.named_children:
+                if ch.type == "as_pattern":
+                    _collect_py_pattern_idents(ch.child_by_field_name("alias"), source, local_defs)
+                elif ch.type == "identifier" and ch == cur.named_children[-1] and cur.named_child_count >= 2:
+                    local_defs.add(node_text(ch, source))
+        elif ctype in ("import_statement", "import_from_statement"):
+            for ch in cur.named_children:
+                if ch.type == "aliased_import":
+                    alias = ch.child_by_field_name("alias")
+                    if alias is not None:
+                        local_defs.add(node_text(alias, source))
+                elif ch.type == "dotted_name" and ctype == "import_from_statement":
+                    if ch != cur.child_by_field_name("module_name"):
+                        local_defs.add(node_text(ch, source).split(".")[0])
+                elif ch.type == "dotted_name" and ctype == "import_statement":
+                    local_defs.add(node_text(ch, source).split(".")[0])
+        elif ctype in ("function_definition", "class_definition") and cur is not body:
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None:
+                local_defs.add(node_text(name_node, source))
+            continue
+
+        for ch in reversed(cur.named_children):
+            if node_key(ch) in function_nodes:
+                if ch.type == "function_definition":
+                    name_node = ch.child_by_field_name("name")
+                    if name_node is not None:
+                        local_defs.add(node_text(name_node, source))
+                continue
+            stack.append(ch)
+
+    return local_defs, global_names
+
+
+def collect_python_var_refs(
+    fn_node: Node,
+    source: bytes,
+    function_nodes: dict[NodeKey, Node],
+) -> list[VarRefSite]:
+    """Recolecta lecturas libres a variables/constantes top-level respetando sombreado léxico."""
+    body = fn_node.child_by_field_name("body")
+    if body is None:
+        return []
+
+    param_names: set[str] = set()
+    _collect_py_pattern_idents(fn_node.child_by_field_name("parameters"), source, param_names)
+    local_defs, global_names = _collect_py_fn_local_bindings(body, source, function_nodes)
+    fn_scope = (param_names | local_defs) - global_names
+
+    refs: list[VarRefSite] = []
+    seen: set[tuple[str, int]] = set()
+    scope_stack: list[set[str]] = [fn_scope]
+
+    def is_shadowed(ident: str) -> bool:
+        return any(ident in scope for scope in scope_stack)
+
+    def emit(name: str, line: int, *, is_write: bool = False) -> None:
+        if not name or name in _PY_NON_VAR_IDENTS:
+            return
+        key = (name, line)
+        if key not in seen:
+            seen.add(key)
+            refs.append(VarRefSite(name=name, line=line, is_write=is_write))
+
+    def walk(node: Node) -> None:
+        if node_key(node) in function_nodes and node is not fn_node:
+            return
+        ntype = node.type
+        if ntype in ("class_definition", "type", "comment", "import_statement", "import_from_statement", "global_statement", "nonlocal_statement"):
+            return
+
+        if ntype in ("list_comprehension", "dict_comprehension", "set_comprehension", "generator_expression"):
+            comp_locals: set[str] = set()
+            for ch in node.named_children:
+                if ch.type == "for_in_clause":
+                    _collect_py_pattern_idents(ch.child_by_field_name("left"), source, comp_locals)
+            # La expresión iterable del primer `for_in_clause` se evalúa en el ámbito exterior.
+            first_for_seen = False
+            scope_stack.append(comp_locals)
+            try:
+                for ch in node.named_children:
+                    if ch.type == "for_in_clause" and not first_for_seen:
+                        first_for_seen = True
+                        scope_stack.pop()
+                        right_iter = ch.child_by_field_name("right")
+                        if right_iter is not None:
+                            walk(right_iter)
+                        scope_stack.append(comp_locals)
+                    else:
+                        walk(ch)
+            finally:
+                scope_stack.pop()
+            return
+
+        if ntype == "lambda":
+            lam_params: set[str] = set()
+            _collect_py_pattern_idents(node.child_by_field_name("parameters"), source, lam_params)
+            scope_stack.append(lam_params)
+            try:
+                lam_body = node.child_by_field_name("body")
+                if lam_body is not None:
+                    walk(lam_body)
+            finally:
+                scope_stack.pop()
+            return
+
+        if ntype == "assignment":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None:
+                if left.type == "identifier":
+                    name = node_text(left, source)
+                    if name in global_names and not is_shadowed(name):
+                        emit(name, line_of(left), is_write=True)
+                elif left.type in ("attribute", "subscript"):
+                    walk(left)
+            if right is not None:
+                walk(right)
+            return
+
+        if ntype == "augmented_assignment":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None:
+                if left.type == "identifier":
+                    name = node_text(left, source)
+                    if not is_shadowed(name):
+                        emit(name, line_of(left), is_write=True)
+                else:
+                    walk(left)
+            if right is not None:
+                walk(right)
+            return
+
+        if ntype == "keyword_argument":
+            val = node.child_by_field_name("value")
+            if val is not None:
+                walk(val)
+            return
+
+        if ntype == "call":
+            fn_expr = node.child_by_field_name("function")
+            args = node.child_by_field_name("arguments")
+            if fn_expr is not None and fn_expr.type != "identifier":
+                walk(fn_expr)
+            if args is not None:
+                walk(args)
+            return
+
+        if ntype == "attribute":
+            obj = node.child_by_field_name("object")
+            attr = node.child_by_field_name("attribute")
+            if obj is not None and obj.type == "identifier":
+                obj_name = node_text(obj, source)
+                if obj_name not in _PY_NON_VAR_IDENTS and not is_shadowed(obj_name):
+                    ln = line_of(node)
+                    if attr is not None and attr.type == "identifier":
+                        emit(f"{obj_name}.{node_text(attr, source)}", ln)
+                    emit(obj_name, ln)
+            elif obj is not None:
+                walk(obj)
+            return
+
+        if ntype == "for_statement":
+            right = node.child_by_field_name("right")
+            fbody = node.child_by_field_name("body")
+            alt = node.child_by_field_name("alternative")
+            if right is not None:
+                walk(right)
+            if fbody is not None:
+                walk(fbody)
+            if alt is not None:
+                walk(alt)
+            return
+
+        if ntype == "for_in_clause":
+            right = node.child_by_field_name("right")
+            if right is not None:
+                walk(right)
+            return
+
+        if ntype == "identifier":
+            name = node_text(node, source)
+            if not is_shadowed(name):
+                emit(name, line_of(node))
+            return
+
+        for ch in node.named_children:
+            walk(ch)
+
+    walk(body)
+    return refs
+
+
 def describe_scope(node: Node, source: bytes) -> tuple[str, str | None, str | None]:
     """Devuelve (qualname, class_name, container) de una def/clase.
 
@@ -354,6 +738,7 @@ def build_function(
         docstring=extract_docstring(body, source),
         param_count=len(params),
         calls=calls,
+        var_refs=collect_python_var_refs(node, source, function_nodes),
         internal_flow=build_flow(
             params,
             body,

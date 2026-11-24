@@ -73,6 +73,11 @@
           <span id="utilities-label-text" class="tool-label">Ocultar utilitarios (0)</span>
           <span id="utilities-count-badge" class="tool-badge hidden">0</span>
         </button>
+        <button id="btn-toggle-variables" class="action-btn sidebar-btn" type="button" aria-pressed="false" title="Mostrar constantes y variables top-level del proyecto">
+          <span class="tool-icon" aria-hidden="true">🔖</span>
+          <span id="variables-label-text" class="tool-label">Mostrar constantes (0)</span>
+          <span id="variables-count-badge" class="tool-badge hidden">0</span>
+        </button>
         <button id="btn-on-demand-edges" class="action-btn sidebar-btn" type="button" title="Aristas bajo demanda: atenúa conexiones y revela entrantes (cian) / salientes (ámbar) al pasar el cursor o seleccionar">
           <span class="tool-icon" aria-hidden="true">〰️</span>
           <span class="tool-label">Aristas bajo demanda</span>
@@ -161,6 +166,7 @@
             <span class="legend-item"><span class="shape shape-html"></span>HTML</span>
             <span class="legend-item"><span class="shape shape-loop"></span>🔁 Bucle / Callback</span>
             <span class="legend-item"><span class="shape shape-event-flow"></span>⚡ Evento / Listener</span>
+            <span class="legend-item"><span class="shape shape-variable"></span>Constante / Var</span>
           </div>
           <div class="legend-section">
             <span class="legend-title">Aristas</span>
@@ -171,6 +177,7 @@
             <span class="legend-item"><span class="edge-sample reactive-sub"></span>Suscripción</span>
             <span class="legend-item"><span class="edge-sample reactive-trig"></span>Disparo reactivo</span>
             <span class="legend-item"><span class="edge-sample html-bridge"></span>HTML / Script</span>
+            <span class="legend-item"><span class="edge-sample reads-var"></span>Lee variable</span>
           </div>
           <div class="legend-section">
             <span class="legend-title">Flujo</span>
@@ -309,6 +316,17 @@
           ></textarea>
         </div>
 
+        <div id="detail-var-preview-block" class="detail-block hidden">
+          <div class="var-preview-header">
+            <h3 id="detail-var-preview-title">Valor / Declaración</h3>
+            <button id="btn-var-load-source" class="call-action-btn" type="button" title="Cargar código fuente exacto de la declaración">Ver código</button>
+          </div>
+          <pre id="detail-var-preview" class="code-box"></pre>
+          <div id="detail-var-source-wrap" class="var-source-wrap hidden">
+            <pre id="detail-var-source" class="code-box var-source-code"></pre>
+          </div>
+        </div>
+
         <div id="detail-signature-block" class="detail-block hidden">
           <h3>Firma</h3>
           <pre id="detail-signature" class="code-box"></pre>
@@ -331,8 +349,15 @@
           </div>
         </div>
 
+        <div id="detail-file-variables-block" class="detail-block hidden">
+          <h3 id="detail-file-variables-title">Constantes / Variables del archivo</h3>
+          <div class="file-functions-box">
+            <ol id="detail-file-variables-list" class="file-functions-list"></ol>
+          </div>
+        </div>
+
         <div id="detail-internal-calls-block" class="detail-block hidden">
-          <h3>Llamadas internas</h3>
+          <h3 id="detail-internal-calls-title">Llamadas internas</h3>
           <div id="detail-hidden-utilities" class="hidden-utilities-box hidden">
             <span class="hidden-utilities-title">Utilitarios ocultos en el lienzo:</span>
             <div id="detail-hidden-utilities-chips" class="utility-chips"></div>

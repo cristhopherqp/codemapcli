@@ -238,7 +238,7 @@ async def handle_get_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "Nodo no encontrado"}, status=404, headers=NO_STORE_HEADERS)
 
     node_type = node.get("type")
-    if node_type == "function":
+    if node_type in ("function", "variable"):
         file_node = nodes_by_id.get(node.get("parent") or "")
         file_path_str = file_node.get("file_path") if isinstance(file_node, dict) else None
         file_id = file_node.get("id", "") if isinstance(file_node, dict) else ""

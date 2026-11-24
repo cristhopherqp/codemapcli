@@ -22,9 +22,11 @@ from codemap.models import (
     EDGE_EVENT_LISTENER,
     EDGE_REACTIVE_SUBSCRIBE,
     EDGE_REACTIVE_TRIGGER,
+    EDGE_READS_VAR,
     FileAnalysis,
     FunctionInfo,
     ImportBinding,
+    VariableInfo,
 )
 from codemap.roles import is_notifier_name, is_reactive_registrar
 
@@ -71,6 +73,7 @@ class ProjectIndex:
     functions_by_file: dict[str, dict[str, FunctionInfo]]  # ruta abs -> qualname -> info
     methods_by_name: dict[str, list[str]]                  # nombre corto -> IDs de métodos
     root_dir: str
+    variables_by_file: dict[str, dict[str, VariableInfo]] = field(default_factory=dict)
     path_by_file_id: dict[str, str] = field(default_factory=dict)
     js_configs_by_dir: dict[str, JsPathConfig | None] = field(default_factory=dict)
     _js_config_cache: dict[str, JsPathConfig | None] = field(default_factory=dict)
@@ -150,6 +153,7 @@ def build_index(analyses: list[FileAnalysis], file_ids: dict[str, str], root_dir
     for analysis in analyses:
         functions = {f.qualname: f for f in analysis.functions}
         index.functions_by_file[analysis.path] = functions
+        index.variables_by_file[analysis.path] = {v.qualname: v for v in analysis.variables}
         for function in analysis.functions:
             if function.class_name is not None:
                 fid = function_id(file_ids[analysis.path], function.qualname)
@@ -1135,3 +1139,85 @@ def infer_by_member(member: str, index: ProjectIndex) -> list[tuple[str, str]]:
     if 1 <= len(candidates) <= MAX_INFERRED_CANDIDATES:
         return [(candidate, INFERRED) for candidate in candidates]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Variables / constantes top-level (`edge_type: "reads_var"`)
+# ---------------------------------------------------------------------------
+
+def find_variable_symbol(
+    file_path: str,
+    symbol: str,
+    index: ProjectIndex,
+    depth: int = 0,
+) -> str | None:
+    """Resuelve un nombre de variable/constante top-level en `file_path` siguiendo re-exports."""
+    analysis = index.files.get(file_path)
+    if analysis is None:
+        return None
+    variables = index.variables_by_file.get(file_path, {})
+    file_id = index.file_ids[file_path]
+
+    if symbol == "default":
+        if analysis.default_export is None:
+            return None
+        symbol = analysis.default_export
+
+    if symbol in variables:
+        return function_id(file_id, symbol)
+
+    if depth >= MAX_REEXPORT_DEPTH:
+        return None
+    binding = find_binding(analysis, symbol)
+    if binding is None:
+        return None
+    target = resolve_binding(binding, analysis, index)
+    if target is None or target[1] is None:
+        return None
+    return find_variable_symbol(target[0], target[1], index, depth + 1)
+
+
+def resolve_variable_refs(index: ProjectIndex) -> list[ResolvedCall]:
+    """Resuelve referencias de lectura desde funciones hacia variables/constantes top-level."""
+    resolved: list[ResolvedCall] = []
+    for path, analysis in index.files.items():
+        if analysis.language == "html":
+            continue
+        file_id = index.file_ids[path]
+        local_vars = index.variables_by_file.get(path, {})
+
+        for function in analysis.functions:
+            if not function.var_refs:
+                continue
+            source_id = function_id(file_id, function.qualname)
+            for ref in function.var_refs:
+                target_id: str | None = None
+                if "." in ref.name:
+                    obj, _, member = ref.name.partition(".")
+                    binding = find_binding(analysis, obj)
+                    if binding is not None:
+                        bound = resolve_binding(binding, analysis, index)
+                        if bound is not None and bound[1] is None:
+                            target_id = find_variable_symbol(bound[0], member, index)
+                else:
+                    if ref.name in local_vars:
+                        target_id = function_id(file_id, ref.name)
+                    else:
+                        binding = find_binding(analysis, ref.name)
+                        if binding is not None:
+                            bound = resolve_binding(binding, analysis, index)
+                            if bound is not None:
+                                target_id = find_variable_symbol(bound[0], bound[1] or "default", index)
+
+                if target_id is not None and target_id != source_id:
+                    resolved.append(
+                        ResolvedCall(
+                            source_id=source_id,
+                            target_id=target_id,
+                            confidence=CONFIRMED,
+                            line=ref.line,
+                            edge_type=EDGE_READS_VAR,
+                            is_invocation=False,
+                        )
+                    )
+    return resolved

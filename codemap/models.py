@@ -22,6 +22,7 @@ EDGE_REACTIVE_SUBSCRIBE = "reactive_subscribe"
 EDGE_REACTIVE_TRIGGER = "reactive_trigger"
 EDGE_LOADS_SCRIPT = "loads_script"
 EDGE_SERVES_HTML = "serves_html"
+EDGE_READS_VAR = "reads_var"
 
 # Clasificación semántica de puntos de entrada / handlers / funciones sin llamadas.
 ENTRY_KIND_MAIN = "main"
@@ -106,6 +107,30 @@ class ClassInfo:
 
 
 @dataclass
+class VariableInfo:
+    """Variable o constante declarada en el nivel superior de un archivo."""
+
+    qualname: str              # "MAX_RETRIES", "API_URL"
+    short_name: str
+    kind: str                  # "constant" | "variable"
+    line: int
+    end_line: int
+    value_preview: str = ""    # resumen 1 línea <= 80 chars (sin secretos completos)
+    docstring: str = ""
+    type_annotation: str = ""
+    fingerprint: str = ""
+
+
+@dataclass
+class VarRefSite:
+    """Referencia de lectura/uso a una variable o constante top-level."""
+
+    name: str                  # "MAX_RETRIES" o "config.API_URL"
+    line: int
+    is_write: bool = False
+
+
+@dataclass
 class FunctionInfo:
     """Función, método, arrow function o callback nombrado por contexto."""
 
@@ -120,6 +145,7 @@ class FunctionInfo:
     end_line: int = 0
     is_constructor: bool = False
     calls: list[CallSite] = field(default_factory=list)
+    var_refs: list[VarRefSite] = field(default_factory=list)
     internal_flow: list[FlowStep] = field(default_factory=list)
     branch_count: int = 0      # if / elif / case ...
     return_count: int = 0
@@ -158,6 +184,7 @@ class FileAnalysis:
     docstring: str = ""
     functions: list[FunctionInfo] = field(default_factory=list)
     classes: list[ClassInfo] = field(default_factory=list)
+    variables: list[VariableInfo] = field(default_factory=list)
     imports: list[ImportBinding] = field(default_factory=list)
     class_names: set[str] = field(default_factory=set)
     default_export: str | None = None  # qualname exportado por defecto (JS/TS)

@@ -8,23 +8,6 @@
 
 ## Improvements & Refactoring
 
-### Lote 2 — Variables y Constantes Top-Level (Nivel de Archivo)
-
-- [ ] **Detección y visualización opcional de Variables y Constantes a nivel de archivo (Top-Level):**
-  - *Objetivo:* Hacer visibles el estado compartido, constantes de configuración, rutas base y tablas declarativas de reglas dentro de un archivo sin saturar el grafo.
-  - *Alcance y criterios:*
-    - **Incluir:** Únicamente declaraciones ubicadas en la raíz del archivo (constantes, objetos/tablas de configuración, variables top-level que no sean funciones).
-    - **Excluir:** Declaraciones `import`/`require` y variables locales internas de cada función.
-  - *Solución técnica sugerida:*
-    - **Backend (`models.py`, `python_parser.py`, `js_parser.py`, `resolver.py`, `graph_builder.py`, `exporter.py`):**
-      - Extraer `VariableInfo` (`qualname`, `short_name`, `kind`, `line`, `end_line`, `value_preview`, `docstring`) y detectar referencias de lectura/uso desde funciones (respetando sombreado de parámetros y variables locales) para generar aristas sutiles (`edge_type: "reads_var"` / `"uses_var"`).
-      - Serializar nodos `type: "variable"` en `graph.json` ordenados por `line` (compatibles con `Orden: Creación (1→N)` y la lista del archivo).
-    - **Frontend (`app.js`, `index.html`, `styles.css`):**
-      - Representación visual compacta y diferenciada de las funciones (p. ej. estilo pastilla con borde punteado) conectada con aristas discretas hacia las funciones consumidoras.
-      - Botón toggle en la barra lateral izquierda (`Mostrar/Ocultar constantes`) para activarlos o esconderlos al vuelo, plenamente integrados con el Inspector (vista previa/código vía `GET /source`, docstring y nota personal) y el tooltip flotante de `1 s`.
-
----
-
 ### Lote 3 — Recorrido Visual Estático (*Static Walkthrough* / Debug Visual)
 
 - [ ] **Reproductor de Recorrido Visual Estático con partícula "Chispa", Call Stack simulado y contrato desacoplado:**
