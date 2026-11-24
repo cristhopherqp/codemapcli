@@ -118,6 +118,27 @@ def _compact_node(node: dict, *, include_flow: bool) -> dict:
         )
 
     if node_type == "file":
+        raw_classes = node.get("classes")
+        compact_classes = (
+            {
+                cname: _prune_neutral(
+                    {
+                        "qualname": cdata.get("qualname"),
+                        "short_name": cdata.get("short_name"),
+                        "bases": cdata.get("bases"),
+                        "implements": cdata.get("implements"),
+                        "is_abstract": cdata.get("is_abstract"),
+                        "docstring": cdata.get("docstring"),
+                        "line": cdata.get("line"),
+                        "end_line": cdata.get("end_line"),
+                    }
+                )
+                for cname, cdata in raw_classes.items()
+                if isinstance(cdata, dict)
+            }
+            if isinstance(raw_classes, dict) and raw_classes
+            else None
+        )
         return _prune_neutral(
             {
                 "id": node.get("id"),
@@ -131,6 +152,7 @@ def _compact_node(node: dict, *, include_flow: bool) -> dict:
                 "script_targets": node.get("script_targets"),
                 "loaded_by_html": node.get("loaded_by_html"),
                 "module_entry_functions": node.get("module_entry_functions"),
+                "classes": compact_classes,
             }
         )
 
@@ -143,6 +165,8 @@ def _compact_node(node: dict, *, include_flow: bool) -> dict:
         "label": node.get("label"),
         "role": node.get("role"),
         "arch_layer": node.get("arch_layer"),
+        "class_name": node.get("class_name"),
+        "is_constructor": node.get("is_constructor"),
         "entry_kind": node.get("entry_kind"),
         "is_main_entry": node.get("is_main_entry"),
         "is_event_handler": node.get("is_event_handler"),
@@ -401,6 +425,25 @@ def build_ai_markdown(graph: dict, *, include_flow: bool = False) -> str:
             if fnode.get("script_targets"):
                 targets = ", ".join(f"`{t}`" for t in fnode["script_targets"])
                 lines.append(f"- Carga scripts: {targets}")
+
+            raw_classes = fnode.get("classes")
+            if isinstance(raw_classes, dict) and raw_classes:
+                for cls in sorted(raw_classes.values(), key=lambda c: (c.get("line", 0), c.get("qualname", ""))):
+                    prefix = "abstract class " if cls.get("is_abstract") else "class "
+                    bases = cls.get("bases") or []
+                    implements = cls.get("implements") or []
+                    if fnode.get("language") == "python":
+                        decl = f"{prefix}{cls.get('qualname', '')}({', '.join(bases)})" if bases else f"{prefix}{cls.get('qualname', '')}"
+                    else:
+                        decl = f"{prefix}{cls.get('qualname', '')}"
+                        if bases:
+                            decl += f" extends {', '.join(bases)}"
+                        if implements:
+                            decl += f" implements {', '.join(implements)}"
+                    cls_line = cls.get("line", 0)
+                    cls_doc = _collapse_ws(cls.get("docstring", ""))
+                    doc_suffix = f" — {cls_doc[:140].rstrip() + '…' if len(cls_doc) > 140 else cls_doc}" if cls_doc else ""
+                    lines.append(f"- `L{cls_line}` **`{decl}`** [clase]{doc_suffix}")
 
             file_fns = fns_by_file.get(fid, [])
             if not file_fns:

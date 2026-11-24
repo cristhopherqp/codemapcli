@@ -228,46 +228,61 @@
 
       <div class="details-content hidden" id="details-content">
         <div class="details-header">
-          <div class="details-badges">
-            <span id="detail-badge" class="role-badge"></span>
-            <span id="detail-flow-badges" class="flow-badges"></span>
+          <div class="details-header-top">
+            <div class="details-badges">
+              <span id="detail-badge" class="role-badge"></span>
+              <span id="detail-flow-badges" class="flow-badges"></span>
+            </div>
+            <button
+              id="btn-isolate-file"
+              class="isolate-file-pill hidden"
+              type="button"
+              title="Colapsar el resto de archivos para enfocar únicamente este archivo"
+            >
+              🎯 Aislar archivo
+            </button>
           </div>
           <h2 id="detail-title"></h2>
+          <a
+            id="detail-class-context"
+            class="detail-class-context hidden"
+            href="#"
+            title="Abrir declaración de la clase en VS Code"
+          ></a>
           <p id="detail-id" class="detail-id"></p>
         </div>
 
         <div class="details-actions">
-          <a id="detail-vscode" class="vscode-link hidden" href="#" title="Abrir en Visual Studio Code">
-            Abrir en VS Code
-          </a>
-          <div class="action-row">
-            <button id="btn-pin-node" class="pin-node-btn" type="button">Fijar posición</button>
-            <button id="btn-toggle-node" class="toggle-node-btn hidden" type="button"></button>
-          </div>
+          <button id="btn-toggle-node" class="details-action-btn toggle-node-btn" type="button">Expandir flujo</button>
           <button
             id="btn-open-floating"
-            class="floating-open-btn hidden"
+            class="details-action-btn floating-open-btn"
             type="button"
             title="Expandir en ventana flotante sin alterar el grafo principal (Alt + Doble clic)"
           >
-            ↗ Abrir en ventana flotante
+            ↗ Abrir en ventana
           </button>
+          <button id="btn-pin-node" class="details-action-btn pin-node-btn" type="button">Fijar posición</button>
           <button
-            id="btn-isolate-file"
-            class="isolate-file-btn hidden"
+            id="btn-release-pinned"
+            class="details-action-btn release-pinned-btn"
             type="button"
-            title="Colapsar el resto de archivos para enfocar únicamente este archivo"
+            disabled
+            title="Liberar únicamente los nodos fijados en la selección o subárbol actual"
           >
-            🎯 Aislar este archivo
+            Liberar fijados (0)
           </button>
           <button
             id="btn-explore-nhops"
-            class="nhops-open-btn hidden"
+            class="details-action-btn nhops-open-btn"
             type="button"
             title="Explorar vecindad progresiva (N-hops hacia callers y callees) desde este nodo"
           >
-            🔭 Explorar vecindad (1 hop)
+            🔭 Explorar vecindad
           </button>
+          <a id="detail-vscode" class="details-action-btn vscode-link" href="#" title="Abrir en Visual Studio Code">
+            Abrir en VS Code
+          </a>
         </div>
 
         <div id="detail-role-block" class="detail-block hidden">
@@ -297,6 +312,11 @@
         <div id="detail-signature-block" class="detail-block hidden">
           <h3>Firma</h3>
           <pre id="detail-signature" class="code-box"></pre>
+        </div>
+
+        <div id="detail-class-docstring-block" class="detail-block detail-class-docstring-block hidden">
+          <h3 id="detail-class-docstring-title">Docstring de la clase</h3>
+          <p id="detail-class-docstring" class="docstring-text"></p>
         </div>
 
         <div id="detail-docstring-block" class="detail-block hidden">

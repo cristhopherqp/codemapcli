@@ -6,61 +6,7 @@
 
 ---
 
-## Critical Fixes (Bugs)
-
-- [ ] **Trazado de aristas roto o invisible en `Nivel 3+: Intra-función` (lienzo principal y ventana flotante):**
-  - *Problema:* Al visualizar el flujo interno de una función (tanto expandido inline en Nivel 3+ como dentro de ventanas flotantes de función), las flechas entre pasos (`type === "flow"`) se trazan de forma errónea, se desvían o directamente no llegan a verse.
-  - *Causas probables a investigar y corregir:*
-    - Verificar el alcance de las aristas de flujo en `buildElkInput()` / `buildCreationElkInput()` y `runSubElkLayout()` (`codemap/viewer/app.js`): colocar aristas internas en el contenedor propietario correcto (`expandedFn` / `flowContainer`) y validar `containerOffsets` al proyectar `sections` hacia `convertElkPointsToCytoscapeSegments()`, especialmente cuando coexisten con `SEPARATE_CHILDREN` en modo `Creación (1→N)`.
-    - Revisar aristas que entran o salen de sub-contenedores compuestos (`flowContainer === "true"`, como bucles `🔁` o hooks `⚡`) donde `srcNode.isParent() || tgtNode.isParent()` hoy descarta `.elk-routed` o genera colisiones de coordenadas.
-    - Asegurar visibilidad y contraste en `buildStylesheet()` (`z-compound-depth: "top"`, contraste de `edge[kind = "flow"]` sobre fondos `#142030` / `#101b2d` y comportamiento de `edge-distances` entre pasos cortos).
-
-- [ ] **Anclaje por ámbito real al arrastrar contenedores, persistencia en Nivel 3+ y recálculo selectivo de aristas:**
-  - *Problema:*
-    1. Al arrastrar un contenedor (`file`, `module` o `function` expandida en Nivel 3/3+) aunque sea ligeramente, `handleNodeDragFree()` fija individualmente a todos sus nodos hijos en `notes.json` y borra `.elk-routed` de todas sus aristas (incluso las internas), provocando que el contenido interno se desordene al re-renderizar o recargar.
-    2. En `Nivel 3+: Intra-función`, mover pasos de flujo (`type === "flow"`) o bloques internos no fija su posición al soltarlos.
-  - *Solución técnica sugerida (coherente en todos los niveles: Módulos, Archivos, Funciones e Intra-función):*
-    - **Anclaje estricto por ámbito (sin contaminar hijos):**
-      - Arrastrar un **módulo** o **archivo** fija únicamente el desplazamiento/posición de ese contenedor (trasladando su contenido interno como bloque rígido `(dx, dy)` sin marcar como `pinned` a sus archivos ni funciones hijas).
-      - Arrastrar una **función** fija únicamente esa función (sin fijar los pasos internos de su flujo 3+ si está expandida).
-      - Arrastrar un **paso de flujo (`type === "flow"`)** en Nivel 3+ (lienzo principal y/o estado de posición por contexto `intra`) sí persiste su posición fijada en `notes.json` (`VALID_LAYOUT_LEVELS` / `notes_storage.py`).
-    - **Recálculo local y no destructivo de aristas:**
-      - Conservar intactas las rutas `.elk-routed` de todas las aristas *internas* a un contenedor trasladado en bloque (al compartir el mismo `(dx, dy)`, `segment-weights` y `segment-distances` son invariantes).
-      - Recalcular/re-enrutar **únicamente las aristas externas incidentes** al nodo o contenedor movido (mediante enrutado ortogonal local / `taxi` direccional ajustado o recálculo focalizado al soltar el arrastre), sin ejecutar un relayout global que mueva el resto del grafo.
-
----
-
 ## Improvements & Refactoring
-
-### Lote 1 — Ergonomía del Inspector, Clases y Ventanas Flotantes
-
-- [ ] **Contexto completo de Clases en parsers e Inspector (herencia, docstring y rol constructor/método):**
-  - *Problema:* Al seleccionar un constructor o método (p. ej. `ConfigError.constructor()` de `export class ConfigError extends Error`), el Inspector solo muestra `Transformación`, `FIN` y el nombre `ConfigError.constructor()`, sin indicar claramente que pertenece a una clase, de qué hereda ni mostrar el docstring explicativo de la clase.
-  - *Solución técnica sugerida:*
-    - Añadir `ClassInfo` (`qualname`, `short_name`, `bases`, `docstring`, `line`, `end_line`) en `codemap/models.py` y extraerlo en `codemap/parsers/python_parser.py` y `codemap/parsers/js_parser.py` (incluyendo `extends` en JS/TS, clases base en Python y el docstring/JSDoc propio de la clase).
-    - Exponer el mapa/resumen de clases por archivo en `codemap/graph_builder.py` (evitando duplicar el docstring de clase en cada método) y marcar `is_constructor` / `class_name` en los nodos de función correspondientes.
-    - En el Inspector (`codemap/viewer/app.js`, `index.html`, `styles.css`), al seleccionar un constructor o método: mostrar una insignia clara (`CONSTRUCTOR` o `MÉTODO`), indicar la clase y su herencia (`class ConfigError extends Error`) junto al encabezado, y renderizar un bloque dedicado con el **Docstring de la clase** antes o junto al docstring del método.
-
-- [ ] **Reorganización de acciones del Inspector (3 filas) y liberación selectiva de posiciones fijadas:**
-  - *Problema:* Los botones de acción del Inspector ocupan demasiada altura vertical, algunos textos se comprimen y no existe una forma rápida de liberar posiciones fijadas únicamente para la selección actual sin reiniciar todo el grafo.
-  - *Solución técnica sugerida:*
-    - Reorganizar `.details-actions` en `codemap/viewer/index.html`, `styles.css` y `app.js` en **3 filas de 2 botones** con textos concisos que encajen holgadamente:
-      1. **Fila 1:** `Expandir flujo` / `Ocultar flujo` (o `Expandir` / `Colapsar` en contenedores) **|** `Abrir en ventana`
-      2. **Fila 2:** `Fijar posición` / `Liberar posición` **|** `Liberar fijados` (ámbito selectivo)
-      3. **Fila 3:** `Explorar vecindad` **|** `Abrir en VS Code`
-    - Implementar el botón **`Liberar fijados`** con alcance estrictamente contextual (nunca global sobre todo el repositorio):
-      - Si hay **multi-selección** en Cytoscape (`Shift` o `Ctrl` + clic / selección de caja, `cy.nodes(":selected").length > 1`), libera las posiciones fijadas de esos nodos seleccionados (y sus descendientes si incluye contenedores) en el contexto de layout activo.
-      - Si hay un único nodo seleccionado (`module`, `file`, `function` o sección/capa), libera las posiciones fijadas pertenecientes únicamente a ese nodo y su subárbol directo en el contexto activo, actualizando `notes.json` en una sola petición y re-enrutando solo el ámbito afectado.
-
-- [ ] **Divisor redimensionable manual y controles de lectura (`Word Wrap` + Zoom de fuente) en ventana flotante de código:**
-  - *Problema:* En la vista dividida `Flujo y código` de las ventanas flotantes no es posible ajustar manualmente el ancho entre ambos paneles; además, en `Solo código` y `Flujo y código` faltan controles para alternar ajuste de líneas (`wrap`) y variar el tamaño de letra del código.
-  - *Solución técnica sugerida:*
-    - Añadir una barra divisoria vertical arrastrable (`.fw-split-resizer`) dentro de `.fw-body.mode-split` (`app.js`, `styles.css`) para ajustar libremente la proporción entre el subgrafo Cytoscape y `.fw-code-pane` (con límites mínimos seguros y llamando `win.cy.resize()` en tiempo real).
-    - Incorporar en la barra superior de `.fw-code-pane` (visible en `Solo código` y `Flujo y código`):
-      - Botón toggle **`Ajustar líneas` (Word Wrap)** que alterne entre ajuste al ancho disponible (`white-space: pre-wrap; overflow-wrap: anywhere`) y desplazamiento horizontal (`white-space: pre; overflow-x: auto`).
-      - Controles de tamaño de fuente (**`A−`**, indicador numérico, **`A+`**, acotados p. ej. entre `10px` y `22px`, recordando la preferencia en el navegador vía `localStorage`).
-
----
 
 ### Lote 2 — Variables y Constantes Top-Level (Nivel de Archivo)
 

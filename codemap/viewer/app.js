@@ -1045,16 +1045,17 @@ function updateExploreNHopsButton(node) {
     return;
   }
   if (!node || (node.type !== "function" && node.type !== "file")) {
-    btn.classList.add("hidden");
+    btn.disabled = true;
+    btn.textContent = "🔭 Vecindad";
     btn.classList.remove("active");
     return;
   }
   const isAnchor = state.nhops.active && state.nhops.anchorIds.includes(node.id);
+  btn.disabled = false;
   btn.textContent = isAnchor
-    ? "✕ Salir de vecindad N-hops"
-    : (state.nhops.active ? "🔭 Centrar vecindad aquí (1 hop)" : "🔭 Explorar vecindad (1 hop)");
+    ? "✕ Salir vecindad"
+    : (state.nhops.active ? "🔭 Centrar aquí" : "🔭 Explorar vecindad");
   btn.classList.toggle("active", isAnchor);
-  btn.classList.remove("hidden");
 }
 
 async function activateNHops(anchorIds, { forwardDepth = 1, backwardDepth = 1, autoTriggered = false } = {}) {
@@ -1319,17 +1320,16 @@ function updateIsolateFileButton(node) {
   if (!btn) {
     return;
   }
-  const fileId = node ? resolveFileIdForNode(node.id) : null;
   const totalFiles = state.rawGraph
     ? state.rawGraph.nodes.filter((n) => n.type === "file").length
     : 0;
-  if (!fileId || totalFiles <= 1) {
+  if (!node || node.type !== "file" || totalFiles <= 1) {
     btn.classList.add("hidden");
     btn.classList.remove("active");
     return;
   }
-  const isThisIsolated = state.isolatedFileId === fileId;
-  btn.textContent = isThisIsolated ? "✕ Salir de aislamiento de archivo" : "🎯 Aislar este archivo";
+  const isThisIsolated = state.isolatedFileId === node.id;
+  btn.textContent = isThisIsolated ? "✕ Salir aislamiento" : "🎯 Aislar archivo";
   btn.classList.toggle("active", isThisIsolated);
   btn.classList.remove("hidden");
 }
@@ -1720,9 +1720,12 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
     }
     const isLayerCollapsed = state.collapsedContainers.has(layer.id);
     const badgeCount = fnCountByLayer.get(layer.index) || members.length;
-    const layerLabel = isLayerCollapsed
+    const layerNote = getNoteEntry(layer.id);
+    const isLayerPinned = !subgraphFilter && isPinnedInCurrentContext(layerNote);
+    const baseLayerLabel = isLayerCollapsed
       ? `${layer.index} · ${layer.label} [+ ${badgeCount}]`
       : `${layer.index} · ${layer.label}`;
+    const layerLabel = isLayerPinned ? `${baseLayerLabel} [📌]` : baseLayerLabel;
 
     visibleNodeIds.add(layer.id);
     nodes.push({
@@ -1730,13 +1733,14 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
         id: layer.id,
         parent: undefined,
         label: layerLabel,
+        baseLabel: baseLayerLabel,
         type: "layer",
         role: "layer",
         layerIndex: layer.index,
         collapsed: isLayerCollapsed ? "true" : "false",
         expandedFn: "false",
-        pinned: "false",
-        hasNote: "false",
+        pinned: isLayerPinned ? "true" : "false",
+        hasNote: layerNote.note && layerNote.note.trim() ? "true" : "false",
       },
     });
 
@@ -1793,7 +1797,7 @@ function buildLayerModeElements(subgraphFilter, activeFlowNodeSet, flowNodeOrder
       });
 
       if (isExpandedFn) {
-        appendInternalFlowElements(rawNode, nodes, visibleNodeIds);
+        appendInternalFlowElements(rawNode, nodes, visibleNodeIds, { ignorePins: Boolean(subgraphFilter) });
       }
     }
   }
@@ -1871,7 +1875,7 @@ function buildVisibleElements() {
     });
 
     if (isExpandedFn) {
-      appendInternalFlowElements(rawNode, nodes, visibleNodeIds);
+      appendInternalFlowElements(rawNode, nodes, visibleNodeIds, { ignorePins: Boolean(subgraphFilter) });
     }
   }
 
@@ -1982,7 +1986,11 @@ function estimateFlowStepSize(role, kind, label) {
   };
 }
 
-function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
+function appendInternalFlowElements(fnNode, nodes, visibleNodeIds, options) {
+  const ignorePins = Boolean(options && options.ignorePins);
+  const canCheckPins = !ignorePins
+    && typeof getNoteEntry === "function"
+    && typeof isPinnedInCurrentContext === "function";
   const flowSteps = fnNode.internal_flow || [];
   const stepIds = new Set(flowSteps.map((step) => step.id));
   for (const step of flowSteps) {
@@ -1992,17 +2000,21 @@ function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
       : fnNode.id;
     visibleNodeIds.add(stepId);
     const stepKind = step.kind || "step";
-    const displayLabel = stepKind === "merge"
+    const baseLabel = stepKind === "merge"
       ? (step.label || "fin")
       : (step.role === "entry" && step.label.startsWith("in:")
           ? `ENTRADA\n${step.label}`
           : step.label);
-    const stepSize = estimateFlowStepSize(step.role, stepKind, displayLabel);
+    const noteEntry = canCheckPins ? getNoteEntry(stepId) : null;
+    const isPinnedHere = Boolean(noteEntry && isPinnedInCurrentContext(noteEntry));
+    const displayLabel = isPinnedHere ? `${baseLabel} [📌]` : baseLabel;
+    const stepSize = estimateFlowStepSize(step.role, stepKind, baseLabel);
     nodes.push({
       data: {
         id: stepId,
         parent: parentNodeId,
         label: displayLabel,
+        baseLabel,
         type: "flow",
         role: step.role,
         flowKind: stepKind,
@@ -2012,8 +2024,8 @@ function appendInternalFlowElements(fnNode, nodes, visibleNodeIds) {
         elkWidth: stepSize.width,
         elkHeight: stepSize.height,
         flowEdges: Array.isArray(step.edges) ? step.edges : null,
-        pinned: "false",
-        hasNote: "false",
+        pinned: isPinnedHere ? "true" : "false",
+        hasNote: noteEntry && noteEntry.note && noteEntry.note.trim() ? "true" : "false",
         collapsed: "false",
         expandedFn: "false",
         ownerFunctionId: fnNode.id,
@@ -2358,9 +2370,30 @@ function initCytoscape() {
     await toggleNodeExpansion(nodeId);
   });
 
-  // Anclaje híbrido por nivel: arrastrar un nodo fija su posición en el nivel actual.
-  state.cy.on("dragfree", "node", async (event) => {
-    await handleNodeDragFree(event.target);
+  // Anclaje estricto por ámbito: durante el arrastre solo se sueltan aristas externas;
+  // al soltar se fija únicamente el ancestro más externo arrastrado y se re-enrutan solo sus aristas externas.
+  state.cy.on("grab", "node", (event) => {
+    handleNodeGrab(event.target);
+  });
+
+  state.cy.on("drag", "node", () => {
+    handleNodeDrag();
+  });
+
+  state.cy.on("dragfree", "node", (event) => {
+    scheduleNodeDragFree(event.target);
+  });
+
+  let selectionUpdateScheduled = false;
+  state.cy.on("select unselect", "node", () => {
+    if (selectionUpdateScheduled) {
+      return;
+    }
+    selectionUpdateScheduled = true;
+    queueMicrotask(() => {
+      selectionUpdateScheduled = false;
+      updateReleasePinnedButton();
+    });
   });
 
   bindEdgeTooltipEvents();
@@ -2604,27 +2637,595 @@ function bindEdgeTooltipEvents() {
   });
 }
 
-async function handleNodeDragFree(cyNode) {
-  // Al arrastrar un nodo, sus aristas incidentes pasan a enrutamiento `taxi` dinámico
-  // para no conservar bendPoints antiguos de ELKjs.
-  const affectedNodes = cyNode.isParent() ? cyNode.union(cyNode.descendants()) : cyNode;
-  affectedNodes.connectedEdges().removeClass("elk-routed");
+let _activeDragExternalEdges = [];
+let _pendingDragFreeNodes = new Map();
+let _dragFreeFlushScheduled = false;
 
-  const leafNodes = cyNode.isParent()
-    ? cyNode.descendants().filter((item) => !item.isParent() && item.data("type") !== "flow")
-    : [cyNode];
-
-  const contextKey = getCurrentLayoutContextKey();
-  const { flow: activeFlow, nodeOrder: flowNodeOrder } = getActiveFlowStepMaps();
-  const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
-
-  const patchNodes = {};
-  for (const item of leafNodes) {
-    const id = item.id();
-    if (!state.nodesById.has(id)) {
+function filterOutermostDraggedNodes(cyNodes) {
+  const unique = [];
+  const seen = new Set();
+  for (const node of cyNodes || []) {
+    if (!node || typeof node.id !== "function") {
       continue;
     }
+    const id = node.id();
+    if (!seen.has(id)) {
+      seen.add(id);
+      unique.push(node);
+    }
+  }
+  const idSet = new Set(unique.map((n) => n.id()));
+  return unique.filter((node) => {
+    let cur = typeof node.parent === "function" ? node.parent() : null;
+    while (cur && cur.length > 0) {
+      if (idSet.has(cur.id())) {
+        return false;
+      }
+      cur = cur.parent();
+    }
+    return true;
+  });
+}
+
+function collectScopeAndExternalEdges(cy, outermostNodes) {
+  const scopeIds = new Set();
+  for (const node of outermostNodes || []) {
+    if (!node || node.length === 0) {
+      continue;
+    }
+    scopeIds.add(node.id());
+    if (node.isParent()) {
+      node.descendants().forEach((desc) => {
+        scopeIds.add(desc.id());
+      });
+    }
+  }
+  const externalEdges = [];
+  if (cy && scopeIds.size > 0) {
+    cy.edges().forEach((edge) => {
+      if (edge.isLoop()) {
+        return;
+      }
+      const srcIn = scopeIds.has(edge.source().id());
+      const tgtIn = scopeIds.has(edge.target().id());
+      if (srcIn !== tgtIn) {
+        externalEdges.push(edge);
+      }
+    });
+  }
+  return { scopeIds, externalEdges };
+}
+
+function computeDynamicTaxiDirection(srcPos, tgtPos) {
+  if (!srcPos || !tgtPos) {
+    return "downward";
+  }
+  const dx = tgtPos.x - srcPos.x;
+  const dy = tgtPos.y - srcPos.y;
+  if (Math.abs(dy) >= Math.abs(dx)) {
+    return dy >= 0 ? "downward" : "upward";
+  }
+  return dx >= 0 ? "rightward" : "leftward";
+}
+
+function handleNodeGrab(cyNode) {
+  if (!state.cy || !cyNode || cyNode.length === 0) {
+    _activeDragExternalEdges = [];
+    return;
+  }
+  const grabbed = state.cy.nodes(":grabbed");
+  const candidates = grabbed.length > 0 ? grabbed.union(cyNode).toArray() : [cyNode];
+  const outermost = filterOutermostDraggedNodes(candidates);
+  const { externalEdges } = collectScopeAndExternalEdges(state.cy, outermost);
+  _activeDragExternalEdges = externalEdges;
+
+  // Solo las aristas externas pierden `.elk-routed` durante el arrastre; las internas quedan intactas.
+  if (externalEdges.length > 0) {
+    state.cy.batch(() => {
+      for (const edge of externalEdges) {
+        edge.removeClass("elk-routed");
+        edge.removeData("srcEndpoint tgtEndpoint");
+        edge.data("taxiDir", computeDynamicTaxiDirection(edge.source().position(), edge.target().position()));
+      }
+    });
+  }
+}
+
+function handleNodeDrag() {
+  if (!state.cy || _activeDragExternalEdges.length === 0) {
+    return;
+  }
+  for (const edge of _activeDragExternalEdges) {
+    if (!edge || edge.removed()) {
+      continue;
+    }
+    const src = edge.source();
+    const tgt = edge.target();
+    if (src.isParent() && typeof src.updateCompoundBounds === "function") {
+      src.updateCompoundBounds(true);
+    }
+    if (tgt.isParent() && typeof tgt.updateCompoundBounds === "function") {
+      tgt.updateCompoundBounds(true);
+    }
+    edge.data("taxiDir", computeDynamicTaxiDirection(src.position(), tgt.position()));
+  }
+}
+
+function scheduleNodeDragFree(cyNode) {
+  if (!cyNode || cyNode.length === 0) {
+    return;
+  }
+  _pendingDragFreeNodes.set(cyNode.id(), cyNode);
+  if (_dragFreeFlushScheduled) {
+    return;
+  }
+  _dragFreeFlushScheduled = true;
+  queueMicrotask(async () => {
+    _dragFreeFlushScheduled = false;
+    const batchNodes = Array.from(_pendingDragFreeNodes.values());
+    _pendingDragFreeNodes.clear();
+    await handleNodeDragFreeBatch(batchNodes);
+  });
+}
+
+function rerouteExternalEdgesLocally(cy, edges) {
+  if (!cy || !edges) {
+    return 0;
+  }
+  const edgeList = Array.isArray(edges) ? edges : edges.toArray();
+  if (edgeList.length === 0) {
+    return 0;
+  }
+
+  const parentNodes = cy.nodes(":parent");
+  if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
+    parentNodes.updateCompoundBounds(true);
+  }
+
+  const leafBoxes = [];
+  cy.nodes().forEach((n) => {
+    if (n.isParent() || !n.visible()) {
+      return;
+    }
+    const pos = n.position();
+    const ow = n.outerWidth();
+    const oh = n.outerHeight();
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) {
+      return;
+    }
+    const hw = (Number.isFinite(ow) && ow > 2 ? ow : 140) / 2;
+    const hh = (Number.isFinite(oh) && oh > 2 ? oh : 44) / 2;
+    leafBoxes.push({
+      id: n.id(),
+      left: pos.x - hw,
+      right: pos.x + hw,
+      top: pos.y - hh,
+      bottom: pos.y + hh,
+      cx: pos.x,
+      cy: pos.y,
+      hw,
+      hh,
+    });
+  });
+
+  const getNodeGeom = (cyNode) => {
+    if (!cyNode || cyNode.length === 0) {
+      return null;
+    }
+    const pos = cyNode.position();
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) {
+      return null;
+    }
+    const ow = cyNode.outerWidth();
+    const oh = cyNode.outerHeight();
+    const hw = (Number.isFinite(ow) && ow > 2 ? ow : 140) / 2;
+    const hh = (Number.isFinite(oh) && oh > 2 ? oh : 44) / 2;
+    return {
+      cx: pos.x,
+      cy: pos.y,
+      hw,
+      hh,
+      left: pos.x - hw,
+      right: pos.x + hw,
+      top: pos.y - hh,
+      bottom: pos.y + hh,
+      shape: String(cyNode.style("shape") || "round-rectangle"),
+      isParent: cyNode.isParent(),
+    };
+  };
+
+  const clampVal = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const round1 = (v) => Math.round(v * 10) / 10;
+
+  const projectBorder = (pt, refPt, geom) => {
+    const segDx = refPt.x - pt.x;
+    const segDy = refPt.y - pt.y;
+    let dx = 0;
+    let dy = 0;
+    if (Math.abs(segDx) <= 1.5 && Math.abs(segDy) > 0.5) {
+      const dirY = segDy >= 0 ? 1 : -1;
+      dx = clampVal(pt.x - geom.cx, -geom.hw + 1, geom.hw - 1);
+      if (geom.shape === "round-diamond" || geom.shape === "diamond") {
+        const frac = Math.min(0.96, Math.abs(dx) / Math.max(1, geom.hw));
+        dy = dirY * geom.hh * (1 - frac);
+      } else if (geom.shape === "ellipse") {
+        const frac = Math.min(0.98, Math.abs(dx) / Math.max(1, geom.hw));
+        dy = dirY * geom.hh * Math.sqrt(Math.max(0.04, 1 - frac * frac));
+      } else {
+        dy = dirY * geom.hh;
+      }
+    } else if (Math.abs(segDy) <= 1.5 && Math.abs(segDx) > 0.5) {
+      const dirX = segDx >= 0 ? 1 : -1;
+      dy = clampVal(pt.y - geom.cy, -geom.hh + 1, geom.hh - 1);
+      if (geom.shape === "round-diamond" || geom.shape === "diamond") {
+        const frac = Math.min(0.96, Math.abs(dy) / Math.max(1, geom.hh));
+        dx = dirX * geom.hw * (1 - frac);
+      } else if (geom.shape === "ellipse") {
+        const frac = Math.min(0.98, Math.abs(dy) / Math.max(1, geom.hh));
+        dx = dirX * geom.hw * Math.sqrt(Math.max(0.04, 1 - frac * frac));
+      } else {
+        dx = dirX * geom.hw;
+      }
+    } else {
+      const rx = refPt.x - geom.cx;
+      const ry = refPt.y - geom.cy;
+      const denom = Math.max(Math.abs(rx) / Math.max(1, geom.hw), Math.abs(ry) / Math.max(1, geom.hh));
+      const t = denom > 0 ? 1 / denom : 0;
+      dx = rx * t;
+      dy = ry * t;
+    }
+    const rdx = round1(dx);
+    const rdy = round1(dy);
+    return { x: geom.cx + rdx, y: geom.cy + rdy, endpointStr: `${rdx}px ${rdy}px` };
+  };
+
+  const buildIgnoreSet = (srcNode, tgtNode) => {
+    const ignore = new Set([srcNode.id(), tgtNode.id()]);
+    if (srcNode.isParent()) {
+      srcNode.descendants().forEach((d) => ignore.add(d.id()));
+    }
+    if (tgtNode.isParent()) {
+      tgtNode.descendants().forEach((d) => ignore.add(d.id()));
+    }
+    return ignore;
+  };
+
+  const vSegBlocked = (x, y1, y2, ignore) => {
+    const top = Math.min(y1, y2);
+    const bot = Math.max(y1, y2);
+    return leafBoxes.some(
+      (b) => !ignore.has(b.id)
+        && x > b.left - 3
+        && x < b.right + 3
+        && bot > b.top - 3
+        && top < b.bottom + 3,
+    );
+  };
+
+  const hSegBlocked = (y, x1, x2, ignore) => {
+    const left = Math.min(x1, x2);
+    const right = Math.max(x1, x2);
+    return leafBoxes.some(
+      (b) => !ignore.has(b.id)
+        && y > b.top - 3
+        && y < b.bottom + 3
+        && right > b.left - 3
+        && left < b.right + 3,
+    );
+  };
+
+  const clearRoute = (cyEdge) => {
+    cyEdge.removeClass("elk-routed");
+    cyEdge.removeData("srcEndpoint tgtEndpoint");
+  };
+
+  // Separación de carriles paralelos ±7px para aristas que comparten el mismo nodo origen.
+  const outGroupCounts = new Map();
+  for (const edge of edgeList) {
+    if (!edge || edge.removed()) {
+      continue;
+    }
+    const sId = edge.source().id();
+    outGroupCounts.set(sId, (outGroupCounts.get(sId) || 0) + 1);
+  }
+  const outGroupCursor = new Map();
+
+  let routedCount = 0;
+
+  cy.batch(() => {
+    for (const cyEdge of edgeList) {
+      if (!cyEdge || cyEdge.removed()) {
+        continue;
+      }
+      const srcNode = cyEdge.source();
+      const tgtNode = cyEdge.target();
+      if (
+        cyEdge.isLoop()
+        || srcNode.ancestors().anySame(tgtNode)
+        || tgtNode.ancestors().anySame(srcNode)
+      ) {
+        clearRoute(cyEdge);
+        continue;
+      }
+      if (srcNode.isParent() || tgtNode.isParent()) {
+        cyEdge.addClass("compound-incident");
+      }
+
+      const srcG = getNodeGeom(srcNode);
+      const tgtG = getNodeGeom(tgtNode);
+      if (!srcG || !tgtG) {
+        clearRoute(cyEdge);
+        continue;
+      }
+
+      cyEdge.data("taxiDir", computeDynamicTaxiDirection({ x: srcG.cx, y: srcG.cy }, { x: tgtG.cx, y: tgtG.cy }));
+
+      const vGap = Math.max(tgtG.top - srcG.bottom, srcG.top - tgtG.bottom);
+      const hGap = Math.max(tgtG.left - srcG.right, srcG.left - tgtG.right);
+      if (vGap < 4 && hGap < 4) {
+        clearRoute(cyEdge);
+        continue;
+      }
+
+      const sId = srcNode.id();
+      const totalOut = outGroupCounts.get(sId) || 1;
+      const laneIdx = outGroupCursor.get(sId) || 0;
+      outGroupCursor.set(sId, laneIdx + 1);
+      const centered = totalOut > 1 ? laneIdx - (totalOut - 1) / 2 : 0;
+
+      const ignore = buildIgnoreSet(srcNode, tgtNode);
+      const dxCenter = tgtG.cx - srcG.cx;
+      const dyCenter = tgtG.cy - srcG.cy;
+      const useVertical = vGap >= 14 && (hGap < 14 || Math.abs(dyCenter) >= Math.abs(dxCenter) * 0.7);
+      let pts = null;
+
+      if (useVertical) {
+        const goingDown = dyCenter >= 0;
+        const maxLane = Math.max(0, Math.min(srcG.hw, tgtG.hw) * 0.45);
+        const laneOff = clampVal(centered * 7, -maxLane, maxLane);
+        const sx = srcG.cx + laneOff;
+        const tx = tgtG.cx + laneOff;
+        const sy = goingDown ? srcG.bottom : srcG.top;
+        const ty = goingDown ? tgtG.top : tgtG.bottom;
+
+        if (Math.abs(sx - tx) <= 2 && !vSegBlocked(sx, sy, ty, ignore)) {
+          pts = [{ x: sx, y: sy }, { x: sx, y: ty }];
+        } else {
+          const baseMidY = (sy + ty) / 2 + clampVal(centered * 7, -Math.max(4, vGap * 0.3), Math.max(4, vGap * 0.3));
+          const offsets = [0, 16, -16, 32, -32, 48, -48];
+          const loY = Math.min(sy, ty) + 8;
+          const hiY = Math.max(sy, ty) - 8;
+          let chosenMidY = null;
+          for (const dOff of offsets) {
+            const candY = clampVal(baseMidY + dOff, loY, hiY);
+            if (
+              !vSegBlocked(sx, sy, candY, ignore)
+              && !hSegBlocked(candY, sx, tx, ignore)
+              && !vSegBlocked(tx, candY, ty, ignore)
+            ) {
+              chosenMidY = candY;
+              break;
+            }
+          }
+          if (chosenMidY !== null) {
+            pts = [
+              { x: sx, y: sy },
+              { x: sx, y: chosenMidY },
+              { x: tx, y: chosenMidY },
+              { x: tx, y: ty },
+            ];
+          } else {
+            // Pasillo lateral alrededor de obstáculos intermedios en el rango vertical.
+            const bandTop = Math.min(sy, ty);
+            const bandBot = Math.max(sy, ty);
+            let minLeft = Math.min(srcG.left, tgtG.left);
+            let maxRight = Math.max(srcG.right, tgtG.right);
+            for (const b of leafBoxes) {
+              if (ignore.has(b.id) || b.bottom < bandTop || b.top > bandBot) {
+                continue;
+              }
+              if (b.left < minLeft) minLeft = b.left;
+              if (b.right > maxRight) maxRight = b.right;
+            }
+            const leftBypassX = minLeft - 22 - Math.abs(centered * 7);
+            const rightBypassX = maxRight + 22 + Math.abs(centered * 7);
+            const avgX = (sx + tx) / 2;
+            const bypassX = Math.abs(avgX - leftBypassX) <= Math.abs(avgX - rightBypassX)
+              ? leftBypassX
+              : rightBypassX;
+            const dir = goingDown ? 1 : -1;
+            const exitY = sy + dir * Math.min(18, Math.max(8, vGap * 0.25));
+            const entryY = ty - dir * Math.min(18, Math.max(8, vGap * 0.25));
+            pts = [
+              { x: sx, y: sy },
+              { x: sx, y: exitY },
+              { x: bypassX, y: exitY },
+              { x: bypassX, y: entryY },
+              { x: tx, y: entryY },
+              { x: tx, y: ty },
+            ];
+          }
+        }
+      } else if (hGap >= 14) {
+        const goingRight = dxCenter >= 0;
+        const maxLane = Math.max(0, Math.min(srcG.hh, tgtG.hh) * 0.45);
+        const laneOff = clampVal(centered * 7, -maxLane, maxLane);
+        const sy = srcG.cy + laneOff;
+        const ty = tgtG.cy + laneOff;
+        const sx = goingRight ? srcG.right : srcG.left;
+        const tx = goingRight ? tgtG.left : tgtG.right;
+
+        if (Math.abs(sy - ty) <= 2 && !hSegBlocked(sy, sx, tx, ignore)) {
+          pts = [{ x: sx, y: sy }, { x: tx, y: sy }];
+        } else {
+          const baseMidX = (sx + tx) / 2 + clampVal(centered * 7, -Math.max(4, hGap * 0.3), Math.max(4, hGap * 0.3));
+          const offsets = [0, 16, -16, 32, -32, 48, -48];
+          const loX = Math.min(sx, tx) + 8;
+          const hiX = Math.max(sx, tx) - 8;
+          let chosenMidX = null;
+          for (const dOff of offsets) {
+            const candX = clampVal(baseMidX + dOff, loX, hiX);
+            if (
+              !hSegBlocked(sy, sx, candX, ignore)
+              && !vSegBlocked(candX, sy, ty, ignore)
+              && !hSegBlocked(ty, candX, tx, ignore)
+            ) {
+              chosenMidX = candX;
+              break;
+            }
+          }
+          if (chosenMidX !== null) {
+            pts = [
+              { x: sx, y: sy },
+              { x: chosenMidX, y: sy },
+              { x: chosenMidX, y: ty },
+              { x: tx, y: ty },
+            ];
+          } else {
+            const bandLeft = Math.min(sx, tx);
+            const bandRight = Math.max(sx, tx);
+            let minTop = Math.min(srcG.top, tgtG.top);
+            let maxBot = Math.max(srcG.bottom, tgtG.bottom);
+            for (const b of leafBoxes) {
+              if (ignore.has(b.id) || b.right < bandLeft || b.left > bandRight) {
+                continue;
+              }
+              if (b.top < minTop) minTop = b.top;
+              if (b.bottom > maxBot) maxBot = b.bottom;
+            }
+            const topBypassY = minTop - 22 - Math.abs(centered * 7);
+            const botBypassY = maxBot + 22 + Math.abs(centered * 7);
+            const avgY = (sy + ty) / 2;
+            const bypassY = Math.abs(avgY - topBypassY) <= Math.abs(avgY - botBypassY)
+              ? topBypassY
+              : botBypassY;
+            const dir = goingRight ? 1 : -1;
+            const exitX = sx + dir * Math.min(18, Math.max(8, hGap * 0.25));
+            const entryX = tx - dir * Math.min(18, Math.max(8, hGap * 0.25));
+            pts = [
+              { x: sx, y: sy },
+              { x: exitX, y: sy },
+              { x: exitX, y: bypassY },
+              { x: entryX, y: bypassY },
+              { x: entryX, y: ty },
+              { x: tx, y: ty },
+            ];
+          }
+        }
+      } else {
+        // Brecha estrecha (4..14px): segmento directo o codo limpio.
+        if (vGap >= hGap) {
+          const goingDown = dyCenter >= 0;
+          const sy = goingDown ? srcG.bottom : srcG.top;
+          const ty = goingDown ? tgtG.top : tgtG.bottom;
+          const midY = (sy + ty) / 2;
+          pts = Math.abs(srcG.cx - tgtG.cx) <= 2
+            ? [{ x: srcG.cx, y: sy }, { x: srcG.cx, y: ty }]
+            : [{ x: srcG.cx, y: sy }, { x: srcG.cx, y: midY }, { x: tgtG.cx, y: midY }, { x: tgtG.cx, y: ty }];
+        } else {
+          const goingRight = dxCenter >= 0;
+          const sx = goingRight ? srcG.right : srcG.left;
+          const tx = goingRight ? tgtG.left : tgtG.right;
+          const midX = (sx + tx) / 2;
+          pts = Math.abs(srcG.cy - tgtG.cy) <= 2
+            ? [{ x: sx, y: srcG.cy }, { x: tx, y: srcG.cy }]
+            : [{ x: sx, y: srcG.cy }, { x: midX, y: srcG.cy }, { x: midX, y: tgtG.cy }, { x: tx, y: tgtG.cy }];
+        }
+      }
+
+      if (!pts || pts.length < 2) {
+        clearRoute(cyEdge);
+        continue;
+      }
+
+      const srcEnd = projectBorder(pts[0], pts[1], srcG);
+      const tgtEnd = projectBorder(pts[pts.length - 1], pts[pts.length - 2], tgtG);
+      if (
+        !Number.isFinite(srcEnd.x)
+        || !Number.isFinite(srcEnd.y)
+        || !Number.isFinite(tgtEnd.x)
+        || !Number.isFinite(tgtEnd.y)
+        || Math.hypot(tgtEnd.x - srcEnd.x, tgtEnd.y - srcEnd.y) < 2
+      ) {
+        clearRoute(cyEdge);
+        continue;
+      }
+
+      let interior = [];
+      for (let i = 1; i < pts.length - 1; i += 1) {
+        const p = pts[i];
+        if (Math.hypot(p.x - srcEnd.x, p.y - srcEnd.y) < 1.5 || Math.hypot(p.x - tgtEnd.x, p.y - tgtEnd.y) < 1.5) {
+          continue;
+        }
+        interior.push(p);
+      }
+      if (interior.length === 0) {
+        interior = [{ x: (srcEnd.x + tgtEnd.x) / 2, y: (srcEnd.y + tgtEnd.y) / 2 }];
+      }
+
+      const segments = convertElkPointsToCytoscapeSegments(interior, srcEnd, tgtEnd);
+      if (!segments) {
+        clearRoute(cyEdge);
+        continue;
+      }
+
+      cyEdge.data("srcEndpoint", srcEnd.endpointStr);
+      cyEdge.data("tgtEndpoint", tgtEnd.endpointStr);
+      cyEdge.data("segWeights", segments.weights);
+      cyEdge.data("segDistances", segments.distances);
+      cyEdge.addClass("elk-routed");
+      routedCount += 1;
+    }
+  });
+
+  return routedCount;
+}
+
+async function handleNodeDragFreeBatch(cyNodes) {
+  if (!state.cy || !Array.isArray(cyNodes) || cyNodes.length === 0) {
+    _activeDragExternalEdges = [];
+    return;
+  }
+
+  const outermost = filterOutermostDraggedNodes(cyNodes);
+  if (outermost.length === 0) {
+    _activeDragExternalEdges = [];
+    return;
+  }
+
+  const parentNodes = state.cy.nodes(":parent");
+  if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
+    parentNodes.updateCompoundBounds(true);
+  }
+
+  const { externalEdges } = collectScopeAndExternalEdges(state.cy, outermost);
+  _activeDragExternalEdges = [];
+
+  // Re-enrutar localmente únicamente las aristas externas; las internas conservan su `.elk-routed` intacto.
+  if (externalEdges.length > 0) {
+    rerouteExternalEdgesLocally(state.cy, externalEdges);
+  }
+
+  const contextKey = getCurrentLayoutContextKey();
+  const patchNodes = {};
+
+  for (const item of outermost) {
+    if (!item || item.removed()) {
+      continue;
+    }
+    const id = item.id();
+    const nodeType = item.data("type");
+    const isPersistable = state.nodesById.has(id) || nodeType === "flow" || nodeType === "layer";
+    if (!isPersistable) {
+      continue;
+    }
+    if (item.isParent() && typeof item.updateCompoundBounds === "function") {
+      item.updateCompoundBounds(true);
+    }
     const pos = item.position();
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) {
+      continue;
+    }
     const x = Math.round(pos.x * 10) / 10;
     const y = Math.round(pos.y * 10) / 10;
     const existing = getNoteEntry(id);
@@ -2643,19 +3244,7 @@ async function handleNodeDragFree(cyNode) {
     };
     state.notes.nodes[id] = entry;
     patchNodes[id] = entry;
-    const effectiveRole = entry.custom_role || (raw && raw.role) || (raw && raw.type);
-    item.data("pinned", "true");
-    item.data(
-      "label",
-      buildDisplayLabel(
-        raw,
-        item.data("collapsed") === "true",
-        entry,
-        effectiveRole,
-        flowNodeOrder.get(id) || null,
-        activeFlowNodeSet,
-      ),
-    );
+    refreshCyNodeMetadata(id);
   }
 
   if (Object.keys(patchNodes).length === 0) {
@@ -2673,6 +3262,13 @@ async function handleNodeDragFree(cyNode) {
   if (state.selectedNodeId && patchNodes[state.selectedNodeId]) {
     updatePinButton(isPinnedInCurrentContext(getNoteEntry(state.selectedNodeId)));
   }
+  if (typeof updateReleasePinnedButton === "function") {
+    updateReleasePinnedButton();
+  }
+}
+
+async function handleNodeDragFree(cyNode) {
+  await handleNodeDragFreeBatch(cyNode ? [cyNode] : []);
 }
 
 function buildStylesheet() {
@@ -2971,6 +3567,12 @@ function buildStylesheet() {
       selector: 'edge[taxiDir = "rightward"]',
       style: {
         "taxi-direction": "rightward",
+      },
+    },
+    {
+      selector: 'edge[taxiDir = "leftward"]',
+      style: {
+        "taxi-direction": "leftward",
       },
     },
     {
@@ -3342,7 +3944,9 @@ async function refreshGraphView({ fit = true } = {}) {
   updateZoomIndicator();
   updateNHopsHud();
   applyCanvasHighlights();
-  if (!state.selectedNodeId) {
+  if (state.selectedNodeId) {
+    updateReleasePinnedButton();
+  } else {
     renderEmptyInspectorSummary();
   }
 }
@@ -4532,6 +5136,104 @@ function stitchCrossFileEdgeOntoMacroCorridor(
   return clean.length >= 2 ? clean : null;
 }
 
+function applyScopedPinsToLayout(cy, elkPositions, containerOffsets, pinnedPositionsById) {
+  const rigidShiftByNodeId = new Map();
+  const individuallyPinnedIds = new Set();
+  if (!cy || !pinnedPositionsById || pinnedPositionsById.size === 0) {
+    return { rigidShiftByNodeId, individuallyPinnedIds };
+  }
+
+  const parentNodes = cy.nodes(":parent");
+  if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
+    parentNodes.updateCompoundBounds(true);
+  }
+
+  const pinnedContainers = [];
+  const pinnedLeaves = [];
+  for (const [nodeId, pinnedPos] of pinnedPositionsById.entries()) {
+    const cyNode = cy.getElementById(nodeId);
+    if (!cyNode || cyNode.length === 0 || !pinnedPos) {
+      continue;
+    }
+    if (cyNode.isParent()) {
+      pinnedContainers.push({ node: cyNode, pos: pinnedPos, depth: cyNode.ancestors().length });
+    } else {
+      pinnedLeaves.push({ node: cyNode, pos: pinnedPos });
+    }
+  }
+
+  // Fase 1: Contenedores fijados en orden top-down (layer -> module -> file -> expandedFn -> flowContainer).
+  // Cada contenedor se traslada como bloque rígido (dx, dy) sin contaminar ni fijar a sus hijos.
+  pinnedContainers.sort((a, b) => a.depth - b.depth);
+  const addRigidShift = (id, dx, dy) => {
+    const prev = rigidShiftByNodeId.get(id);
+    if (prev) {
+      prev.dx += dx;
+      prev.dy += dy;
+    } else {
+      rigidShiftByNodeId.set(id, { dx, dy });
+    }
+  };
+
+  for (const { node: containerNode, pos: targetPos } of pinnedContainers) {
+    if (typeof containerNode.updateCompoundBounds === "function") {
+      containerNode.updateCompoundBounds(true);
+    }
+    const curCenter = containerNode.position();
+    if (!curCenter || !Number.isFinite(curCenter.x) || !Number.isFinite(curCenter.y)) {
+      continue;
+    }
+    const dx = targetPos.x - curCenter.x;
+    const dy = targetPos.y - curCenter.y;
+    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) {
+      continue;
+    }
+
+    const cId = containerNode.id();
+    addRigidShift(cId, dx, dy);
+    if (containerOffsets && containerOffsets.has(cId)) {
+      const off = containerOffsets.get(cId);
+      off.x += dx;
+      off.y += dy;
+    }
+
+    containerNode.descendants().forEach((desc) => {
+      const dId = desc.id();
+      addRigidShift(dId, dx, dy);
+      if (desc.isParent()) {
+        if (containerOffsets && containerOffsets.has(dId)) {
+          const off = containerOffsets.get(dId);
+          off.x += dx;
+          off.y += dy;
+        }
+      } else {
+        const curPos = desc.position();
+        const nextPos = { x: curPos.x + dx, y: curPos.y + dy };
+        desc.position(nextPos);
+        if (elkPositions) {
+          elkPositions.set(dId, nextPos);
+        }
+      }
+    });
+  }
+
+  // Fase 2: Hojas fijadas individualmente (funciones, archivos/módulos colapsados, pasos flow hoja).
+  for (const { node: leafNode, pos: targetPos } of pinnedLeaves) {
+    const id = leafNode.id();
+    leafNode.position({ x: targetPos.x, y: targetPos.y });
+    if (elkPositions) {
+      elkPositions.set(id, { x: targetPos.x, y: targetPos.y });
+    }
+    individuallyPinnedIds.add(id);
+  }
+
+  if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
+    parentNodes.updateCompoundBounds(true);
+  }
+
+  return { rigidShiftByNodeId, individuallyPinnedIds };
+}
+
 async function runElkLayout(visibleNodes, visibleEdges) {
   const isCreationOrder = state.layoutOrderMode === "creation";
   let elkGraph;
@@ -4551,19 +5253,18 @@ async function runElkLayout(visibleNodes, visibleEdges) {
 
   const contextKey = getCurrentLayoutContextKey();
   const ignorePins = Boolean(computeSubgraphFilter());
-  const pinnedPositions = new Map();
-  const pinnedNodeIds = new Set();
+  const pinnedPositionsById = new Map();
+  const leafPinnedIds = new Set();
 
   if (!ignorePins) {
     state.cy.nodes().forEach((cyNode) => {
-      if (cyNode.isParent()) {
-        return;
-      }
       const noteEntry = getNoteEntry(cyNode.id());
       const pinnedPos = getPinnedPositionForContext(noteEntry, contextKey);
       if (pinnedPos) {
-        pinnedPositions.set(cyNode.id(), pinnedPos);
-        pinnedNodeIds.add(cyNode.id());
+        pinnedPositionsById.set(cyNode.id(), pinnedPos);
+        if (!cyNode.isParent()) {
+          leafPinnedIds.add(cyNode.id());
+        }
       }
     });
   }
@@ -4574,7 +5275,7 @@ async function runElkLayout(visibleNodes, visibleEdges) {
     const shiftedNodeIds = applyCreationRowStagger(
       layouted,
       elkPositions,
-      pinnedNodeIds,
+      leafPinnedIds,
       dataById,
       CREATION_ROW_STAGGER_PX,
     );
@@ -4582,15 +5283,11 @@ async function runElkLayout(visibleNodes, visibleEdges) {
   }
 
   const defaultDirection = "downward";
+  let pinResult = { rigidShiftByNodeId: new Map(), individuallyPinnedIds: new Set() };
 
   state.cy.batch(() => {
     state.cy.nodes().forEach((cyNode) => {
       if (cyNode.isParent()) {
-        return;
-      }
-      const pinnedPos = pinnedPositions.get(cyNode.id());
-      if (pinnedPos) {
-        cyNode.position(pinnedPos);
         return;
       }
       const pos = elkPositions.get(cyNode.id());
@@ -4598,21 +5295,31 @@ async function runElkLayout(visibleNodes, visibleEdges) {
         cyNode.position(pos);
       }
     });
+    if (pinnedPositionsById.size > 0) {
+      pinResult = applyScopedPinsToLayout(state.cy, elkPositions, containerOffsets, pinnedPositionsById);
+    }
   });
-  // Ejecutar el enrutamiento en un segundo batch sincrónico para leer las cajas
-  // reales ya actualizadas de contenedores compuestos (expandedFn / flowContainer).
+
+  // Enrutar preservando `.elk-routed` en todas las aristas internas de contenedores movidos en bloque,
+  // y re-enrutar localmente únicamente las aristas externas incidentes a nodos/contenedores fijados.
+  const externalEdgesToReroute = [];
   state.cy.batch(() => {
     applyElkEdgeRoutes(
       state.cy,
       layouted,
       elkPositions,
       containerOffsets,
-      pinnedNodeIds,
+      pinResult.individuallyPinnedIds,
       defaultDirection,
       staggerMeta,
       creationMeta,
+      pinResult.rigidShiftByNodeId,
+      externalEdgesToReroute,
     );
   });
+  if (externalEdgesToReroute.length > 0) {
+    rerouteExternalEdgesLocally(state.cy, externalEdgesToReroute);
+  }
 }
 
 function buildElkInput(visibleNodes, visibleEdges, options) {
@@ -4962,6 +5669,8 @@ function applyElkEdgeRoutes(
   defaultDirection = "downward",
   staggerMeta = null,
   creationMeta = null,
+  rigidShiftByNodeId = null,
+  outExternalEdges = null,
 ) {
   if (!cy || !layouted) {
     return;
@@ -4972,6 +5681,22 @@ function applyElkEdgeRoutes(
   if (parentNodes.length > 0 && typeof parentNodes.updateCompoundBounds === "function") {
     parentNodes.updateCompoundBounds(true);
   }
+
+  const getRigidShift = (id) => {
+    if (!rigidShiftByNodeId) {
+      return { dx: 0, dy: 0 };
+    }
+    return rigidShiftByNodeId.get(id) || { dx: 0, dy: 0 };
+  };
+
+  const hasRelativeShift = (srcId, tgtId) => {
+    if (!rigidShiftByNodeId || rigidShiftByNodeId.size === 0) {
+      return false;
+    }
+    const s = getRigidShift(srcId);
+    const t = getRigidShift(tgtId);
+    return Math.abs(s.dx - t.dx) > 0.1 || Math.abs(s.dy - t.dy) > 0.1;
+  };
 
   const allElkEdges = [];
   collectAllLayoutedEdges(layouted, allElkEdges);
@@ -5204,11 +5929,18 @@ function applyElkEdgeRoutes(
       continue;
     }
 
-    if (
-      isContainmentPair(srcNode, tgtNode)
-      || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
-    ) {
+    if (isContainmentPair(srcNode, tgtNode)) {
       clearElkRoute(cyEdge);
+      continue;
+    }
+
+    const endpointPinned = Boolean(pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)));
+    const endpointShiftedRel = hasRelativeShift(srcId, tgtId);
+    if (endpointPinned || endpointShiftedRel) {
+      clearElkRoute(cyEdge);
+      if (Array.isArray(outExternalEdges)) {
+        outExternalEdges.push(cyEdge);
+      }
       continue;
     }
 
@@ -5220,7 +5952,16 @@ function applyElkEdgeRoutes(
 
     const edgeContainer = elkEdge.container || "root";
     const offset = (containerOffsets && containerOffsets.get(edgeContainer)) || { x: 0, y: 0 };
-    const absPoints = adjustElkSectionPoints(section, edgeContainer, offset, srcId, tgtId, staggerMeta);
+    let absPoints = adjustElkSectionPoints(section, edgeContainer, offset, srcId, tgtId, staggerMeta);
+    if (rigidShiftByNodeId && rigidShiftByNodeId.size > 0) {
+      const endShift = getRigidShift(srcId);
+      const contShift = getRigidShift(edgeContainer);
+      const extraDx = endShift.dx - contShift.dx;
+      const extraDy = endShift.dy - contShift.dy;
+      if (Math.abs(extraDx) > 0.05 || Math.abs(extraDy) > 0.05) {
+        absPoints = absPoints.map((pt) => ({ x: pt.x + extraDx, y: pt.y + extraDy }));
+      }
+    }
 
     if (!applySafeElkSegments(cyEdge, absPoints, srcGeom, tgtGeom)) {
       clearElkRoute(cyEdge);
@@ -5259,14 +6000,18 @@ function applyElkEdgeRoutes(
       }
 
       cyEdge.data("taxiDir", resolveEdgeTaxiDir(srcPos, tgtPos));
-      if (
-        cyEdge.isLoop()
-        || isContainmentPair(srcNode, tgtNode)
-        || !srcGeom
-        || !tgtGeom
-        || (pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)))
-      ) {
+      if (cyEdge.isLoop() || isContainmentPair(srcNode, tgtNode) || !srcGeom || !tgtGeom) {
         clearElkRoute(cyEdge);
+        continue;
+      }
+
+      const endpointPinned = Boolean(pinnedNodeIds && (pinnedNodeIds.has(srcId) || pinnedNodeIds.has(tgtId)));
+      const endpointShiftedRel = hasRelativeShift(srcId, tgtId);
+      if (endpointPinned || endpointShiftedRel) {
+        clearElkRoute(cyEdge);
+        if (Array.isArray(outExternalEdges)) {
+          outExternalEdges.push(cyEdge);
+        }
         continue;
       }
 
@@ -6051,8 +6796,10 @@ function selectNode(nodeId, stepId = undefined) {
   document.getElementById("detail-title").textContent = node.label;
   document.getElementById("detail-id").textContent = node.id;
 
+  updateClassContext(node);
   updateVsCodeLink(node);
   updatePinButton(isPinnedInCurrentContext(noteEntry));
+  updateReleasePinnedButton();
   updateToggleButton(node);
   updateFloatingOpenButton(node);
   updateIsolateFileButton(node);
@@ -6079,6 +6826,90 @@ function selectNode(nodeId, stepId = undefined) {
   }
 }
 
+function getClassInfoForFunction(node) {
+  if (!node || node.type !== "function" || !node.class_name || !node.parent) {
+    return null;
+  }
+  const fileNode = state.nodesById.get(node.parent);
+  if (!fileNode || !fileNode.classes || typeof fileNode.classes !== "object") {
+    return null;
+  }
+  return fileNode.classes[node.class_name] || null;
+}
+
+function formatClassDeclaration(clsInfo, language) {
+  if (!clsInfo || !clsInfo.qualname) {
+    return "";
+  }
+  const prefix = clsInfo.is_abstract ? "abstract class " : "class ";
+  const bases = Array.isArray(clsInfo.bases) ? clsInfo.bases.filter(Boolean) : [];
+  const implementsList = Array.isArray(clsInfo.implements) ? clsInfo.implements.filter(Boolean) : [];
+  if (language === "python") {
+    return bases.length > 0
+      ? `${prefix}${clsInfo.qualname}(${bases.join(", ")})`
+      : `${prefix}${clsInfo.qualname}`;
+  }
+  let decl = `${prefix}${clsInfo.qualname}`;
+  if (bases.length > 0) {
+    decl += ` extends ${bases.join(", ")}`;
+  }
+  if (implementsList.length > 0) {
+    decl += ` implements ${implementsList.join(", ")}`;
+  }
+  return decl;
+}
+
+function updateClassContext(node) {
+  const ctxLink = document.getElementById("detail-class-context");
+  const docBlock = document.getElementById("detail-class-docstring-block");
+  const docTitle = document.getElementById("detail-class-docstring-title");
+  const docText = document.getElementById("detail-class-docstring");
+
+  const clsInfo = getClassInfoForFunction(node);
+  if (!clsInfo) {
+    if (ctxLink) {
+      ctxLink.classList.add("hidden");
+      ctxLink.textContent = "";
+      ctxLink.href = "#";
+      ctxLink.classList.remove("no-link");
+    }
+    if (docBlock) {
+      docBlock.classList.add("hidden");
+    }
+    return;
+  }
+
+  const fileNode = state.nodesById.get(node.parent);
+  const lang = fileNode ? fileNode.language : "";
+  const decl = formatClassDeclaration(clsInfo, lang);
+
+  if (ctxLink) {
+    const filePath = resolveNodeFilePath(node);
+    ctxLink.textContent = clsInfo.line ? `${decl} · L${clsInfo.line}` : decl;
+    if (filePath && Number.isInteger(clsInfo.line) && clsInfo.line > 0) {
+      ctxLink.href = `vscode://file/${encodeFileUriPath(filePath)}:${clsInfo.line}`;
+      ctxLink.classList.remove("no-link");
+      ctxLink.title = `Abrir declaración de ${clsInfo.short_name || clsInfo.qualname} en VS Code (línea ${clsInfo.line})`;
+    } else {
+      ctxLink.href = "#";
+      ctxLink.classList.add("no-link");
+      ctxLink.title = decl;
+    }
+    ctxLink.classList.remove("hidden");
+  }
+
+  if (docBlock && docTitle && docText) {
+    const clsDoc = (clsInfo.docstring || "").trim();
+    if (clsDoc) {
+      docTitle.textContent = `Docstring de la clase (${clsInfo.short_name || clsInfo.qualname})`;
+      docText.textContent = clsDoc;
+      docBlock.classList.remove("hidden");
+    } else {
+      docBlock.classList.add("hidden");
+    }
+  }
+}
+
 function updateFlowBadges(node, effectiveRole) {
   const container = document.getElementById("detail-flow-badges");
   container.innerHTML = "";
@@ -6100,6 +6931,12 @@ function updateFlowBadges(node, effectiveRole) {
   }
   if (node.type !== "function") {
     return;
+  }
+
+  if (node.is_constructor) {
+    appendBadge("CONSTRUCTOR", "flow-badge-constructor");
+  } else if (node.class_name) {
+    appendBadge("MÉTODO", "flow-badge-method");
   }
 
   const eKind = node.entry_kind || null;
@@ -6176,10 +7013,16 @@ function updateVsCodeLink(node) {
 
   if (href) {
     link.href = href;
-    link.textContent = node.line ? `Abrir en VS Code (línea ${node.line})` : "Abrir en VS Code";
-    link.classList.remove("hidden");
+    link.textContent = node.line ? `VS Code (L${node.line})` : "Abrir en VS Code";
+    link.title = node.line ? `Abrir en Visual Studio Code (línea ${node.line})` : "Abrir en Visual Studio Code";
+    link.classList.remove("disabled-action");
+    link.setAttribute("aria-disabled", "false");
   } else {
-    link.classList.add("hidden");
+    link.href = "#";
+    link.textContent = "Abrir en VS Code";
+    link.title = "Este contenedor no corresponde a un archivo directo";
+    link.classList.add("disabled-action");
+    link.setAttribute("aria-disabled", "true");
   }
 }
 
@@ -6187,6 +7030,148 @@ function updatePinButton(isPinned) {
   const btn = document.getElementById("btn-pin-node");
   btn.textContent = isPinned ? "Liberar posición 📌" : "Fijar posición";
   btn.classList.toggle("pinned", Boolean(isPinned));
+}
+
+function collectScopedPinnedNodeIds(
+  cy,
+  selectedNodeId,
+  notesNodes,
+  contextKey,
+  nodesById,
+  childrenByParent,
+) {
+  const candidateIds = new Set();
+  const rootIds = [];
+  if (cy) {
+    const selected = cy.nodes(":selected");
+    if (selected && selected.length > 0) {
+      selected.forEach((n) => rootIds.push(n.id()));
+    }
+  }
+  if (rootIds.length === 0 && selectedNodeId) {
+    rootIds.push(selectedNodeId);
+  }
+  if (rootIds.length === 0) {
+    return [];
+  }
+
+  const addGraphSubtree = (id) => {
+    if (candidateIds.has(id)) {
+      return;
+    }
+    candidateIds.add(id);
+    if (cy) {
+      const cyNode = cy.getElementById(id);
+      if (cyNode && cyNode.length > 0 && cyNode.isParent()) {
+        cyNode.descendants().forEach((desc) => {
+          addGraphSubtree(desc.id());
+        });
+      }
+    }
+    const raw = nodesById ? nodesById.get(id) : null;
+    if (raw && raw.type === "function" && Array.isArray(raw.internal_flow)) {
+      for (const step of raw.internal_flow) {
+        if (step && step.id) {
+          candidateIds.add(`${id}::${step.id}`);
+        }
+      }
+    }
+    const children = childrenByParent ? (childrenByParent.get(id) || []) : [];
+    for (const child of children) {
+      if (child && child.id) {
+        addGraphSubtree(child.id);
+      }
+    }
+  };
+
+  for (const rid of rootIds) {
+    addGraphSubtree(rid);
+  }
+
+  const pinnedIds = [];
+  for (const id of candidateIds) {
+    const entry = notesNodes ? notesNodes[id] : null;
+    if (entry && getPinnedPositionForContext(entry, contextKey) !== null) {
+      pinnedIds.push(id);
+    }
+  }
+  return pinnedIds;
+}
+
+function updateReleasePinnedButton() {
+  const btn = document.getElementById("btn-release-pinned");
+  if (!btn) {
+    return;
+  }
+  const contextKey = getCurrentLayoutContextKey();
+  const scopedIds = collectScopedPinnedNodeIds(
+    state.cy,
+    state.selectedNodeId,
+    state.notes && state.notes.nodes ? state.notes.nodes : {},
+    contextKey,
+    state.nodesById,
+    state.childrenByParent,
+  );
+  const count = scopedIds.length;
+  btn.textContent = `Liberar fijados (${count})`;
+  btn.disabled = count === 0;
+  btn.title = count > 0
+    ? `Liberar ${count} nodo(s) fijado(s) dentro de la selección o subárbol actual`
+    : "No hay nodos fijados en la selección o subárbol actual";
+}
+
+async function releaseScopedPinnedNodes() {
+  const contextKey = getCurrentLayoutContextKey();
+  const legacyKey = LEGACY_PIN_FALLBACK_KEY[contextKey];
+  const scopedIds = collectScopedPinnedNodeIds(
+    state.cy,
+    state.selectedNodeId,
+    state.notes && state.notes.nodes ? state.notes.nodes : {},
+    contextKey,
+    state.nodesById,
+    state.childrenByParent,
+  );
+  if (scopedIds.length === 0) {
+    updateReleasePinnedButton();
+    return;
+  }
+
+  const patchNodes = {};
+  for (const id of scopedIds) {
+    const entry = getNoteEntry(id);
+    const raw = state.nodesById.get(id);
+    const nextPositions = { ...(entry.pinned_positions || {}) };
+    delete nextPositions[contextKey];
+    if (legacyKey) {
+      delete nextPositions[legacyKey];
+    }
+    const stillHasOtherPins = Object.keys(nextPositions).length > 0;
+    const updated = {
+      ...entry,
+      pinned: stillHasOtherPins,
+      x: contextKey === "functions" ? null : entry.x,
+      y: contextKey === "functions" ? null : entry.y,
+      pinned_positions: nextPositions,
+      last_fingerprint: (raw && raw.fingerprint) || entry.last_fingerprint || "",
+    };
+    state.notes.nodes[id] = updated;
+    patchNodes[id] = updated;
+    refreshCyNodeMetadata(id);
+  }
+
+  const response = await fetch("/notes.json", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodes: patchNodes }),
+  });
+  if (response.ok) {
+    state.notes = await response.json();
+  }
+  if (state.selectedNodeId) {
+    updatePinButton(isPinnedInCurrentContext(getNoteEntry(state.selectedNodeId)));
+  }
+  updateReleasePinnedButton();
+  await refreshGraphView({ fit: false });
 }
 
 function updateRoleSelector(node, noteEntry) {
@@ -6204,14 +7189,18 @@ function updateToggleButton(node) {
   const btn = document.getElementById("btn-toggle-node");
   if (node.type === "module" || node.type === "file") {
     const collapsed = state.collapsedContainers.has(node.id);
-    btn.textContent = collapsed ? "Expandir contenedor" : "Colapsar contenedor";
-    btn.classList.remove("hidden");
+    btn.disabled = false;
+    btn.textContent = collapsed ? "Expandir" : "Colapsar";
+    btn.title = collapsed ? "Expandir contenedor" : "Colapsar contenedor";
   } else if (node.type === "function" && node.internal_flow && node.internal_flow.length > 0) {
     const expanded = state.expandedFunctions.has(node.id);
-    btn.textContent = expanded ? "Ocultar flujo interno" : "Expandir flujo interno (3+)";
-    btn.classList.remove("hidden");
+    btn.disabled = false;
+    btn.textContent = expanded ? "Ocultar flujo" : "Expandir flujo";
+    btn.title = expanded ? "Ocultar flujo interno (Nivel 3+)" : "Expandir flujo interno (Nivel 3+)";
   } else {
-    btn.classList.add("hidden");
+    btn.disabled = true;
+    btn.textContent = "Sin flujo (3+)";
+    btn.title = "Esta función no tiene flujo interno expandible";
   }
 }
 
@@ -6665,11 +7654,25 @@ function updateExternalCallsBlock(node) {
 }
 
 function refreshCyNodeMetadata(nodeId) {
+  const entry = getNoteEntry(nodeId);
   const raw = state.nodesById.get(nodeId);
   if (!raw) {
+    if (!state.cy) {
+      return;
+    }
+    const cyNode = state.cy.getElementById(nodeId);
+    if (!cyNode || cyNode.length === 0) {
+      return;
+    }
+    const isPinnedHere = isPinnedInCurrentContext(entry);
+    cyNode.data("pinned", isPinnedHere ? "true" : "false");
+    cyNode.data("hasNote", entry.note && entry.note.trim() ? "true" : "false");
+    const rawBase = cyNode.data("baseLabel")
+      || String(cyNode.data("label") || "").replace(/\s*\[📌\]\s*$/, "");
+    cyNode.data("baseLabel", rawBase);
+    cyNode.data("label", isPinnedHere ? `${rawBase} [📌]` : rawBase);
     return;
   }
-  const entry = getNoteEntry(nodeId);
   const effectiveRole = entry.custom_role || raw.role || raw.type;
   const { flow: activeFlow, nodeOrder: flowNodeOrder } = getActiveFlowStepMaps();
   const activeFlowNodeSet = activeFlow ? new Set(activeFlow.node_ids || []) : null;
@@ -7904,8 +8907,12 @@ function bindControls() {
       });
       refreshCyNodeMetadata(state.selectedNodeId);
       updatePinButton(false);
+      updateReleasePinnedButton();
       await refreshGraphView({ fit: false });
-    } else if (cyNode && cyNode.length > 0 && !cyNode.isParent()) {
+    } else if (cyNode && cyNode.length > 0) {
+      if (cyNode.isParent() && typeof cyNode.updateCompoundBounds === "function") {
+        cyNode.updateCompoundBounds(true);
+      }
       const pos = cyNode.position();
       const x = Math.round(pos.x * 10) / 10;
       const y = Math.round(pos.y * 10) / 10;
@@ -7921,8 +8928,16 @@ function bindControls() {
       });
       refreshCyNodeMetadata(state.selectedNodeId);
       updatePinButton(true);
+      updateReleasePinnedButton();
     }
   });
+
+  const releasePinnedBtn = document.getElementById("btn-release-pinned");
+  if (releasePinnedBtn) {
+    releasePinnedBtn.addEventListener("click", async () => {
+      await releaseScopedPinnedNodes();
+    });
+  }
 
   document.getElementById("detail-role-select").addEventListener("change", async (event) => {
     if (!state.selectedNodeId) {
@@ -8188,18 +9203,23 @@ function updateFloatingOpenButton(node) {
     return;
   }
   if (!canOpenInFloatingWindow(node)) {
-    btn.classList.add("hidden");
+    btn.disabled = true;
+    btn.textContent = "↗ Abrir en ventana";
+    btn.title = "No disponible para este nodo";
     return;
   }
+  btn.disabled = false;
   const alreadyOpen = state.floatingWindowByTarget.has(node.id);
   if (alreadyOpen) {
-    btn.textContent = "↗ Enfocar ventana flotante";
+    btn.textContent = "↗ Enfocar ventana";
+    btn.title = "Enfocar ventana flotante abierta";
   } else if (node.type === "function") {
-    btn.textContent = "↗ Abrir flujo (3+) en ventana flotante";
+    btn.textContent = "↗ Abrir en ventana";
+    btn.title = "Abrir flujo interno (3+) y código en ventana flotante (Alt + Doble clic)";
   } else {
-    btn.textContent = "↗ Abrir en ventana flotante";
+    btn.textContent = "↗ Abrir en ventana";
+    btn.title = "Abrir contenedor aislado en ventana flotante (Alt + Doble clic)";
   }
-  btn.classList.remove("hidden");
 }
 
 function getFloatingWindowIcon(node) {
@@ -8334,7 +9354,7 @@ function buildFloatingSubgraph(targetNode) {
   // Caso 1: Función (Nivel 3+) — flujo interno aislado sin caja externa redundante.
   if (targetNode.type === "function") {
     const visibleIds = new Set();
-    appendInternalFlowElements(targetNode, nodes, visibleIds);
+    appendInternalFlowElements(targetNode, nodes, visibleIds, { ignorePins: true });
     for (const item of nodes) {
       if (item.data.parent === targetNode.id) {
         item.data.parent = undefined;
@@ -8716,6 +9736,198 @@ function formatFloatingFooterStats(subgraph) {
   return parts.join(" · ");
 }
 
+const FW_CODE_WRAP_STORAGE_KEY = "codemap.fw.codeWrap";
+const FW_CODE_FONT_SIZE_STORAGE_KEY = "codemap.fw.codeFontSize";
+const FW_CODE_FONT_MIN = 10;
+const FW_CODE_FONT_MAX = 22;
+const FW_CODE_FONT_DEFAULT = 12;
+const FW_SPLIT_MIN_PANE_PX = 180;
+
+const fwCodePrefs = {
+  wrap: false,
+  fontSize: FW_CODE_FONT_DEFAULT,
+  loaded: false,
+};
+
+function loadFloatingCodePrefs() {
+  if (fwCodePrefs.loaded) {
+    return fwCodePrefs;
+  }
+  fwCodePrefs.loaded = true;
+  try {
+    if (typeof localStorage !== "undefined") {
+      const savedWrap = localStorage.getItem(FW_CODE_WRAP_STORAGE_KEY);
+      if (savedWrap === "true" || savedWrap === "1") {
+        fwCodePrefs.wrap = true;
+      }
+      const savedSize = parseInt(localStorage.getItem(FW_CODE_FONT_SIZE_STORAGE_KEY) || "", 10);
+      if (Number.isFinite(savedSize)) {
+        fwCodePrefs.fontSize = Math.max(FW_CODE_FONT_MIN, Math.min(FW_CODE_FONT_MAX, savedSize));
+      }
+    }
+  } catch (_err) {
+    // Ignorar errores de almacenamiento privado.
+  }
+  return fwCodePrefs;
+}
+
+function saveFloatingCodePrefs() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(FW_CODE_WRAP_STORAGE_KEY, String(Boolean(fwCodePrefs.wrap)));
+      localStorage.setItem(FW_CODE_FONT_SIZE_STORAGE_KEY, String(fwCodePrefs.fontSize));
+    }
+  } catch (_err) {
+    // Ignorar errores de almacenamiento privado.
+  }
+}
+
+function applyFloatingCodePrefsToWindow(win) {
+  if (!win || win.destroyed || !win.codePaneEl) {
+    return;
+  }
+  const prefs = loadFloatingCodePrefs();
+  win.codePaneEl.classList.toggle("wrap-enabled", Boolean(prefs.wrap));
+  win.codePaneEl.style.setProperty("--fw-code-font-size", `${prefs.fontSize}px`);
+  if (win.wrapCodeBtn) {
+    win.wrapCodeBtn.classList.toggle("active", Boolean(prefs.wrap));
+    win.wrapCodeBtn.setAttribute("aria-pressed", String(Boolean(prefs.wrap)));
+  }
+  if (win.zoomValEl) {
+    win.zoomValEl.textContent = `${prefs.fontSize}px`;
+  }
+  if (win.zoomOutBtn) {
+    win.zoomOutBtn.disabled = prefs.fontSize <= FW_CODE_FONT_MIN;
+  }
+  if (win.zoomInBtn) {
+    win.zoomInBtn.disabled = prefs.fontSize >= FW_CODE_FONT_MAX;
+  }
+}
+
+function applyFloatingCodePrefsToAllWindows() {
+  for (const win of state.floatingWindows.values()) {
+    applyFloatingCodePrefsToWindow(win);
+  }
+}
+
+function applyFloatingSplitRatio(win) {
+  if (!win || win.destroyed || !win.cyContainer || !win.codePaneEl) {
+    return;
+  }
+  if (win.viewMode !== "split") {
+    win.cyContainer.style.flex = "";
+    win.cyContainer.style.width = "";
+    win.codePaneEl.style.flex = "";
+    win.codePaneEl.style.width = "";
+    return;
+  }
+  const resizerW = win.splitResizerEl ? (win.splitResizerEl.offsetWidth || 6) : 6;
+  const totalW = Math.max(0, (win.bodyEl ? win.bodyEl.clientWidth : 0) - resizerW);
+  const ratio = typeof win.splitRatio === "number" && Number.isFinite(win.splitRatio)
+    ? win.splitRatio
+    : 0.5;
+  if (totalW > FW_SPLIT_MIN_PANE_PX * 2) {
+    const minRatio = FW_SPLIT_MIN_PANE_PX / totalW;
+    const maxRatio = 1 - minRatio;
+    const clamped = Math.max(minRatio, Math.min(maxRatio, ratio));
+    win.splitRatio = clamped;
+    const leftPx = Math.round(totalW * clamped);
+    win.cyContainer.style.flex = `0 0 ${leftPx}px`;
+    win.cyContainer.style.width = `${leftPx}px`;
+    win.codePaneEl.style.flex = "1 1 0%";
+    win.codePaneEl.style.width = "";
+  } else {
+    const clamped = Math.max(0.25, Math.min(0.75, ratio));
+    win.splitRatio = clamped;
+    const pct = Math.round(clamped * 1000) / 10;
+    win.cyContainer.style.flex = `0 0 ${pct}%`;
+    win.cyContainer.style.width = "";
+    win.codePaneEl.style.flex = "1 1 0%";
+    win.codePaneEl.style.width = "";
+  }
+}
+
+function bindFloatingSplitResizer(win) {
+  if (!win || !win.splitResizerEl || !win.bodyEl) {
+    return null;
+  }
+  let dragging = false;
+  let rafPending = false;
+
+  const scheduleSplitResize = () => {
+    if (rafPending) {
+      return;
+    }
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      if (!win.destroyed && win.cy) {
+        win.cy.resize();
+        scheduleBridgeRender();
+      }
+    });
+  };
+
+  const onMouseMove = (event) => {
+    if (!dragging || win.destroyed || win.viewMode !== "split") {
+      return;
+    }
+    const rect = win.bodyEl.getBoundingClientRect();
+    const resizerW = win.splitResizerEl.offsetWidth || 6;
+    const availW = Math.max(1, rect.width - resizerW);
+    const relX = event.clientX - rect.left;
+    win.splitRatio = relX / availW;
+    applyFloatingSplitRatio(win);
+    scheduleSplitResize();
+  };
+
+  const stopDragging = () => {
+    if (!dragging) {
+      return;
+    }
+    dragging = false;
+    win.splitResizerEl.classList.remove("dragging");
+    document.body.style.cursor = "";
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", stopDragging);
+    scheduleSplitResize();
+  };
+
+  const onMouseDown = (event) => {
+    if (event.button !== 0 || win.viewMode !== "split") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    focusFloatingWindow(win.id);
+    dragging = true;
+    win.splitResizerEl.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", stopDragging);
+  };
+
+  const onDblClick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (win.viewMode !== "split") {
+      return;
+    }
+    win.splitRatio = 0.5;
+    applyFloatingSplitRatio(win);
+    scheduleSplitResize();
+  };
+
+  win.splitResizerEl.addEventListener("mousedown", onMouseDown);
+  win.splitResizerEl.addEventListener("dblclick", onDblClick);
+
+  return () => {
+    stopDragging();
+    win.splitResizerEl.removeEventListener("mousedown", onMouseDown);
+    win.splitResizerEl.removeEventListener("dblclick", onDblClick);
+  };
+}
+
 function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, subgraph) {
   const winEl = document.createElement("section");
   winEl.className = "floating-window";
@@ -8822,11 +10034,24 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
   cyContainer.className = "fw-cy-container";
   bodyEl.appendChild(cyContainer);
 
+  let splitResizerEl = null;
   let codePaneEl = null;
   let codeMetaEl = null;
+  let wrapCodeBtn = null;
+  let zoomOutBtn = null;
+  let zoomValEl = null;
+  let zoomInBtn = null;
   let copyCodeBtn = null;
   let codeLinesEl = null;
   if (subgraph.isFunctionFlow) {
+    splitResizerEl = document.createElement("div");
+    splitResizerEl.className = "fw-split-resizer";
+    splitResizerEl.setAttribute("role", "separator");
+    splitResizerEl.setAttribute("aria-orientation", "vertical");
+    splitResizerEl.setAttribute("aria-label", "Redimensionar paneles de flujo y código");
+    splitResizerEl.title = "Arrastra para redimensionar · Doble clic para restaurar 50/50";
+    bodyEl.appendChild(splitResizerEl);
+
     codePaneEl = document.createElement("div");
     codePaneEl.className = "fw-code-pane hidden";
     codePaneEl.setAttribute("aria-label", "Código fuente de la función");
@@ -8838,14 +10063,53 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     codeMetaEl.className = "fw-code-meta";
     codeMetaEl.textContent = "Código fuente";
 
+    const codeControls = document.createElement("div");
+    codeControls.className = "fw-code-controls";
+
+    wrapCodeBtn = document.createElement("button");
+    wrapCodeBtn.type = "button";
+    wrapCodeBtn.className = "fw-btn fw-code-wrap-btn";
+    wrapCodeBtn.textContent = "Ajustar líneas";
+    wrapCodeBtn.setAttribute("aria-pressed", "false");
+    wrapCodeBtn.title = "Alternar ajuste de líneas largas (Word Wrap)";
+
+    const zoomGroup = document.createElement("div");
+    zoomGroup.className = "fw-code-zoom-group";
+    zoomGroup.setAttribute("role", "group");
+    zoomGroup.setAttribute("aria-label", "Tamaño de fuente del código");
+
+    zoomOutBtn = document.createElement("button");
+    zoomOutBtn.type = "button";
+    zoomOutBtn.className = "fw-code-zoom-btn fw-code-zoom-out-btn";
+    zoomOutBtn.textContent = "A−";
+    zoomOutBtn.title = "Reducir fuente del código";
+
+    zoomValEl = document.createElement("span");
+    zoomValEl.className = "fw-code-zoom-val";
+    zoomValEl.textContent = `${FW_CODE_FONT_DEFAULT}px`;
+
+    zoomInBtn = document.createElement("button");
+    zoomInBtn.type = "button";
+    zoomInBtn.className = "fw-code-zoom-btn fw-code-zoom-in-btn";
+    zoomInBtn.textContent = "A+";
+    zoomInBtn.title = "Aumentar fuente del código";
+
+    zoomGroup.appendChild(zoomOutBtn);
+    zoomGroup.appendChild(zoomValEl);
+    zoomGroup.appendChild(zoomInBtn);
+
     copyCodeBtn = document.createElement("button");
     copyCodeBtn.type = "button";
     copyCodeBtn.className = "fw-btn fw-copy-code-btn";
     copyCodeBtn.textContent = "Copiar";
     copyCodeBtn.title = "Copiar código fuente de la función";
 
+    codeControls.appendChild(wrapCodeBtn);
+    codeControls.appendChild(zoomGroup);
+    codeControls.appendChild(copyCodeBtn);
+
     codeToolbar.appendChild(codeMetaEl);
-    codeToolbar.appendChild(copyCodeBtn);
+    codeToolbar.appendChild(codeControls);
 
     const codeScroll = document.createElement("div");
     codeScroll.className = "fw-code-scroll";
@@ -8895,8 +10159,13 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     lockNoticeEl,
     bodyEl,
     cyContainer,
+    splitResizerEl,
     codePaneEl,
     codeMetaEl,
+    wrapCodeBtn,
+    zoomOutBtn,
+    zoomValEl,
+    zoomInBtn,
     copyCodeBtn,
     codeLinesEl,
     statsEl,
@@ -9247,9 +10516,12 @@ async function setFloatingWindowViewMode(win, mode) {
     }
   }
 
+  applyFloatingSplitRatio(win);
+
   if (nextMode === "flow" || nextMode === "split") {
     requestAnimationFrame(() => {
       if (!win.destroyed && win.cy) {
+        applyFloatingSplitRatio(win);
         win.cy.resize();
         win.cy.fit(undefined, 18);
         scheduleBridgeRender();
@@ -9542,8 +10814,13 @@ async function openFloatingWindow(
     lockNoticeEl: dom.lockNoticeEl,
     bodyEl: dom.bodyEl,
     cyContainer: dom.cyContainer,
+    splitResizerEl: dom.splitResizerEl,
     codePaneEl: dom.codePaneEl,
     codeMetaEl: dom.codeMetaEl,
+    wrapCodeBtn: dom.wrapCodeBtn,
+    zoomOutBtn: dom.zoomOutBtn,
+    zoomValEl: dom.zoomValEl,
+    zoomInBtn: dom.zoomInBtn,
     copyCodeBtn: dom.copyCodeBtn,
     codeLinesEl: dom.codeLinesEl,
     statsEl: dom.statsEl,
@@ -9555,6 +10832,7 @@ async function openFloatingWindow(
     subgraphNodes: subgraph.nodes,
     subgraphEdges: subgraph.edges,
     viewMode: "flow",
+    splitRatio: 0.5,
     sourceData: null,
     sourceLoaded: false,
     sourceLoading: null,
@@ -9566,6 +10844,7 @@ async function openFloatingWindow(
     lockNoticeTimer: null,
     pulseTimer: null,
     activeDragCleanup: null,
+    splitResizerCleanup: null,
     panCleanup: null,
     tooltipCleanup: null,
     destroyed: false,
@@ -9578,12 +10857,51 @@ async function openFloatingWindow(
     updateFloatingWindowHeaderState(parentWin);
   }
   updateFloatingWindowHeaderState(win);
+  applyFloatingCodePrefsToWindow(win);
 
   dom.winEl.addEventListener("mousedown", () => {
     focusFloatingWindow(win.id);
   });
 
   bindFloatingWindowDrag(win);
+  win.splitResizerCleanup = bindFloatingSplitResizer(win);
+
+  if (dom.wrapCodeBtn) {
+    dom.wrapCodeBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      focusFloatingWindow(win.id);
+      const prefs = loadFloatingCodePrefs();
+      prefs.wrap = !prefs.wrap;
+      saveFloatingCodePrefs();
+      applyFloatingCodePrefsToAllWindows();
+    });
+  }
+
+  if (dom.zoomOutBtn) {
+    dom.zoomOutBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      focusFloatingWindow(win.id);
+      const prefs = loadFloatingCodePrefs();
+      if (prefs.fontSize > FW_CODE_FONT_MIN) {
+        prefs.fontSize = Math.max(FW_CODE_FONT_MIN, prefs.fontSize - 1);
+        saveFloatingCodePrefs();
+        applyFloatingCodePrefsToAllWindows();
+      }
+    });
+  }
+
+  if (dom.zoomInBtn) {
+    dom.zoomInBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      focusFloatingWindow(win.id);
+      const prefs = loadFloatingCodePrefs();
+      if (prefs.fontSize < FW_CODE_FONT_MAX) {
+        prefs.fontSize = Math.min(FW_CODE_FONT_MAX, prefs.fontSize + 1);
+        saveFloatingCodePrefs();
+        applyFloatingCodePrefsToAllWindows();
+      }
+    });
+  }
 
   dom.fitBtn.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -9728,6 +11046,9 @@ async function openFloatingWindow(
       if (win.destroyed || !win.cy) {
         return;
       }
+      if (win.viewMode === "split") {
+        applyFloatingSplitRatio(win);
+      }
       win.cy.resize();
       scheduleBridgeRender();
     });
@@ -9839,6 +11160,10 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
   if (win.activeDragCleanup) {
     win.activeDragCleanup();
     win.activeDragCleanup = null;
+  }
+  if (win.splitResizerCleanup) {
+    win.splitResizerCleanup();
+    win.splitResizerCleanup = null;
   }
   if (win.panCleanup) {
     win.panCleanup();

@@ -26,6 +26,7 @@ from codemap.models import (
     ROLE_IO,
     ROLE_TRANSFORM,
     CallSite,
+    ClassInfo,
     FileAnalysis,
     FlowStep,
     FunctionInfo,
@@ -177,7 +178,8 @@ def parse_python_file(path: str, source: bytes) -> FileAnalysis:
         qualname_by_key[key] = info.qualname
         analysis.functions.append(info)
 
-    analysis.class_names = collect_class_names(root, source)
+    analysis.classes = collect_classes(root, source)
+    analysis.class_names = {cls.qualname for cls in analysis.classes}
     analysis.imports = collect_imports(root, source)
     analysis.module_calls = module_calls
     analysis.html_refs = collect_html_refs(root, source, function_nodes, qualname_by_key)
@@ -207,13 +209,66 @@ def collect_function_nodes(root: Node) -> dict[NodeKey, Node]:
     return dict(sorted(functions.items()))
 
 
-def collect_class_names(root: Node, source: bytes) -> set[str]:
-    names: set[str] = set()
+def _extract_python_bases(class_node: Node, source: bytes) -> tuple[list[str], bool]:
+    """Extrae las superclases de `class Foo(Base, Generic[T], metaclass=ABCMeta)`."""
+    super_node = class_node.child_by_field_name("superclasses")
+    if super_node is None:
+        return [], False
+    bases: list[str] = []
+    keyword_bases: list[str] = []
+    is_abstract = False
+    for child in super_node.named_children:
+        if child.type == "comment":
+            continue
+        text = collapse_whitespace(node_text(child, source))
+        if not text:
+            continue
+        if child.type == "keyword_argument":
+            keyword_bases.append(text)
+            if "ABCMeta" in text:
+                is_abstract = True
+        else:
+            bases.append(text)
+            if text in ("ABC", "abc.ABC") or text.endswith(".ABC"):
+                is_abstract = True
+    return bases + keyword_bases, is_abstract
+
+
+def collect_classes(root: Node, source: bytes) -> list[ClassInfo]:
+    """Extrae metadatos completos (`ClassInfo`) de todas las clases Python en orden de aparición."""
+    seen: dict[NodeKey, Node] = {}
     for captures in run_matches(LANGUAGE, CLASS_QUERY, root):
         node = first_capture(captures, "class")
         if node is not None:
-            names.add(describe_scope(node, source)[0])
-    return names
+            seen[node_key(node)] = node
+
+    classes: list[ClassInfo] = []
+    for _key, node in sorted(seen.items()):
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        qualname, _, _ = describe_scope(node, source)
+        short_name = node_text(name_node, source)
+        bases, is_abstract = _extract_python_bases(node, source)
+        body = node.child_by_field_name("body")
+        anchor = node.parent if (node.parent is not None and node.parent.type == "decorated_definition") else node
+        classes.append(
+            ClassInfo(
+                qualname=qualname,
+                short_name=short_name,
+                bases=bases,
+                implements=[],
+                is_abstract=is_abstract,
+                docstring=extract_docstring(body, source),
+                line=line_of(anchor),
+                end_line=end_line_of(anchor),
+            )
+        )
+    return classes
+
+
+def collect_class_names(root: Node, source: bytes) -> set[str]:
+    return {cls.qualname for cls in collect_classes(root, source)}
 
 
 def describe_scope(node: Node, source: bytes) -> tuple[str, str | None, str | None]:
@@ -294,6 +349,7 @@ def build_function(
         container=container,
         line=fn_line,
         end_line=fn_end_line,
+        is_constructor=(class_name is not None and short_name == "__init__"),
         signature=signature_text(source, node, body),
         docstring=extract_docstring(body, source),
         param_count=len(params),

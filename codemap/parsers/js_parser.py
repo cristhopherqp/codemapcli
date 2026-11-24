@@ -26,6 +26,7 @@ from codemap.models import (
     ROLE_IO,
     ROLE_TRANSFORM,
     CallSite,
+    ClassInfo,
     FileAnalysis,
     FlowStep,
     FunctionInfo,
@@ -128,14 +129,19 @@ CALLBACK_QUERY = """
   arguments: (arguments [(arrow_function) (function_expression)] @callback)) @call
 """
 
-# Clases (JS y TS; las abstractas solo existen en TS, por eso van aparte).
+# Clases (JS y TS; incluye expresiones `const Foo = class extends Bar {}` y clases abstractas en TS).
+_CLASS_EXPR_QUERY = """
+(variable_declarator
+  name: (identifier) @name
+  value: (class) @class) @anchor
+"""
 CLASS_QUERY_JS = """
 (class_declaration name: (_) @name) @class
-"""
+""" + _CLASS_EXPR_QUERY
 CLASS_QUERY_TS = """
 (class_declaration name: (_) @name) @class
 (abstract_class_declaration name: (_) @name) @class
-"""
+""" + _CLASS_EXPR_QUERY
 
 # Invocaciones normales y constructores: foo(), obj.m(), new Foo().
 CALL_QUERY = """
@@ -294,7 +300,14 @@ def parse_js_file(path: str, source: bytes, language: str) -> FileAnalysis:
         qualname_by_key[key] = info.qualname
         analysis.functions.append(info)
 
-    analysis.class_names = collect_class_names(root, source, language, function_nodes)
+    analysis.classes = collect_classes(
+        root,
+        source,
+        language,
+        function_nodes,
+        file_doc_key=file_doc_key,
+    )
+    analysis.class_names = {cls.qualname for cls in analysis.classes}
     analysis.imports = collect_imports(root, source, language)
     analysis.default_export = default_name
     analysis.module_calls = module_calls
@@ -480,19 +493,121 @@ def find_default_export(root: Node, source: bytes) -> tuple[str | None, Node | N
     return None, None
 
 
-def collect_class_names(
-    root: Node, source: bytes, language: str, functions: dict[NodeKey, FunctionNode]
-) -> set[str]:
+def _split_top_level_commas(text: str) -> list[str]:
+    """Divide una lista separada por comas respetando genéricos `<...>`, `(...)` y `[...]`."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch in "<([":
+            depth += 1
+            buf.append(ch)
+        elif ch in ">)]":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            item = collapse_whitespace("".join(buf))
+            if item:
+                parts.append(item)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = collapse_whitespace("".join(buf))
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_js_class_heritage(class_node: Node, source: bytes) -> tuple[list[str], list[str]]:
+    """Extrae `(bases, implements)` desde `class_heritage` en JS y TS/TSX."""
+    heritage: Node | None = None
+    for child in class_node.named_children:
+        if child.type == "class_heritage":
+            heritage = child
+            break
+    if heritage is None:
+        return [], []
+
+    bases: list[str] = []
+    implements: list[str] = []
+    has_ts_clauses = False
+    for child in heritage.named_children:
+        if child.type == "extends_clause":
+            has_ts_clauses = True
+            raw = collapse_whitespace(node_text(child, source))
+            cleaned = re.sub(r"^extends\s+", "", raw)
+            bases.extend(_split_top_level_commas(cleaned))
+        elif child.type == "implements_clause":
+            has_ts_clauses = True
+            raw = collapse_whitespace(node_text(child, source))
+            cleaned = re.sub(r"^implements\s+", "", raw)
+            implements.extend(_split_top_level_commas(cleaned))
+
+    if not has_ts_clauses:
+        raw = collapse_whitespace(node_text(heritage, source))
+        cleaned = re.sub(r"^extends\s+", "", raw)
+        bases.extend(_split_top_level_commas(cleaned))
+
+    return bases, implements
+
+
+def collect_classes(
+    root: Node,
+    source: bytes,
+    language: str,
+    functions: dict[NodeKey, FunctionNode],
+    *,
+    file_doc_key: NodeKey | None = None,
+) -> list[ClassInfo]:
+    """Extrae metadatos completos (`ClassInfo`) de clases JS/TS en orden de aparición."""
     query = CLASS_QUERY_JS if language == "javascript" else CLASS_QUERY_TS
-    names: set[str] = set()
+    seen: dict[NodeKey, tuple[Node, Node, Node]] = {}
     for captures in run_matches(language, query, root):
         node = first_capture(captures, "class")
         name_node = first_capture(captures, "name")
-        if node is None or name_node is None:
+        anchor_node = first_capture(captures, "anchor") or node
+        if node is None or name_node is None or anchor_node is None:
             continue
+        seen[node_key(node)] = (node, name_node, anchor_node)
+
+    classes: list[ClassInfo] = []
+    for _key, (node, name_node, anchor_node) in sorted(seen.items()):
         scope_names, _, _ = scope_chain(node, source, functions)
-        names.add(".".join(scope_names + [node_text(name_node, source)]))
-    return names
+        short_name = node_text(name_node, source)
+        qualname = ".".join(scope_names + [short_name])
+        bases, implements = _extract_js_class_heritage(node, source)
+        doc_anchor = anchor_node
+        if doc_anchor.parent is not None and doc_anchor.parent.type == "export_statement":
+            line_anchor = doc_anchor.parent
+        elif (
+            doc_anchor.type == "variable_declarator"
+            and doc_anchor.parent is not None
+            and doc_anchor.parent.type in ("lexical_declaration", "variable_declaration")
+        ):
+            line_anchor = doc_anchor.parent
+            if line_anchor.parent is not None and line_anchor.parent.type == "export_statement":
+                line_anchor = line_anchor.parent
+        else:
+            line_anchor = doc_anchor
+        classes.append(
+            ClassInfo(
+                qualname=qualname,
+                short_name=short_name,
+                bases=bases,
+                implements=implements,
+                is_abstract=(node.type == "abstract_class_declaration"),
+                docstring=extract_jsdoc(doc_anchor, source, file_doc_key=file_doc_key),
+                line=line_of(line_anchor),
+                end_line=end_line_of(node),
+            )
+        )
+    return classes
+
+
+def collect_class_names(
+    root: Node, source: bytes, language: str, functions: dict[NodeKey, FunctionNode]
+) -> set[str]:
+    return {cls.qualname for cls in collect_classes(root, source, language, functions)}
 
 
 # ---------------------------------------------------------------------------
@@ -510,8 +625,14 @@ def scope_chain(
         key = node_key(parent)
         if key in functions:
             ancestors.append(("function", functions[key].name))
-        elif parent.type in CLASS_TYPES and parent.child_by_field_name("name") is not None:
-            ancestors.append(("class", node_text(parent.child_by_field_name("name"), source)))
+        elif parent.type in CLASS_TYPES:
+            cls_name_node = parent.child_by_field_name("name")
+            if cls_name_node is not None:
+                ancestors.append(("class", node_text(cls_name_node, source)))
+            elif parent.parent is not None and parent.parent.type == "variable_declarator":
+                var_name = parent.parent.child_by_field_name("name")
+                if var_name is not None:
+                    ancestors.append(("class", node_text(var_name, source)))
         parent = parent.parent
     ancestors.reverse()
 
@@ -572,6 +693,7 @@ def build_function(
         container=container,
         line=fn_line,
         end_line=fn_end_line,
+        is_constructor=(class_name is not None and candidate.name == "constructor"),
         signature=signature_text(source, candidate.anchor, body),
         docstring=extract_jsdoc(candidate.anchor, source, file_doc_key=file_doc_key),
         param_count=len(params),
@@ -626,6 +748,16 @@ def _node_declares_function_or_class(node: Node, function_nodes: dict[NodeKey, F
         for child in node.named_children:
             if child.type in CLASS_TYPES or child.type in ("function_declaration", "generator_function_declaration"):
                 return True
+            if child.type == "variable_declarator":
+                val = child.child_by_field_name("value")
+                if val is not None and val.type in CLASS_TYPES:
+                    return True
+            if child.type in ("lexical_declaration", "variable_declaration"):
+                for decl in child.named_children:
+                    if decl.type == "variable_declarator":
+                        val = decl.child_by_field_name("value")
+                        if val is not None and val.type in CLASS_TYPES:
+                            return True
     return False
 
 

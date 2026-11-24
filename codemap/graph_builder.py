@@ -450,7 +450,9 @@ def recommended_level(
 # ---------------------------------------------------------------------------
 
 def is_private(function: FunctionInfo) -> bool:
-    """_helper, __init__ (Python) y #metodo (JS) se ocultan sin --include-private."""
+    """_helper, dunders (salvo __init__ en clases) y #metodo (JS) se ocultan sin --include-private."""
+    if function.is_constructor or (function.class_name is not None and function.short_name == "__init__"):
+        return False
     return function.short_name.startswith(("_", "#"))
 
 
@@ -518,6 +520,20 @@ def build_file_nodes(
             node["loaded_by_html"] = htmls_map[file_id]
         if file_id in mod_entries_map:
             node["module_entry_functions"] = mod_entries_map[file_id]
+        if analysis.classes:
+            node["classes"] = {
+                cls.qualname: {
+                    "qualname": cls.qualname,
+                    "short_name": cls.short_name,
+                    "bases": list(cls.bases),
+                    "implements": list(cls.implements),
+                    "is_abstract": cls.is_abstract,
+                    "docstring": cls.docstring,
+                    "line": cls.line,
+                    "end_line": cls.end_line,
+                }
+                for cls in analysis.classes
+            }
         nodes.append(node)
     return nodes
 
@@ -833,45 +849,48 @@ def build_function_nodes(
             if fid not in visible_ids:
                 continue
             e_kind = kinds_map.get(fid)
-            nodes.append(
-                {
-                    "id": fid,
-                    "type": "function",
-                    "parent": file_id,
-                    "label": f"{function.qualname}()",
-                    "role": classify_role(function, has_callers=fid in called_ids, entry_kind=e_kind),
-                    "entry_kind": e_kind,
-                    "is_main_entry": e_kind == ENTRY_KIND_MAIN,
-                    "is_event_handler": e_kind in (ENTRY_KIND_EVENT, ENTRY_KIND_ROUTE),
-                    "is_unreferenced": e_kind == ENTRY_KIND_UNREFERENCED,
-                    "is_module_entry": fid in mod_entries,
-                    "is_terminal": fid in terminal_ids,
-                    "signature": function.signature,
-                    "docstring": function.docstring,
-                    "line": function.line,
-                    "end_line": function.end_line or function.line,
-                    "fingerprint": function.fingerprint,
-                    "external_calls": collect_external_calls(function, analysis, index),
-                    "internal_flow": [
-                        {
-                            "id": step.id,
-                            "role": step.role,
-                            "label": step.label,
-                            "code": step.code or step.label,
-                            "parent_id": step.parent_id,
-                            "is_container": step.is_container,
-                            "kind": step.kind,
-                            "line": step.line,
-                            "end_line": step.end_line or step.line,
-                            "edges": [
-                                {"target": edge.target, "label": edge.label, "kind": edge.kind}
-                                for edge in step.edges
-                            ],
-                        }
-                        for step in function.internal_flow
-                    ],
-                }
-            )
+            fn_node: dict = {
+                "id": fid,
+                "type": "function",
+                "parent": file_id,
+                "label": f"{function.qualname}()",
+                "role": classify_role(function, has_callers=fid in called_ids, entry_kind=e_kind),
+                "entry_kind": e_kind,
+                "is_main_entry": e_kind == ENTRY_KIND_MAIN,
+                "is_event_handler": e_kind in (ENTRY_KIND_EVENT, ENTRY_KIND_ROUTE),
+                "is_unreferenced": e_kind == ENTRY_KIND_UNREFERENCED,
+                "is_module_entry": fid in mod_entries,
+                "is_terminal": fid in terminal_ids,
+                "signature": function.signature,
+                "docstring": function.docstring,
+                "line": function.line,
+                "end_line": function.end_line or function.line,
+                "fingerprint": function.fingerprint,
+                "external_calls": collect_external_calls(function, analysis, index),
+                "internal_flow": [
+                    {
+                        "id": step.id,
+                        "role": step.role,
+                        "label": step.label,
+                        "code": step.code or step.label,
+                        "parent_id": step.parent_id,
+                        "is_container": step.is_container,
+                        "kind": step.kind,
+                        "line": step.line,
+                        "end_line": step.end_line or step.line,
+                        "edges": [
+                            {"target": edge.target, "label": edge.label, "kind": edge.kind}
+                            for edge in step.edges
+                        ],
+                    }
+                    for step in function.internal_flow
+                ],
+            }
+            if function.class_name:
+                fn_node["class_name"] = function.class_name
+            if function.is_constructor:
+                fn_node["is_constructor"] = True
+            nodes.append(fn_node)
     return nodes
 
 

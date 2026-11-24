@@ -92,6 +92,20 @@ class HtmlRef:
 
 
 @dataclass
+class ClassInfo:
+    """Metadatos estructurales de una clase declarada en un archivo."""
+
+    qualname: str              # "ConfigError", "Outer.Inner"
+    short_name: str            # "ConfigError"
+    bases: list[str] = field(default_factory=list)       # ["Error"] / ["ValueError", "Generic[T]"]
+    implements: list[str] = field(default_factory=list)  # TS: ["IService", "Disposable"]
+    is_abstract: bool = False
+    docstring: str = ""
+    line: int = 0
+    end_line: int = 0
+
+
+@dataclass
 class FunctionInfo:
     """Función, método, arrow function o callback nombrado por contexto."""
 
@@ -104,6 +118,7 @@ class FunctionInfo:
     docstring: str
     param_count: int
     end_line: int = 0
+    is_constructor: bool = False
     calls: list[CallSite] = field(default_factory=list)
     internal_flow: list[FlowStep] = field(default_factory=list)
     branch_count: int = 0      # if / elif / case ...
@@ -142,6 +157,7 @@ class FileAnalysis:
     language: str              # "python" | "javascript" | "typescript" | "tsx" | "html"
     docstring: str = ""
     functions: list[FunctionInfo] = field(default_factory=list)
+    classes: list[ClassInfo] = field(default_factory=list)
     imports: list[ImportBinding] = field(default_factory=list)
     class_names: set[str] = field(default_factory=set)
     default_export: str | None = None  # qualname exportado por defecto (JS/TS)

@@ -171,18 +171,61 @@ def _new_functions_by_key(graph_nodes: dict[str, dict], known_ids: set[str]) -> 
     return buckets
 
 
+def _collect_valid_flow_steps(graph: dict) -> tuple[set[str], dict[str, set[str]]]:
+    """Construye el conjunto de IDs válidos `fn_id::step_id` desde `internal_flow`."""
+    valid_ids: set[str] = set()
+    by_fn: dict[str, set[str]] = {}
+    for node in graph.get("nodes", []):
+        if node.get("type") != "function":
+            continue
+        fn_id = node.get("id") or ""
+        if not fn_id:
+            continue
+        step_ids: set[str] = set()
+        for step in node.get("internal_flow") or []:
+            if not isinstance(step, dict):
+                continue
+            sid = step.get("id")
+            if isinstance(sid, str) and sid:
+                step_ids.add(sid)
+                valid_ids.add(f"{fn_id}::{sid}")
+        if step_ids:
+            by_fn[fn_id] = step_ids
+    return valid_ids, by_fn
+
+
+def _is_layer_container_id(node_id: str) -> bool:
+    return isinstance(node_id, str) and node_id.startswith("layer::")
+
+
+def _split_flow_step_id(node_id: str) -> tuple[str, str] | None:
+    """Separa `file::fn::step` en `(file::fn, step)` si tiene al menos 2 separadores `::`."""
+    if not isinstance(node_id, str) or "::" not in node_id:
+        return None
+    owner_id, step_id = node_id.rsplit("::", 1)
+    if "::" in owner_id and step_id:
+        return owner_id, step_id
+    return None
+
+
 def reconcile_notes(target_path: str, graph: dict) -> dict:
     """Sincroniza notes.json tras regenerar graph.json.
 
     - Actualiza `last_fingerprint` de nodos vigentes.
+    - Preserva pines/notas en contenedores de capa (`layer::*`) y pasos intra-función
+      (`fn_id::step_id`) presentes en `internal_flow`.
     - Si una función desaparece y aparece otra en el mismo archivo con idéntico
-      `fingerprint` AST, transfiere automáticamente nota, rol y coordenadas.
-    - Si desaparece definitivamente y tenía contenido humano, la mueve a `orphans`.
+      `fingerprint` AST, transfiere automáticamente nota, rol, coordenadas y también
+      las entradas `old_fn::step` → `new_fn::step` de pasos que sigan existiendo.
+    - Si un paso intra-función desaparece tras refactorizar y solo tenía posición
+      fijada (sin nota ni rol manual), se descarta silenciosamente sin ensuciar `orphans`.
+    - Si un nodo con contenido humano desaparece definitivamente, se mueve a `orphans`.
     """
     with _NOTES_LOCK:
         notes = load_notes(target_path)
         nodes_map: dict[str, dict] = notes["nodes"]
         graph_nodes = {node["id"]: node for node in graph.get("nodes", [])}
+        valid_flow_step_ids, flow_steps_by_fn = _collect_valid_flow_steps(graph)
 
         for node_id, entry in nodes_map.items():
             if node_id in graph_nodes:
@@ -190,14 +233,33 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
                 if fp:
                     entry["last_fingerprint"] = fp
 
-        missing_ids = [node_id for node_id in list(nodes_map) if node_id not in graph_nodes]
+        missing_ids = [
+            node_id
+            for node_id in list(nodes_map)
+            if node_id not in graph_nodes
+            and node_id not in valid_flow_step_ids
+            and not _is_layer_container_id(node_id)
+        ]
         if not missing_ids:
             return notes
 
         candidates = _new_functions_by_key(graph_nodes, set(nodes_map))
         now_iso = _utc_now_iso()
 
+        # Separar nodos de nivel superior de pasos intra-función para migrar primero funciones
+        # y luego trasladar sus pasos `old_fn::step` → `new_fn::step`.
+        missing_regular: list[str] = []
+        missing_flow_steps: list[tuple[str, str, str]] = []
         for old_id in missing_ids:
+            split_step = _split_flow_step_id(old_id)
+            if split_step is not None:
+                missing_flow_steps.append((old_id, split_step[0], split_step[1]))
+            else:
+                missing_regular.append(old_id)
+
+        migrated_fn_ids: dict[str, str] = {}
+
+        for old_id in missing_regular:
             entry = nodes_map.pop(old_id)
             if not has_user_content(entry):
                 continue
@@ -208,8 +270,10 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
 
             if pool:
                 target_node = pool.pop(0)
+                target_id = target_node["id"]
                 entry["last_fingerprint"] = target_node.get("fingerprint") or fp
-                nodes_map[target_node["id"]] = entry
+                nodes_map[target_id] = entry
+                migrated_fn_ids[old_id] = target_id
             else:
                 notes["orphans"].append(
                     {
@@ -220,6 +284,32 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
                         "orphaned_at": now_iso,
                     }
                 )
+
+        for old_id, old_fn_id, step_id in missing_flow_steps:
+            entry = nodes_map.pop(old_id)
+            if not has_user_content(entry):
+                continue
+
+            migrated_fn = migrated_fn_ids.get(old_fn_id)
+            if migrated_fn and step_id in flow_steps_by_fn.get(migrated_fn, set()):
+                new_step_id = f"{migrated_fn}::{step_id}"
+                if new_step_id not in nodes_map:
+                    nodes_map[new_step_id] = entry
+                continue
+
+            # Si el paso intra-función solo tenía posición fijada (sin texto ni rol), descartar sin ensuciar orphans.
+            if not entry.get("note", "").strip() and not entry.get("custom_role"):
+                continue
+
+            notes["orphans"].append(
+                {
+                    "old_id": old_id,
+                    "note": entry["note"],
+                    "custom_role": entry["custom_role"],
+                    "last_fingerprint": entry.get("last_fingerprint") or "",
+                    "orphaned_at": now_iso,
+                }
+            )
 
         save_notes(target_path, notes)
         return notes
