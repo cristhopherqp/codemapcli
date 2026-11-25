@@ -459,20 +459,67 @@ button:hover {
   padding-top: 4px;
 }
 
-/* Panel lateral colapsable */
+/* Tirador arrastrable para redimensionar el panel lateral derecho (#details-panel) */
+.details-panel-resizer {
+  width: 6px;
+  flex-shrink: 0;
+  cursor: ew-resize;
+  background: transparent;
+  border-left: 1px solid var(--border);
+  position: relative;
+  z-index: 25;
+  transition: background 0.14s, border-color 0.14s;
+}
+
+.details-panel-resizer::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 36px;
+  border-radius: 2px;
+  background: rgba(148, 163, 184, 0.35);
+  transition: background 0.14s, height 0.14s;
+}
+
+.details-panel-resizer:hover,
+.details-panel-resizer.dragging {
+  background: rgba(56, 189, 248, 0.18);
+  border-left-color: var(--accent);
+}
+
+.details-panel-resizer:hover::after,
+.details-panel-resizer.dragging::after {
+  background: var(--accent);
+  height: 54px;
+}
+
+.details-panel-resizer.hidden-resizer {
+  display: none;
+}
+
+/* Panel lateral colapsable y redimensionable */
 .details-panel {
   width: 350px;
+  min-width: 280px;
   flex-shrink: 0;
   background: var(--bg-panel);
-  border-left: 1px solid var(--border);
   padding: 12px 16px 16px;
   overflow-y: auto;
   overflow-x: hidden;
   transition: width 0.22s ease, padding 0.22s ease, border-width 0.22s ease, opacity 0.18s ease;
 }
 
+.details-panel.resizing {
+  transition: none !important;
+  user-select: none;
+}
+
 .details-panel.collapsed {
-  width: 0;
+  width: 0 !important;
+  min-width: 0 !important;
   padding-left: 0;
   padding-right: 0;
   border-left-width: 0;
@@ -2990,11 +3037,33 @@ kbd {
 }
 
 /* ---------------------------------------------------------------------------
- * Ciclo 8: Recorrido Visual Estático ("Chispa"), HUD, Call Stack y Tarjeta
+ * Ciclo 8 / 10: Recorrido Visual Estático, HUD de una fila, Call Stack y Tarjeta
  * --------------------------------------------------------------------------- */
 
 .fw-cy-container {
   position: relative;
+}
+
+.fw-walkthrough-btn {
+  color: #67e8f9;
+  border-color: rgba(6, 182, 212, 0.55);
+  background: rgba(6, 182, 212, 0.12);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.fw-walkthrough-btn:hover {
+  background: rgba(6, 182, 212, 0.26);
+  border-color: #22d3ee;
+  color: #ecfeff;
+}
+
+.fw-walkthrough-btn.active {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: #10b981;
+  color: #a7f3d0;
 }
 
 .walkthrough-canvas {
@@ -3019,15 +3088,15 @@ kbd {
 
 .walkthrough-hud {
   position: absolute;
-  top: 12px;
+  top: 10px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 860;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-width: min(860px, calc(100% - 28px));
-  padding: 7px 10px;
+  gap: 5px;
+  max-width: calc(100% - 20px);
+  padding: 5px 8px;
   background: rgba(15, 22, 33, 0.96);
   border: 1px solid #0891b2;
   border-radius: 10px;
@@ -3037,19 +3106,42 @@ kbd {
 .wt-hud-row {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 7px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  gap: 5px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.wt-hud-row::-webkit-scrollbar {
+  display: none;
+}
+
+.wt-scope-pill {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.16);
+  border: 1px solid rgba(16, 185, 129, 0.55);
+  border-radius: 999px;
+  padding: 2px 7px;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 
 .wt-transport-group,
 .wt-mode-group {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
+  flex-shrink: 0;
 }
 
 .wt-hud-btn {
-  padding: 4px 8px;
+  padding: 3px 7px;
   font-size: 11px;
   font-weight: 600;
   border-radius: 6px;
@@ -3058,6 +3150,7 @@ kbd {
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .wt-hud-btn:hover:not(:disabled) {
@@ -3102,15 +3195,16 @@ kbd {
 
 .wt-counter {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 700;
   color: #bae6fd;
-  padding: 2px 7px;
+  padding: 2px 6px;
   border-radius: 999px;
   background: var(--bg);
   border: 1px solid var(--border);
-  min-width: 56px;
+  min-width: 48px;
   text-align: center;
+  flex-shrink: 0;
 }
 
 .wt-speed-select {
@@ -3120,8 +3214,9 @@ kbd {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 3px 6px;
+  padding: 3px 5px;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .wt-branch-bar {
@@ -3237,6 +3332,7 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .wt-stack-header {
@@ -3338,13 +3434,29 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  min-width: 0;
 }
 
 .wt-code-preview-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.wt-code-preview-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.wt-wrap-btn.active {
+  background: rgba(56, 189, 248, 0.2);
+  border-color: var(--accent);
+  color: #e0f2fe;
 }
 
 .wt-code-meta {
@@ -3354,24 +3466,45 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 
 .wt-code-lines {
   background: #0b1017;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 0;
+  padding: 6px 0;
   font-family: var(--font-mono);
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.5;
+  max-height: 280px;
   overflow-x: auto;
+  overflow-y: auto;
+  min-width: 0;
 }
 
 .wt-code-row {
   display: flex;
   align-items: flex-start;
-  padding: 0 8px 0 0;
+  min-width: max-content;
+  padding: 0 10px 0 0;
   border-left: 3px solid transparent;
+}
+
+.wt-code-preview-box.wrap-enabled .wt-code-lines {
+  overflow-x: hidden;
+  max-height: 320px;
+}
+
+.wt-code-preview-box.wrap-enabled .wt-code-row {
+  min-width: 0;
+  width: 100%;
+}
+
+.wt-code-preview-box.wrap-enabled .wt-code-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .wt-code-row.active {

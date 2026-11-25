@@ -1,8 +1,8 @@
-/* Recorrido Visual Estático ("Chispa") de CodeMap — Ciclo 8 (Lote 3)
+/* Recorrido Visual Estático de CodeMap — Ciclo 8 / Ciclo 10
  * - Contrato desacoplado `WalkthroughTrace` (schema_version: 1), compatible con futuro `codemap trace`
  * - `StaticWalkthroughGenerator`: Modo Pulso (Nivel 3) y Modo Paso a Paso (Nivel 3+) con ramas if/switch/try-catch
  * - `WalkthroughCanvasRenderer`: capa <canvas> sincronizada con pan/zoom sobre polilíneas ortogonales exactas
- * - `WalkthroughController`: HUD flotante, Call Stack simulado, tarjeta de acción y sincronización con GET /source
+ * - `WalkthroughController`: HUD flotante, Call Stack simulado, tarjeta de acción, ámbito de ventana flotante y sincronización con GET /source
  */
 
 (function initCodeMapWalkthrough(globalScope) {
@@ -1171,7 +1171,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 3. Motor <canvas> "Chispa" sincronizado con cy.pan(), cy.zoom() y rAF
+  // 3. Motor <canvas> de Recorrido Visual sincronizado con cy.pan(), cy.zoom() y rAF
   // -------------------------------------------------------------------------
 
   class WalkthroughCanvasRenderer {
@@ -1377,7 +1377,7 @@
         }
       }
 
-      // 2. Polilínea activa del evento y partícula "Chispa" (ida, vuelta o ida+vuelta en Step Over).
+      // 2. Polilínea activa del evento y partícula de recorrido (ida, vuelta o ida+vuelta en Step Over).
       const isReturn = event.kind === "return";
       const poly = extractEdgePolyline(cy, event.from, event.to, event.edge_id, {
         nodesById,
@@ -1443,7 +1443,7 @@
             ctx.restore();
           }
 
-          // Núcleo luminoso de la chispa.
+          // Núcleo luminoso de la partícula de recorrido.
           const head = samplePolylineAt(activePoly, activeT);
           if (head) {
             const hs = modelToScreen(head, pan, zoom);
@@ -1542,10 +1542,31 @@
   // 4. Controlador UI (`WalkthroughController`): HUD, Call Stack, Tarjeta y Código
   // -------------------------------------------------------------------------
 
+  const WT_CODE_WRAP_STORAGE_KEY = "codemap.wt.codeWrap";
+
   function createWalkthroughController(hooks) {
+    const loadInitialCodeWrap = () => {
+      try {
+        if (typeof localStorage !== "undefined") {
+          const saved = localStorage.getItem(WT_CODE_WRAP_STORAGE_KEY);
+          if (saved === "false" || saved === "0") {
+            return false;
+          }
+          if (saved === "true" || saved === "1") {
+            return true;
+          }
+        }
+      } catch (_err) {
+        // Ignorar errores de almacenamiento privado.
+      }
+      return true;
+    };
+
     const wtState = {
       active: false,
       playing: false,
+      scope: "main", // "main" | "window"
+      windowId: null,
       granularity: "pulse", // "pulse" | "step"
       stepInto: true,
       speed: 1,
@@ -1557,11 +1578,46 @@
       playTimer: null,
       sourceCache: new Map(),
       lastRenderedCodeKey: "",
+      codeWrap: loadInitialCodeWrap(),
+    };
+
+    const getScopedFloatingWindow = () => {
+      if (wtState.scope !== "window" || !wtState.windowId) {
+        return null;
+      }
+      if (hooks.getFloatingWindowById) {
+        const w = hooks.getFloatingWindowById(wtState.windowId);
+        return w && !w.destroyed ? w : null;
+      }
+      const floatingWins = hooks.getFloatingWindows ? hooks.getFloatingWindows() : [];
+      return floatingWins.find((w) => w && !w.destroyed && w.id === wtState.windowId) || null;
+    };
+
+    const clearMainCanvasOnly = () => {
+      const mainCanvas = document.getElementById("walkthrough-canvas");
+      if (!mainCanvas) {
+        return;
+      }
+      const ctx = mainCanvas.getContext("2d");
+      if (ctx) {
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, mainCanvas.width, mainCanvas.height);
+        ctx.restore();
+      }
     };
 
     const renderer = new WalkthroughCanvasRenderer(
       () => {
         const list = [];
+        if (wtState.scope === "window") {
+          clearMainCanvasOnly();
+          const targetWin = getScopedFloatingWindow();
+          if (targetWin && targetWin.cy && targetWin.cyContainer) {
+            list.push({ cy: targetWin.cy, canvas: null, containerEl: targetWin.cyContainer, win: targetWin });
+          }
+          return list;
+        }
         const mainCy = hooks.getCy ? hooks.getCy() : null;
         const mainCanvas = document.getElementById("walkthrough-canvas");
         const mainArea = document.getElementById("canvas-area");
@@ -1578,6 +1634,49 @@
       },
       () => (hooks.getNodesById ? hooks.getNodesById() : null),
     );
+
+    const applyCodeWrapState = () => {
+      const box = document.getElementById("wt-code-preview-box");
+      const btn = document.getElementById("btn-wt-wrap-code");
+      if (box) {
+        box.classList.toggle("wrap-enabled", Boolean(wtState.codeWrap));
+      }
+      if (btn) {
+        btn.classList.toggle("active", Boolean(wtState.codeWrap));
+        btn.setAttribute("aria-pressed", wtState.codeWrap ? "true" : "false");
+      }
+    };
+
+    const toggleCodeWrap = () => {
+      wtState.codeWrap = !wtState.codeWrap;
+      try {
+        if (typeof localStorage !== "undefined") {
+          localStorage.setItem(WT_CODE_WRAP_STORAGE_KEY, String(wtState.codeWrap));
+        }
+      } catch (_err) {
+        // Ignorar errores de almacenamiento privado.
+      }
+      applyCodeWrapState();
+    };
+
+    const getSnapshotState = () => ({
+      active: wtState.active,
+      playing: wtState.playing,
+      scope: wtState.scope,
+      windowId: wtState.windowId,
+      granularity: wtState.granularity,
+      stepInto: wtState.stepInto,
+      speed: wtState.speed,
+      index: wtState.index,
+      total: wtState.trace ? wtState.trace.events.length : 0,
+      rootId: wtState.rootId,
+    });
+
+    const notifyStateChanged = () => {
+      if (hooks.onWalkthroughStateChanged) {
+        hooks.onWalkthroughStateChanged(getSnapshotState());
+      }
+    };
 
     const clearPlayTimer = () => {
       if (wtState.playTimer !== null) {
@@ -1649,9 +1748,26 @@
         speedSelect.value = String(wtState.speed);
       }
 
+      const isWindowScope = wtState.scope === "window";
+      const scopePill = document.getElementById("wt-scope-pill");
+      if (scopePill) {
+        if (isWindowScope) {
+          const nodesById = hooks.getNodesById ? hooks.getNodesById() : null;
+          const rootNode = nodesById && wtState.rootId ? nodesById.get(wtState.rootId) : null;
+          const label = (rootNode && rootNode.label) || wtState.rootId || "función";
+          scopePill.textContent = `Ventana: ${label}`;
+          scopePill.title = `Recorrido Visual aislado dentro de la ventana flotante (${label})`;
+          scopePill.classList.remove("hidden");
+        } else {
+          scopePill.textContent = "";
+          scopePill.classList.add("hidden");
+        }
+      }
+
       const pulseBtn = document.getElementById("btn-wt-mode-pulse");
       const stepBtn = document.getElementById("btn-wt-mode-step");
       if (pulseBtn) {
+        pulseBtn.classList.toggle("hidden", isWindowScope);
         pulseBtn.classList.toggle("active", wtState.granularity === "pulse");
         pulseBtn.setAttribute("aria-pressed", wtState.granularity === "pulse" ? "true" : "false");
       }
@@ -1662,10 +1778,13 @@
 
       const stepIntoBtn = document.getElementById("btn-wt-step-into");
       if (stepIntoBtn) {
-        stepIntoBtn.classList.toggle("hidden", wtState.granularity !== "step");
+        stepIntoBtn.classList.toggle("hidden", isWindowScope || wtState.granularity !== "step");
         stepIntoBtn.classList.toggle("active", wtState.stepInto);
         stepIntoBtn.setAttribute("aria-pressed", wtState.stepInto ? "true" : "false");
-        stepIntoBtn.textContent = wtState.stepInto ? "↳ Profundizar: Sí" : "↷ Profundizar: No";
+        stepIntoBtn.textContent = wtState.stepInto ? "↳ Profundizar" : "↷ Sin hijas";
+        stepIntoBtn.title = wtState.stepInto
+          ? "Profundizar en funciones hijas: Sí (Step Into). Clic para cambiar a Step Over"
+          : "Profundizar en funciones hijas: No (Step Over). Clic para profundizar";
       }
 
       // Píldoras de bifurcación (if / switch / try-catch).
@@ -1687,6 +1806,7 @@
           branchBar.classList.add("hidden");
         }
       }
+      notifyStateChanged();
     };
 
     const renderStackPanel = () => {
@@ -1708,7 +1828,11 @@
         depthEl.textContent = `${stack.length} ${stack.length === 1 ? "frame" : "frames"}`;
       }
       if (modeBadgeEl) {
-        modeBadgeEl.textContent = wtState.granularity === "step" ? "Paso a Paso · N3+" : "Pulso · N3";
+        if (wtState.scope === "window") {
+          modeBadgeEl.textContent = "Ventana · Paso a Paso";
+        } else {
+          modeBadgeEl.textContent = wtState.granularity === "step" ? "Paso a Paso · N3+" : "Pulso · N3";
+        }
       }
 
       listEl.innerHTML = "";
@@ -1751,37 +1875,56 @@
     const positionActionCard = () => {
       const card = document.getElementById("walkthrough-action-card");
       const area = document.getElementById("canvas-area");
-      const cy = hooks.getCy ? hooks.getCy() : null;
       const cur = getCurrentEvent();
       if (!card || !area) {
         return;
       }
       if (!wtState.active || !cur) {
         card.classList.add("hidden");
+        card.style.zIndex = "";
         return;
       }
 
+      const targetWin = wtState.scope === "window" ? getScopedFloatingWindow() : null;
+      const cy = targetWin ? targetWin.cy : (hooks.getCy ? hooks.getCy() : null);
       const nodesById = hooks.getNodesById ? hooks.getNodesById() : null;
       const focusId = resolveVisibleCyNodeId(cy, cur.step_over ? cur.from : (cur.to || cur.from), nodesById);
       const cyNode = cy && focusId ? cy.getElementById(focusId) : null;
 
-      let left = 20;
-      let top = 74;
-      if (cyNode && cyNode.length > 0) {
+      let offsetX = 0;
+      let offsetY = 0;
+      if (targetWin && targetWin.el) {
+        const areaRect = area.getBoundingClientRect();
+        const boxEl = targetWin.viewMode === "code" ? targetWin.el : targetWin.cyContainer;
+        const boxRect = boxEl ? boxEl.getBoundingClientRect() : areaRect;
+        offsetX = boxRect.left - areaRect.left;
+        offsetY = boxRect.top - areaRect.top;
+        const winZ = Number.parseInt(targetWin.el.style.zIndex || "32", 10) || 32;
+        card.style.zIndex = String(Math.min(855, winZ + 4));
+      } else {
+        card.style.zIndex = "";
+      }
+
+      let left = offsetX + 20;
+      let top = offsetY + 56;
+      if (targetWin && targetWin.viewMode === "code" && targetWin.el) {
+        left = offsetX + Math.max(12, targetWin.el.clientWidth - 290);
+        top = offsetY + 42;
+      } else if (cyNode && cyNode.length > 0) {
         const bb = cyNode.renderedBoundingBox({ includeLabels: false });
-        left = Math.round(bb.x2 + 14);
-        top = Math.round(bb.y1 - 4);
+        left = Math.round(offsetX + bb.x2 + 14);
+        top = Math.round(offsetY + bb.y1 - 4);
       }
 
       card.classList.remove("hidden");
       const cardW = card.offsetWidth || 260;
       const cardH = card.offsetHeight || 68;
-      if (left + cardW > area.clientWidth - 14 && cyNode && cyNode.length > 0) {
+      if ((!targetWin || targetWin.viewMode !== "code") && left + cardW > area.clientWidth - 14 && cyNode && cyNode.length > 0) {
         const bb = cyNode.renderedBoundingBox({ includeLabels: false });
-        left = Math.round(bb.x1 - cardW - 14);
+        left = Math.round(offsetX + bb.x1 - cardW - 14);
       }
       left = Math.max(14, Math.min(Math.max(14, area.clientWidth - cardW - 14), left));
-      top = Math.max(66, Math.min(Math.max(66, area.clientHeight - cardH - 18), top));
+      top = Math.max(58, Math.min(Math.max(58, area.clientHeight - cardH - 18), top));
       card.style.left = `${left}px`;
       card.style.top = `${top}px`;
     };
@@ -1900,11 +2043,18 @@
 
       const startLine = cur.line > 0 ? cur.line : sourceData.start_line;
       const endLine = cur.end_line >= startLine ? cur.end_line : startLine;
-      const windowStart = Math.max(sourceData.start_line, startLine - 2);
-      const windowEnd = Math.min(sourceData.end_line, endLine + 3);
+      const totalLines = sourceData.lines.length;
+      const windowStart = totalLines <= 28
+        ? sourceData.start_line
+        : Math.max(sourceData.start_line, startLine - 4);
+      const windowEnd = totalLines <= 28
+        ? sourceData.end_line
+        : Math.min(sourceData.end_line, endLine + 5);
 
+      applyCodeWrapState();
       linesEl.replaceChildren();
       const frag = document.createDocumentFragment();
+      let firstActiveRow = null;
       for (const lineObj of sourceData.lines) {
         if (lineObj.number < windowStart || lineObj.number > windowEnd) {
           continue;
@@ -1932,9 +2082,15 @@
 
         row.appendChild(numSpan);
         row.appendChild(textSpan);
+        if (isActiveLine && !firstActiveRow) {
+          firstActiveRow = row;
+        }
         frag.appendChild(row);
       }
       linesEl.appendChild(frag);
+      if (firstActiveRow && typeof firstActiveRow.scrollIntoView === "function") {
+        firstActiveRow.scrollIntoView({ block: "nearest" });
+      }
 
       if (hooks.renderWalkthroughVocab) {
         hooks.renderWalkthroughVocab(cur, sourceData);
@@ -1996,7 +2152,10 @@
       wtState.lastRenderedCodeKey = "";
 
       if (hooks.prepareCanvasForTrace && trace.events.length > 0) {
-        await hooks.prepareCanvasForTrace(trace);
+        await hooks.prepareCanvasForTrace(trace, {
+          scope: wtState.scope,
+          windowId: wtState.windowId,
+        });
       }
 
       applyCurrentEvent();
@@ -2014,14 +2173,23 @@
       if (!rawGraph) {
         return false;
       }
+      const nextScope = options.scope === "window" && options.windowId ? "window" : "main";
       wtState.active = true;
       wtState.playing = false;
-      wtState.granularity = options.granularity || wtState.granularity || "pulse";
-      if (options.stepInto !== undefined) {
-        wtState.stepInto = Boolean(options.stepInto);
+      wtState.scope = nextScope;
+      wtState.windowId = nextScope === "window" ? options.windowId : null;
+      if (nextScope === "window") {
+        wtState.granularity = "step";
+        wtState.stepInto = false;
+        wtState.flowId = null;
+      } else {
+        wtState.granularity = options.granularity || wtState.granularity || "pulse";
+        if (options.stepInto !== undefined) {
+          wtState.stepInto = Boolean(options.stepInto);
+        }
+        wtState.flowId = options.flowId !== undefined ? options.flowId : (hooks.getActiveFlowId ? hooks.getActiveFlowId() : null);
       }
       wtState.rootId = options.rootId !== undefined ? options.rootId : (hooks.getPreferredRootId ? hooks.getPreferredRootId() : null);
-      wtState.flowId = options.flowId !== undefined ? options.flowId : (hooks.getActiveFlowId ? hooks.getActiveFlowId() : null);
       wtState.branchOverrides = options.branchOverrides ? { ...options.branchOverrides } : {};
       wtState.index = 0;
 
@@ -2034,7 +2202,7 @@
       return true;
     };
 
-    const loadExternalTrace = async (externalTrace, { autoPlay = false } = {}) => {
+    const loadExternalTrace = async (externalTrace, { autoPlay = false, scope = "main", windowId = null } = {}) => {
       clearPlayTimer();
       const normalized = normalizeTrace(externalTrace);
       if (normalized.events.length === 0) {
@@ -2042,6 +2210,8 @@
       }
       wtState.active = true;
       wtState.playing = false;
+      wtState.scope = scope === "window" && windowId ? "window" : "main";
+      wtState.windowId = wtState.scope === "window" ? windowId : null;
       wtState.trace = normalized;
       wtState.granularity = normalized.granularity;
       wtState.stepInto = normalized.step_into;
@@ -2052,7 +2222,10 @@
       wtState.lastRenderedCodeKey = "";
       updateSidebarButton();
       if (hooks.prepareCanvasForTrace) {
-        await hooks.prepareCanvasForTrace(normalized);
+        await hooks.prepareCanvasForTrace(normalized, {
+          scope: wtState.scope,
+          windowId: wtState.windowId,
+        });
       }
       applyCurrentEvent();
       if (autoPlay && normalized.events.length > 1) {
@@ -2067,10 +2240,13 @@
       clearPlayTimer();
       wtState.active = false;
       wtState.playing = false;
+      wtState.scope = "main";
+      wtState.windowId = null;
       wtState.trace = null;
       wtState.index = 0;
       wtState.lastRenderedCodeKey = "";
       renderer.stop();
+      clearMainCanvasOnly();
       updateSidebarButton();
       updateHudControls();
       renderStackPanel();
@@ -2083,6 +2259,13 @@
       if (vocabDock) {
         vocabDock.replaceChildren();
         vocabDock.classList.add("hidden");
+      }
+      notifyStateChanged();
+    };
+
+    const onFloatingWindowClosed = (closedWinId) => {
+      if (wtState.active && wtState.scope === "window" && wtState.windowId === closedWinId) {
+        stop();
       }
     };
 
@@ -2217,10 +2400,19 @@
       bindClick("btn-wt-play", togglePlay);
       bindClick("btn-wt-prev", stepBackward);
       bindClick("btn-wt-next", stepForward);
-      bindClick("btn-wt-mode-pulse", () => setGranularity("pulse"));
+      bindClick("btn-wt-mode-pulse", () => {
+        if (wtState.scope !== "window") {
+          setGranularity("pulse");
+        }
+      });
       bindClick("btn-wt-mode-step", () => setGranularity("step"));
-      bindClick("btn-wt-step-into", toggleStepInto);
+      bindClick("btn-wt-step-into", () => {
+        if (wtState.scope !== "window") {
+          toggleStepInto();
+        }
+      });
       bindClick("btn-wt-close", stop);
+      bindClick("btn-wt-wrap-code", toggleCodeWrap);
       bindClick("btn-wt-open-split", () => {
         const btn = document.getElementById("btn-wt-open-split");
         const fnId = btn && btn.dataset.fnId;
@@ -2233,20 +2425,13 @@
       if (speedSelect) {
         speedSelect.addEventListener("change", (event) => setSpeed(event.target.value));
       }
+      applyCodeWrapState();
     };
 
     return {
       isActive: () => wtState.active,
-      getState: () => ({
-        active: wtState.active,
-        playing: wtState.playing,
-        granularity: wtState.granularity,
-        stepInto: wtState.stepInto,
-        speed: wtState.speed,
-        index: wtState.index,
-        total: wtState.trace ? wtState.trace.events.length : 0,
-        rootId: wtState.rootId,
-      }),
+      getState: getSnapshotState,
+      getScope: () => ({ scope: wtState.scope, windowId: wtState.windowId }),
       getCurrentEvent,
       getTrace: () => wtState.trace,
       bindDomEvents,
@@ -2260,9 +2445,11 @@
       setSpeed,
       setGranularity,
       toggleStepInto,
+      toggleCodeWrap,
       selectBranchOption,
       onViewportChanged,
       onLiveGraphUpdated,
+      onFloatingWindowClosed,
       refreshVocabView,
     };
   }

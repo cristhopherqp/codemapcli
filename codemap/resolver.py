@@ -47,10 +47,53 @@ JS_ALIAS_PREFIXES = ("@/", "~/")
 KNOWN_GLOBAL_OBJECTS = frozenset(
     {
         "console", "Math", "JSON", "Object", "Array", "Promise", "Number",
-        "String", "Date", "Reflect", "Symbol", "document", "window",
-        "globalThis", "process", "super",
+        "String", "Boolean", "Date", "RegExp", "Reflect", "Symbol", "Intl",
+        "Map", "Set", "WeakMap", "WeakSet", "Error", "TypeError", "RangeError",
+        "SyntaxError", "ReferenceError", "URIError", "EvalError", "AggregateError",
+        "URL", "URLSearchParams", "Buffer", "Atomics", "WebAssembly",
+        "TextEncoder", "TextDecoder", "AbortController", "FormData", "Headers",
+        "Request", "Response", "WebSocket", "document", "window", "navigator",
+        "history", "location", "localStorage", "sessionStorage", "crypto",
+        "performance", "globalThis", "global", "process", "super",
     }
 )
+
+# Módulos estándar integrados de Node.js (tanto `node:path` como `path` o `fs/promises`).
+NODE_BUILTIN_MODULES = frozenset(
+    {
+        "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
+        "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain",
+        "events", "fs", "http", "http2", "https", "inspector", "module", "net",
+        "os", "path", "perf_hooks", "process", "punycode", "querystring",
+        "readline", "repl", "stream", "string_decoder", "sys", "test", "timers",
+        "tls", "trace_events", "tty", "url", "util", "v8", "vm", "wasi",
+        "worker_threads", "zlib",
+    }
+)
+
+
+def normalize_node_builtin_module(specifier: str) -> tuple[str, str] | None:
+    """Si `specifier` es un módulo integrado de Node.js, devuelve `(módulo_raíz, subruta_limpia)`.
+
+    Ejemplos:
+      - `'node:path'`        -> `('path', 'path')`
+      - `'path'`             -> `('path', 'path')`
+      - `'node:fs/promises'` -> `('fs', 'fs/promises')`
+      - `'fs/promises'`      -> `('fs', 'fs/promises')`
+    """
+    if not specifier:
+        return None
+    raw = specifier.strip()
+    explicit_node = raw.startswith("node:")
+    cleaned = raw[5:] if explicit_node else raw
+    if not cleaned or cleaned.startswith((".", "/", "@", "~", "#")):
+        return None
+    root_mod = cleaned.split("/", 1)[0]
+    if root_mod in NODE_BUILTIN_MODULES:
+        return root_mod, cleaned
+    if explicit_node:
+        return root_mod, cleaned
+    return None
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_$][\w$]*$")
 
 
@@ -573,10 +616,12 @@ def _match_ts_path_pattern(specifier: str, pattern: str) -> str | None:
 
 
 def is_js_local_alias(specifier: str, importer_path: str, index: ProjectIndex) -> bool:
-    """True si el especificador JS/TS corresponde a una ruta local o alias (nunca paquete npm)."""
+    """True si el especificador JS/TS corresponde a una ruta local o alias (nunca paquete npm ni stdlib Node)."""
+    if normalize_node_builtin_module(specifier) is not None:
+        return False
     if specifier.startswith(("./", "../", "/", *JS_ALIAS_PREFIXES, "#")):
         return True
-    if specifier.startswith(("http://", "https://", "node:", "data:")):
+    if specifier.startswith(("http://", "https://", "data:")):
         return True
     cfg = _find_js_path_config(importer_path, index)
     if cfg is not None:

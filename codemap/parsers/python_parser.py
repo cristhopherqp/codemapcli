@@ -1099,14 +1099,26 @@ def collect_imports(root: Node, source: bytes) -> list[ImportBinding]:
 
         if module_node is not None:  # import a.b [as c]
             module = node_text(module_node, source)
+            line = line_of(module_node)
             bindings.append(
                 ImportBinding(
                     local_name=alias or module,
                     module=module,
                     imported_name=None,
-                    line=line_of(module_node),
+                    line=line,
                 )
             )
+            if alias is None and "." in module:
+                root_pkg = module.split(".", 1)[0]
+                if root_pkg and not any(b.local_name == root_pkg for b in bindings):
+                    bindings.append(
+                        ImportBinding(
+                            local_name=root_pkg,
+                            module=root_pkg,
+                            imported_name=None,
+                            line=line,
+                        )
+                    )
         elif from_node is not None:  # from x import y [as z]
             name = node_text(first_capture(captures, "name"), source)
             bindings.append(

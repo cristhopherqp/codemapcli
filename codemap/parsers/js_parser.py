@@ -195,12 +195,56 @@ IMPORT_QUERY = """
      arguments: (arguments (string (string_fragment) @source))))
  (#eq? @_require "require"))
 
+; const fsp = require('fs').promises
+((variable_declarator
+   name: (identifier) @member_alias
+   value: (member_expression
+     object: (call_expression
+       function: (identifier) @_require
+       arguments: (arguments (string (string_fragment) @source)))
+     property: (property_identifier) @member_prop))
+ (#eq? @_require "require"))
+
 ; const { a, b } = require('./m')
 ((variable_declarator
    name: (object_pattern (shorthand_property_identifier_pattern) @name)
    value: (call_expression
      function: (identifier) @_require
      arguments: (arguments (string (string_fragment) @source))))
+ (#eq? @_require "require"))
+
+; const { resolve: resolvePath } = require('path')
+((variable_declarator
+   name: (object_pattern
+     (pair_pattern
+       key: (_) @name
+       value: (identifier) @alias))
+   value: (call_expression
+     function: (identifier) @_require
+     arguments: (arguments (string (string_fragment) @source))))
+ (#eq? @_require "require"))
+
+; const { readFile } = require('fs').promises
+((variable_declarator
+   name: (object_pattern (shorthand_property_identifier_pattern) @sub_name)
+   value: (member_expression
+     object: (call_expression
+       function: (identifier) @_require
+       arguments: (arguments (string (string_fragment) @source)))
+     property: (property_identifier) @sub_prop))
+ (#eq? @_require "require"))
+
+; const { readFile: readAsync } = require('fs').promises
+((variable_declarator
+   name: (object_pattern
+     (pair_pattern
+       key: (_) @sub_name
+       value: (identifier) @sub_alias))
+   value: (member_expression
+     object: (call_expression
+       function: (identifier) @_require
+       arguments: (arguments (string (string_fragment) @source)))
+     property: (property_identifier) @sub_prop))
  (#eq? @_require "require"))
 """
 
@@ -1546,15 +1590,31 @@ def collect_imports(root: Node, source: bytes, language: str) -> list[ImportBind
         default_node = first_capture(captures, "default_name")
         namespace_node = first_capture(captures, "namespace_name")
         name_node = first_capture(captures, "name")
+        member_alias_node = first_capture(captures, "member_alias")
+        member_prop_node = first_capture(captures, "member_prop")
+        sub_name_node = first_capture(captures, "sub_name")
+        sub_prop_node = first_capture(captures, "sub_prop")
 
         if default_node is not None:
             bindings.append(ImportBinding(node_text(default_node, source), module, "default", line))
         elif namespace_node is not None:
             bindings.append(ImportBinding(node_text(namespace_node, source), module, None, line))
+        elif member_alias_node is not None and member_prop_node is not None:
+            prop = node_text(member_prop_node, source).strip()
+            alias = node_text(member_alias_node, source).strip()
+            if alias and prop:
+                bindings.append(ImportBinding(alias, module, prop, line))
+        elif sub_name_node is not None and sub_prop_node is not None:
+            prop = node_text(sub_prop_node, source).strip()
+            name = node_text(sub_name_node, source).strip().strip("'\"")
+            alias = node_text(first_capture(captures, "sub_alias"), source).strip() or name
+            if alias and name and prop:
+                bindings.append(ImportBinding(alias, module, f"{prop}.{name}", line))
         elif name_node is not None:
-            name = node_text(name_node, source)
-            alias = node_text(first_capture(captures, "alias"), source) or name
-            bindings.append(ImportBinding(alias, module, name, line))
+            name = node_text(name_node, source).strip().strip("'\"")
+            alias = node_text(first_capture(captures, "alias"), source).strip() or name
+            if alias and name:
+                bindings.append(ImportBinding(alias, module, name, line))
     return bindings
 
 

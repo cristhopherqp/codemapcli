@@ -194,6 +194,7 @@ const state = {
   legendCollapsed: false,
   legendUserToggled: false,
   panelCollapsed: false,
+  inspectorWidth: 350,
   spacePanning: false,
   suppressNextTap: false,
   mainPanCleanup: null,
@@ -2448,6 +2449,9 @@ function initCytoscape() {
       if (state.onDemandEdges) {
         applyOnDemandEdgeHighlight();
       }
+      if (state.expandedFunctions.size >= 2) {
+        applyIntraMultiFunctionClarity();
+      }
     }
   });
 
@@ -2456,6 +2460,9 @@ function initCytoscape() {
       state.hoveredNodeId = null;
       if (state.onDemandEdges) {
         applyOnDemandEdgeHighlight();
+      }
+      if (state.expandedFunctions.size >= 2) {
+        applyIntraMultiFunctionClarity();
       }
     }
   });
@@ -2471,14 +2478,18 @@ function initCytoscape() {
     await toggleNodeExpansion(nodeId);
   });
 
-  // Anclaje estricto por ámbito: durante el arrastre solo se sueltan aristas externas;
-  // al soltar se fija únicamente el ancestro más externo arrastrado y se re-enrutan solo sus aristas externas.
+  // Anclaje estricto por ámbito: un clic de 0 px nunca suelta `.elk-routed` ni fija el nodo;
+  // solo tras desplazamiento real (>= DRAG_MOVE_THRESHOLD_PX) se sueltan y re-enrutan sus aristas externas.
   state.cy.on("grab", "node", (event) => {
     handleNodeGrab(event.target);
   });
 
   state.cy.on("drag", "node", () => {
     handleNodeDrag();
+  });
+
+  state.cy.on("free", "node", (event) => {
+    handleNodeFree(event.target);
   });
 
   state.cy.on("dragfree", "node", (event) => {
@@ -2500,7 +2511,10 @@ function initCytoscape() {
   bindEdgeTooltipEvents();
   state.mainTooltipCleanup = bindNodeDocstringTooltip(state.cy, document.getElementById("canvas-area"));
   bindCanvasPanControls();
-  state.cy.on("zoom", updateZoomIndicator);
+  state.cy.on("zoom", () => {
+    updateZoomIndicator();
+    applyIntraZoomReadability();
+  });
   state.cy.on("pan zoom resize", () => {
     if (state.walkthrough) {
       state.walkthrough.onViewportChanged();
@@ -2753,7 +2767,8 @@ function bindEdgeTooltipEvents() {
   });
 }
 
-let _activeDragExternalEdges = [];
+const DRAG_MOVE_THRESHOLD_PX = 3;
+let _activeDragState = null;
 let _pendingDragFreeNodes = new Map();
 let _dragFreeFlushScheduled = false;
 
@@ -2824,34 +2839,98 @@ function computeDynamicTaxiDirection(srcPos, tgtPos) {
   return dx >= 0 ? "rightward" : "leftward";
 }
 
+function captureDragStartPositions(outermost) {
+  const positions = new Map();
+  const record = (node) => {
+    if (!node || node.length === 0 || node.removed()) {
+      return;
+    }
+    const pos = node.position();
+    if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
+      positions.set(node.id(), { x: pos.x, y: pos.y, isParent: node.isParent() });
+    }
+  };
+  for (const node of outermost || []) {
+    record(node);
+    if (node && typeof node.isParent === "function" && node.isParent()) {
+      node.descendants().forEach((desc) => {
+        if (!desc.isParent()) {
+          record(desc);
+        }
+      });
+    }
+  }
+  return positions;
+}
+
+function computeMaxDragDisplacement(cy, startPositions) {
+  if (!cy || !startPositions || startPositions.size === 0) {
+    return 0;
+  }
+  let maxDisp = 0;
+  for (const [id, orig] of startPositions.entries()) {
+    const node = cy.getElementById(id);
+    if (!node || node.length === 0 || node.removed()) {
+      continue;
+    }
+    const pos = node.position();
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) {
+      continue;
+    }
+    const dist = Math.hypot(pos.x - orig.x, pos.y - orig.y);
+    if (dist > maxDisp) {
+      maxDisp = dist;
+    }
+  }
+  return maxDisp;
+}
+
 function handleNodeGrab(cyNode) {
   if (!state.cy || !cyNode || cyNode.length === 0) {
-    _activeDragExternalEdges = [];
+    _activeDragState = null;
     return;
   }
   const grabbed = state.cy.nodes(":grabbed");
   const candidates = grabbed.length > 0 ? grabbed.union(cyNode).toArray() : [cyNode];
   const outermost = filterOutermostDraggedNodes(candidates);
   const { externalEdges } = collectScopeAndExternalEdges(state.cy, outermost);
-  _activeDragExternalEdges = externalEdges;
+  const startPositions = captureDragStartPositions(outermost);
 
-  // Solo las aristas externas pierden `.elk-routed` durante el arrastre; las internas quedan intactas.
-  if (externalEdges.length > 0) {
-    state.cy.batch(() => {
-      for (const edge of externalEdges) {
-        edge.removeClass("elk-routed");
-        edge.removeData("srcEndpoint tgtEndpoint");
-        edge.data("taxiDir", computeDynamicTaxiDirection(edge.source().position(), edge.target().position()));
-      }
-    });
-  }
+  // Nunca tocar `.elk-routed` ni los endpoints al pulsar `mousedown` (evita degradar aristas en clics de 0 px).
+  _activeDragState = {
+    outermost,
+    externalEdges,
+    startPositions,
+    detached: false,
+  };
 }
 
 function handleNodeDrag() {
-  if (!state.cy || _activeDragExternalEdges.length === 0) {
+  if (!state.cy || !_activeDragState) {
     return;
   }
-  for (const edge of _activeDragExternalEdges) {
+  if (!_activeDragState.detached) {
+    const moved = computeMaxDragDisplacement(state.cy, _activeDragState.startPositions);
+    if (moved < DRAG_MOVE_THRESHOLD_PX) {
+      return;
+    }
+    _activeDragState.detached = true;
+    // Solo tras superar el umbral de arrastre real las aristas externas pasan temporalmente a `taxi`.
+    if (_activeDragState.externalEdges.length > 0) {
+      state.cy.batch(() => {
+        for (const edge of _activeDragState.externalEdges) {
+          if (!edge || edge.removed()) {
+            continue;
+          }
+          edge.removeClass("elk-routed");
+          edge.removeData("srcEndpoint tgtEndpoint");
+          edge.data("taxiDir", computeDynamicTaxiDirection(edge.source().position(), edge.target().position()));
+        }
+      });
+    }
+  }
+
+  for (const edge of _activeDragState.externalEdges) {
     if (!edge || edge.removed()) {
       continue;
     }
@@ -2864,6 +2943,18 @@ function handleNodeDrag() {
       tgt.updateCompoundBounds(true);
     }
     edge.data("taxiDir", computeDynamicTaxiDirection(src.position(), tgt.position()));
+  }
+}
+
+function handleNodeFree(_cyNode) {
+  // En clics de 0 px Cytoscape emite `grab` -> `free` -> `tap` sin `dragfree`.
+  if (_activeDragState && !_activeDragState.detached) {
+    const dragRef = _activeDragState;
+    queueMicrotask(() => {
+      if (_activeDragState === dragRef && !_dragFreeFlushScheduled && !dragRef.detached) {
+        _activeDragState = null;
+      }
+    });
   }
 }
 
@@ -2898,9 +2989,10 @@ function rerouteExternalEdgesLocally(cy, edges) {
     parentNodes.updateCompoundBounds(true);
   }
 
-  const leafBoxes = [];
+  // Obstáculos reales en Niveles 1, 2, 3 y 3+: hojas visibles + contenedores compuestos hermanos.
+  const obstacleBoxes = [];
   cy.nodes().forEach((n) => {
-    if (n.isParent() || !n.visible()) {
+    if (!n.visible()) {
       return;
     }
     const pos = n.position();
@@ -2911,8 +3003,9 @@ function rerouteExternalEdgesLocally(cy, edges) {
     }
     const hw = (Number.isFinite(ow) && ow > 2 ? ow : 140) / 2;
     const hh = (Number.isFinite(oh) && oh > 2 ? oh : 44) / 2;
-    leafBoxes.push({
+    obstacleBoxes.push({
       id: n.id(),
+      isParent: n.isParent(),
       left: pos.x - hw,
       right: pos.x + hw,
       top: pos.y - hh,
@@ -2937,6 +3030,7 @@ function rerouteExternalEdgesLocally(cy, edges) {
     const hw = (Number.isFinite(ow) && ow > 2 ? ow : 140) / 2;
     const hh = (Number.isFinite(oh) && oh > 2 ? oh : 44) / 2;
     return {
+      id: cyNode.id(),
       cx: pos.x,
       cy: pos.y,
       hw,
@@ -3003,30 +3097,38 @@ function rerouteExternalEdgesLocally(cy, edges) {
     if (tgtNode.isParent()) {
       tgtNode.descendants().forEach((d) => ignore.add(d.id()));
     }
+    srcNode.ancestors().forEach((a) => ignore.add(a.id()));
+    tgtNode.ancestors().forEach((a) => ignore.add(a.id()));
     return ignore;
   };
 
-  const vSegBlocked = (x, y1, y2, ignore) => {
+  const vSegBlocked = (x, y1, y2, ignore, pad = 6) => {
     const top = Math.min(y1, y2);
     const bot = Math.max(y1, y2);
-    return leafBoxes.some(
+    if (bot - top < 1) {
+      return false;
+    }
+    return obstacleBoxes.some(
       (b) => !ignore.has(b.id)
-        && x > b.left - 3
-        && x < b.right + 3
-        && bot > b.top - 3
-        && top < b.bottom + 3,
+        && x > b.left - pad
+        && x < b.right + pad
+        && bot > b.top - pad
+        && top < b.bottom + pad,
     );
   };
 
-  const hSegBlocked = (y, x1, x2, ignore) => {
+  const hSegBlocked = (y, x1, x2, ignore, pad = 6) => {
     const left = Math.min(x1, x2);
     const right = Math.max(x1, x2);
-    return leafBoxes.some(
+    if (right - left < 1) {
+      return false;
+    }
+    return obstacleBoxes.some(
       (b) => !ignore.has(b.id)
-        && y > b.top - 3
-        && y < b.bottom + 3
-        && right > b.left - 3
-        && left < b.right + 3,
+        && y > b.top - pad
+        && y < b.bottom + pad
+        && right > b.left - pad
+        && left < b.right + pad,
     );
   };
 
@@ -3035,217 +3137,413 @@ function rerouteExternalEdgesLocally(cy, edges) {
     cyEdge.removeData("srcEndpoint tgtEndpoint");
   };
 
-  // Separación de carriles paralelos ±7px para aristas que comparten el mismo nodo origen.
-  const outGroupCounts = new Map();
-  for (const edge of edgeList) {
-    if (!edge || edge.removed()) {
+  // Pasada 1: clasificar cada arista y preparar distribución ordenada de puertos en origen y destino.
+  const specs = [];
+  const portGroups = new Map();
+  const addToPortGroup = (nodeId, side, entry) => {
+    const key = `${nodeId}::${side}`;
+    if (!portGroups.has(key)) {
+      portGroups.set(key, []);
+    }
+    portGroups.get(key).push(entry);
+  };
+
+  for (const cyEdge of edgeList) {
+    if (!cyEdge || cyEdge.removed()) {
       continue;
     }
-    const sId = edge.source().id();
-    outGroupCounts.set(sId, (outGroupCounts.get(sId) || 0) + 1);
+    const srcNode = cyEdge.source();
+    const tgtNode = cyEdge.target();
+    if (
+      cyEdge.isLoop()
+      || srcNode.ancestors().anySame(tgtNode)
+      || tgtNode.ancestors().anySame(srcNode)
+    ) {
+      specs.push({ cyEdge, skip: true });
+      continue;
+    }
+    const srcG = getNodeGeom(srcNode);
+    const tgtG = getNodeGeom(tgtNode);
+    if (!srcG || !tgtG) {
+      specs.push({ cyEdge, skip: true });
+      continue;
+    }
+    const vGap = Math.max(tgtG.top - srcG.bottom, srcG.top - tgtG.bottom);
+    const hGap = Math.max(tgtG.left - srcG.right, srcG.left - tgtG.right);
+    if (vGap < 4 && hGap < 4) {
+      specs.push({ cyEdge, skip: true, srcG, tgtG });
+      continue;
+    }
+
+    const dxCenter = tgtG.cx - srcG.cx;
+    const dyCenter = tgtG.cy - srcG.cy;
+    const useVertical = vGap >= 12 && (hGap < 12 || Math.abs(dyCenter) >= Math.abs(dxCenter) * 0.65);
+    const exitSide = useVertical
+      ? (dyCenter >= 0 ? "bottom" : "top")
+      : (dxCenter >= 0 ? "right" : "left");
+    const entrySide = useVertical
+      ? (dyCenter >= 0 ? "top" : "bottom")
+      : (dxCenter >= 0 ? "left" : "right");
+
+    const spec = {
+      cyEdge,
+      skip: false,
+      srcNode,
+      tgtNode,
+      srcG,
+      tgtG,
+      vGap,
+      hGap,
+      dxCenter,
+      dyCenter,
+      useVertical,
+      exitSide,
+      entrySide,
+      srcPortOffset: 0,
+      tgtPortOffset: 0,
+      laneIndex: 0,
+    };
+    specs.push(spec);
+    addToPortGroup(srcG.id, exitSide, {
+      spec,
+      isSource: true,
+      sortCoord: useVertical ? tgtG.cx : tgtG.cy,
+      otherId: tgtG.id,
+      halfSpan: useVertical ? srcG.hw : srcG.hh,
+    });
+    addToPortGroup(tgtG.id, entrySide, {
+      spec,
+      isSource: false,
+      sortCoord: useVertical ? srcG.cx : srcG.cy,
+      otherId: srcG.id,
+      halfSpan: useVertical ? tgtG.hw : tgtG.hh,
+    });
   }
-  const outGroupCursor = new Map();
+
+  // Distribuir los puertos de cada cara en orden espacial para evitar cruces locales al salir/entrar.
+  for (const group of portGroups.values()) {
+    group.sort((a, b) => (a.sortCoord - b.sortCoord) || a.otherId.localeCompare(b.otherId));
+    const count = group.length;
+    if (count <= 1) {
+      continue;
+    }
+    for (let i = 0; i < count; i += 1) {
+      const item = group[i];
+      const maxSpread = Math.max(0, item.halfSpan * 0.72 - 6);
+      const step = Math.min(16, (2 * maxSpread) / Math.max(1, count - 1));
+      const offset = (i - (count - 1) / 2) * step;
+      if (item.isSource) {
+        item.spec.srcPortOffset = offset;
+        item.spec.laneIndex = i - (count - 1) / 2;
+      } else {
+        item.spec.tgtPortOffset = offset;
+      }
+    }
+  }
+
+  // Canales usados para separar corredores paralelos sin solapamiento.
+  const usedHChannels = [];
+  const usedVChannels = [];
+  const CHANNEL_SEP = 12;
+
+  const hChannelBusy = (y, x1, x2) => {
+    const lo = Math.min(x1, x2);
+    const hi = Math.max(x1, x2);
+    return usedHChannels.some((ch) => Math.abs(ch.y - y) < CHANNEL_SEP && hi > ch.x1 - 4 && lo < ch.x2 + 4);
+  };
+  const vChannelBusy = (x, y1, y2) => {
+    const lo = Math.min(y1, y2);
+    const hi = Math.max(y1, y2);
+    return usedVChannels.some((ch) => Math.abs(ch.x - x) < CHANNEL_SEP && hi > ch.y1 - 4 && lo < ch.y2 + 4);
+  };
+  const registerPathChannels = (pts) => {
+    for (let i = 0; i < pts.length - 1; i += 1) {
+      const a = pts[i];
+      const b = pts[i + 1];
+      if (Math.abs(a.y - b.y) <= 1 && Math.abs(a.x - b.x) > 4) {
+        usedHChannels.push({ y: (a.y + b.y) / 2, x1: Math.min(a.x, b.x), x2: Math.max(a.x, b.x) });
+      } else if (Math.abs(a.x - b.x) <= 1 && Math.abs(a.y - b.y) > 4) {
+        usedVChannels.push({ x: (a.x + b.x) / 2, y1: Math.min(a.y, b.y), y2: Math.max(a.y, b.y) });
+      }
+    }
+  };
 
   let routedCount = 0;
 
   cy.batch(() => {
-    for (const cyEdge of edgeList) {
-      if (!cyEdge || cyEdge.removed()) {
-        continue;
-      }
-      const srcNode = cyEdge.source();
-      const tgtNode = cyEdge.target();
-      if (
-        cyEdge.isLoop()
-        || srcNode.ancestors().anySame(tgtNode)
-        || tgtNode.ancestors().anySame(srcNode)
-      ) {
+    for (const spec of specs) {
+      const { cyEdge, srcG, tgtG } = spec;
+      if (spec.skip) {
+        if (srcG && tgtG) {
+          cyEdge.data("taxiDir", computeDynamicTaxiDirection({ x: srcG.cx, y: srcG.cy }, { x: tgtG.cx, y: tgtG.cy }));
+        }
         clearRoute(cyEdge);
         continue;
       }
+
+      const { srcNode, tgtNode, vGap, hGap, dxCenter, dyCenter, useVertical } = spec;
       if (srcNode.isParent() || tgtNode.isParent()) {
         cyEdge.addClass("compound-incident");
       }
-
-      const srcG = getNodeGeom(srcNode);
-      const tgtG = getNodeGeom(tgtNode);
-      if (!srcG || !tgtG) {
-        clearRoute(cyEdge);
-        continue;
-      }
-
       cyEdge.data("taxiDir", computeDynamicTaxiDirection({ x: srcG.cx, y: srcG.cy }, { x: tgtG.cx, y: tgtG.cy }));
 
-      const vGap = Math.max(tgtG.top - srcG.bottom, srcG.top - tgtG.bottom);
-      const hGap = Math.max(tgtG.left - srcG.right, srcG.left - tgtG.right);
-      if (vGap < 4 && hGap < 4) {
-        clearRoute(cyEdge);
-        continue;
-      }
-
-      const sId = srcNode.id();
-      const totalOut = outGroupCounts.get(sId) || 1;
-      const laneIdx = outGroupCursor.get(sId) || 0;
-      outGroupCursor.set(sId, laneIdx + 1);
-      const centered = totalOut > 1 ? laneIdx - (totalOut - 1) / 2 : 0;
-
       const ignore = buildIgnoreSet(srcNode, tgtNode);
-      const dxCenter = tgtG.cx - srcG.cx;
-      const dyCenter = tgtG.cy - srcG.cy;
-      const useVertical = vGap >= 14 && (hGap < 14 || Math.abs(dyCenter) >= Math.abs(dxCenter) * 0.7);
       let pts = null;
 
-      if (useVertical) {
+      if (useVertical && vGap >= 12) {
         const goingDown = dyCenter >= 0;
-        const maxLane = Math.max(0, Math.min(srcG.hw, tgtG.hw) * 0.45);
-        const laneOff = clampVal(centered * 7, -maxLane, maxLane);
-        const sx = srcG.cx + laneOff;
-        const tx = tgtG.cx + laneOff;
+        const sx = srcG.cx + spec.srcPortOffset;
+        const tx = tgtG.cx + spec.tgtPortOffset;
         const sy = goingDown ? srcG.bottom : srcG.top;
         const ty = goingDown ? tgtG.top : tgtG.bottom;
 
-        if (Math.abs(sx - tx) <= 2 && !vSegBlocked(sx, sy, ty, ignore)) {
+        if (Math.abs(sx - tx) <= 2 && !vSegBlocked(sx, sy, ty, ignore, 5)) {
           pts = [{ x: sx, y: sy }, { x: sx, y: ty }];
         } else {
-          const baseMidY = (sy + ty) / 2 + clampVal(centered * 7, -Math.max(4, vGap * 0.3), Math.max(4, vGap * 0.3));
-          const offsets = [0, 16, -16, 32, -32, 48, -48];
-          const loY = Math.min(sy, ty) + 8;
-          const hiY = Math.max(sy, ty) - 8;
+          const loY = Math.min(sy, ty) + 10;
+          const hiY = Math.max(sy, ty) - 10;
+          const baseMidY = clampVal((sy + ty) / 2 + spec.laneIndex * 10, loY, hiY);
+          const candidateYs = [baseMidY];
+          for (let step = 12; step <= Math.max(96, vGap * 0.48); step += 12) {
+            if (baseMidY + step <= hiY) candidateYs.push(baseMidY + step);
+            if (baseMidY - step >= loY) candidateYs.push(baseMidY - step);
+          }
+          // Candidatos exactos justo arriba/abajo de cajas intermedias en el rango.
+          const bandTop = Math.min(sy, ty);
+          const bandBot = Math.max(sy, ty);
+          const bandLeft = Math.min(sx, tx) - 10;
+          const bandRight = Math.max(sx, tx) + 10;
+          for (const b of obstacleBoxes) {
+            if (ignore.has(b.id) || b.bottom < bandTop || b.top > bandBot || b.right < bandLeft || b.left > bandRight) {
+              continue;
+            }
+            if (b.top - 14 >= loY && b.top - 14 <= hiY) candidateYs.push(b.top - 14);
+            if (b.bottom + 14 >= loY && b.bottom + 14 <= hiY) candidateYs.push(b.bottom + 14);
+          }
+
           let chosenMidY = null;
-          for (const dOff of offsets) {
-            const candY = clampVal(baseMidY + dOff, loY, hiY);
-            if (
-              !vSegBlocked(sx, sy, candY, ignore)
-              && !hSegBlocked(candY, sx, tx, ignore)
-              && !vSegBlocked(tx, candY, ty, ignore)
-            ) {
+          let fallbackMidY = null;
+          for (const candY of candidateYs) {
+            const clear = !vSegBlocked(sx, sy, candY, ignore, 5)
+              && !hSegBlocked(candY, sx, tx, ignore, 5)
+              && !vSegBlocked(tx, candY, ty, ignore, 5);
+            if (!clear) {
+              continue;
+            }
+            if (!hChannelBusy(candY, sx, tx)) {
               chosenMidY = candY;
               break;
             }
+            if (fallbackMidY === null) {
+              fallbackMidY = candY;
+            }
           }
-          if (chosenMidY !== null) {
+          const finalMidY = chosenMidY !== null ? chosenMidY : fallbackMidY;
+
+          if (finalMidY !== null) {
             pts = [
               { x: sx, y: sy },
-              { x: sx, y: chosenMidY },
-              { x: tx, y: chosenMidY },
+              { x: sx, y: finalMidY },
+              { x: tx, y: finalMidY },
               { x: tx, y: ty },
             ];
           } else {
-            // Pasillo lateral alrededor de obstáculos intermedios en el rango vertical.
-            const bandTop = Math.min(sy, ty);
-            const bandBot = Math.max(sy, ty);
+            // Pasillo lateral limpio rodeando cajas y contenedores intermedios en el corredor vertical.
             let minLeft = Math.min(srcG.left, tgtG.left);
             let maxRight = Math.max(srcG.right, tgtG.right);
-            for (const b of leafBoxes) {
-              if (ignore.has(b.id) || b.bottom < bandTop || b.top > bandBot) {
+            for (const b of obstacleBoxes) {
+              if (ignore.has(b.id) || b.bottom < bandTop - 16 || b.top > bandBot + 16) {
                 continue;
               }
               if (b.left < minLeft) minLeft = b.left;
               if (b.right > maxRight) maxRight = b.right;
             }
-            const leftBypassX = minLeft - 22 - Math.abs(centered * 7);
-            const rightBypassX = maxRight + 22 + Math.abs(centered * 7);
-            const avgX = (sx + tx) / 2;
-            const bypassX = Math.abs(avgX - leftBypassX) <= Math.abs(avgX - rightBypassX)
-              ? leftBypassX
-              : rightBypassX;
             const dir = goingDown ? 1 : -1;
-            const exitY = sy + dir * Math.min(18, Math.max(8, vGap * 0.25));
-            const entryY = ty - dir * Math.min(18, Math.max(8, vGap * 0.25));
-            pts = [
-              { x: sx, y: sy },
-              { x: sx, y: exitY },
-              { x: bypassX, y: exitY },
-              { x: bypassX, y: entryY },
-              { x: tx, y: entryY },
-              { x: tx, y: ty },
-            ];
+            const pickStubY = (anchorY, sign, targetX) => {
+              const offsets = [14, 22, 30, 10, 38];
+              for (const d of offsets) {
+                const cyStub = anchorY + sign * d;
+                if (!vSegBlocked(anchorY === sy ? sx : tx, anchorY, cyStub, ignore, 4)
+                  && !hSegBlocked(cyStub, anchorY === sy ? sx : tx, targetX, ignore, 4)) {
+                  return cyStub;
+                }
+              }
+              return anchorY + sign * Math.min(18, Math.max(10, vGap * 0.22));
+            };
+
+            const avgX = (sx + tx) / 2;
+            const leftBase = minLeft - 22;
+            const rightBase = maxRight + 22;
+            const preferLeft = Math.abs(avgX - leftBase) <= Math.abs(avgX - rightBase);
+            const sides = preferLeft ? [-1, 1] : [1, -1];
+            let bestBypass = null;
+            for (const s of sides) {
+              let bx = s < 0 ? leftBase : rightBase;
+              for (let k = 0; k < 8; k += 1) {
+                const candX = bx + s * k * 14;
+                if (!vSegBlocked(candX, bandTop - 24, bandBot + 24, ignore, 5)
+                  && !vChannelBusy(candX, bandTop, bandBot)) {
+                  bx = candX;
+                  break;
+                }
+              }
+              const exitY = pickStubY(sy, dir, bx);
+              const entryY = pickStubY(ty, -dir, bx);
+              const stubClear = !hSegBlocked(exitY, sx, bx, ignore, 4)
+                && !hSegBlocked(entryY, bx, tx, ignore, 4)
+                && !vSegBlocked(bx, exitY, entryY, ignore, 5);
+              bestBypass = [
+                { x: sx, y: sy },
+                { x: sx, y: exitY },
+                { x: bx, y: exitY },
+                { x: bx, y: entryY },
+                { x: tx, y: entryY },
+                { x: tx, y: ty },
+              ];
+              if (stubClear) {
+                break;
+              }
+            }
+            pts = bestBypass;
           }
         }
-      } else if (hGap >= 14) {
+      } else if (hGap >= 12) {
         const goingRight = dxCenter >= 0;
-        const maxLane = Math.max(0, Math.min(srcG.hh, tgtG.hh) * 0.45);
-        const laneOff = clampVal(centered * 7, -maxLane, maxLane);
-        const sy = srcG.cy + laneOff;
-        const ty = tgtG.cy + laneOff;
+        const sy = srcG.cy + spec.srcPortOffset;
+        const ty = tgtG.cy + spec.tgtPortOffset;
         const sx = goingRight ? srcG.right : srcG.left;
         const tx = goingRight ? tgtG.left : tgtG.right;
 
-        if (Math.abs(sy - ty) <= 2 && !hSegBlocked(sy, sx, tx, ignore)) {
+        if (Math.abs(sy - ty) <= 2 && !hSegBlocked(sy, sx, tx, ignore, 5)) {
           pts = [{ x: sx, y: sy }, { x: tx, y: sy }];
         } else {
-          const baseMidX = (sx + tx) / 2 + clampVal(centered * 7, -Math.max(4, hGap * 0.3), Math.max(4, hGap * 0.3));
-          const offsets = [0, 16, -16, 32, -32, 48, -48];
-          const loX = Math.min(sx, tx) + 8;
-          const hiX = Math.max(sx, tx) - 8;
+          const loX = Math.min(sx, tx) + 10;
+          const hiX = Math.max(sx, tx) - 10;
+          const baseMidX = clampVal((sx + tx) / 2 + spec.laneIndex * 10, loX, hiX);
+          const candidateXs = [baseMidX];
+          for (let step = 12; step <= Math.max(96, hGap * 0.48); step += 12) {
+            if (baseMidX + step <= hiX) candidateXs.push(baseMidX + step);
+            if (baseMidX - step >= loX) candidateXs.push(baseMidX - step);
+          }
+          const bandLeft = Math.min(sx, tx);
+          const bandRight = Math.max(sx, tx);
+          const bandTop = Math.min(sy, ty) - 10;
+          const bandBot = Math.max(sy, ty) + 10;
+          for (const b of obstacleBoxes) {
+            if (ignore.has(b.id) || b.right < bandLeft || b.left > bandRight || b.bottom < bandTop || b.top > bandBot) {
+              continue;
+            }
+            if (b.left - 14 >= loX && b.left - 14 <= hiX) candidateXs.push(b.left - 14);
+            if (b.right + 14 >= loX && b.right + 14 <= hiX) candidateXs.push(b.right + 14);
+          }
+
           let chosenMidX = null;
-          for (const dOff of offsets) {
-            const candX = clampVal(baseMidX + dOff, loX, hiX);
-            if (
-              !hSegBlocked(sy, sx, candX, ignore)
-              && !vSegBlocked(candX, sy, ty, ignore)
-              && !hSegBlocked(ty, candX, tx, ignore)
-            ) {
+          let fallbackMidX = null;
+          for (const candX of candidateXs) {
+            const clear = !hSegBlocked(sy, sx, candX, ignore, 5)
+              && !vSegBlocked(candX, sy, ty, ignore, 5)
+              && !hSegBlocked(ty, candX, tx, ignore, 5);
+            if (!clear) {
+              continue;
+            }
+            if (!vChannelBusy(candX, sy, ty)) {
               chosenMidX = candX;
               break;
             }
+            if (fallbackMidX === null) {
+              fallbackMidX = candX;
+            }
           }
-          if (chosenMidX !== null) {
+          const finalMidX = chosenMidX !== null ? chosenMidX : fallbackMidX;
+
+          if (finalMidX !== null) {
             pts = [
               { x: sx, y: sy },
-              { x: chosenMidX, y: sy },
-              { x: chosenMidX, y: ty },
+              { x: finalMidX, y: sy },
+              { x: finalMidX, y: ty },
               { x: tx, y: ty },
             ];
           } else {
-            const bandLeft = Math.min(sx, tx);
-            const bandRight = Math.max(sx, tx);
             let minTop = Math.min(srcG.top, tgtG.top);
             let maxBot = Math.max(srcG.bottom, tgtG.bottom);
-            for (const b of leafBoxes) {
-              if (ignore.has(b.id) || b.right < bandLeft || b.left > bandRight) {
+            for (const b of obstacleBoxes) {
+              if (ignore.has(b.id) || b.right < bandLeft - 16 || b.left > bandRight + 16) {
                 continue;
               }
               if (b.top < minTop) minTop = b.top;
               if (b.bottom > maxBot) maxBot = b.bottom;
             }
-            const topBypassY = minTop - 22 - Math.abs(centered * 7);
-            const botBypassY = maxBot + 22 + Math.abs(centered * 7);
-            const avgY = (sy + ty) / 2;
-            const bypassY = Math.abs(avgY - topBypassY) <= Math.abs(avgY - botBypassY)
-              ? topBypassY
-              : botBypassY;
             const dir = goingRight ? 1 : -1;
-            const exitX = sx + dir * Math.min(18, Math.max(8, hGap * 0.25));
-            const entryX = tx - dir * Math.min(18, Math.max(8, hGap * 0.25));
-            pts = [
-              { x: sx, y: sy },
-              { x: exitX, y: sy },
-              { x: exitX, y: bypassY },
-              { x: entryX, y: bypassY },
-              { x: entryX, y: ty },
-              { x: tx, y: ty },
-            ];
+            const pickStubX = (anchorX, sign, targetY) => {
+              const offsets = [14, 22, 30, 10, 38];
+              for (const d of offsets) {
+                const cxStub = anchorX + sign * d;
+                if (!hSegBlocked(anchorX === sx ? sy : ty, anchorX, cxStub, ignore, 4)
+                  && !vSegBlocked(cxStub, anchorX === sx ? sy : ty, targetY, ignore, 4)) {
+                  return cxStub;
+                }
+              }
+              return anchorX + sign * Math.min(18, Math.max(10, hGap * 0.22));
+            };
+
+            const avgY = (sy + ty) / 2;
+            const topBase = minTop - 22;
+            const botBase = maxBot + 22;
+            const preferTop = Math.abs(avgY - topBase) <= Math.abs(avgY - botBase);
+            const sides = preferTop ? [-1, 1] : [1, -1];
+            let bestBypass = null;
+            for (const s of sides) {
+              let by = s < 0 ? topBase : botBase;
+              for (let k = 0; k < 8; k += 1) {
+                const candY = by + s * k * 14;
+                if (!hSegBlocked(candY, bandLeft - 24, bandRight + 24, ignore, 5)
+                  && !hChannelBusy(candY, bandLeft, bandRight)) {
+                  by = candY;
+                  break;
+                }
+              }
+              const exitX = pickStubX(sx, dir, by);
+              const entryX = pickStubX(tx, -dir, by);
+              const stubClear = !vSegBlocked(exitX, sy, by, ignore, 4)
+                && !vSegBlocked(entryX, by, ty, ignore, 4)
+                && !hSegBlocked(by, exitX, entryX, ignore, 5);
+              bestBypass = [
+                { x: sx, y: sy },
+                { x: exitX, y: sy },
+                { x: exitX, y: by },
+                { x: entryX, y: by },
+                { x: entryX, y: ty },
+                { x: tx, y: ty },
+              ];
+              if (stubClear) {
+                break;
+              }
+            }
+            pts = bestBypass;
           }
         }
       } else {
-        // Brecha estrecha (4..14px): segmento directo o codo limpio.
+        // Brecha estrecha (4..12px): segmento directo o codo limpio.
         if (vGap >= hGap) {
           const goingDown = dyCenter >= 0;
+          const sx = srcG.cx + spec.srcPortOffset;
+          const tx = tgtG.cx + spec.tgtPortOffset;
           const sy = goingDown ? srcG.bottom : srcG.top;
           const ty = goingDown ? tgtG.top : tgtG.bottom;
           const midY = (sy + ty) / 2;
-          pts = Math.abs(srcG.cx - tgtG.cx) <= 2
-            ? [{ x: srcG.cx, y: sy }, { x: srcG.cx, y: ty }]
-            : [{ x: srcG.cx, y: sy }, { x: srcG.cx, y: midY }, { x: tgtG.cx, y: midY }, { x: tgtG.cx, y: ty }];
+          pts = Math.abs(sx - tx) <= 2
+            ? [{ x: sx, y: sy }, { x: sx, y: ty }]
+            : [{ x: sx, y: sy }, { x: sx, y: midY }, { x: tx, y: midY }, { x: tx, y: ty }];
         } else {
           const goingRight = dxCenter >= 0;
+          const sy = srcG.cy + spec.srcPortOffset;
+          const ty = tgtG.cy + spec.tgtPortOffset;
           const sx = goingRight ? srcG.right : srcG.left;
           const tx = goingRight ? tgtG.left : tgtG.right;
           const midX = (sx + tx) / 2;
-          pts = Math.abs(srcG.cy - tgtG.cy) <= 2
-            ? [{ x: sx, y: srcG.cy }, { x: tx, y: srcG.cy }]
-            : [{ x: sx, y: srcG.cy }, { x: midX, y: srcG.cy }, { x: midX, y: tgtG.cy }, { x: tx, y: tgtG.cy }];
+          pts = Math.abs(sy - ty) <= 2
+            ? [{ x: sx, y: sy }, { x: tx, y: sy }]
+            : [{ x: sx, y: sy }, { x: midX, y: sy }, { x: midX, y: ty }, { x: tx, y: ty }];
         }
       }
 
@@ -3285,6 +3583,7 @@ function rerouteExternalEdgesLocally(cy, edges) {
         continue;
       }
 
+      registerPathChannels([srcEnd, ...interior, tgtEnd]);
       cyEdge.data("srcEndpoint", srcEnd.endpointStr);
       cyEdge.data("tgtEndpoint", tgtEnd.endpointStr);
       cyEdge.data("segWeights", segments.weights);
@@ -3298,15 +3597,39 @@ function rerouteExternalEdgesLocally(cy, edges) {
 }
 
 async function handleNodeDragFreeBatch(cyNodes) {
+  const dragSnapshot = typeof _activeDragState !== "undefined" ? _activeDragState : null;
+  if (typeof _activeDragState !== "undefined") {
+    _activeDragState = null;
+  }
+
   if (!state.cy || !Array.isArray(cyNodes) || cyNodes.length === 0) {
-    _activeDragExternalEdges = [];
     return;
   }
 
   const outermost = filterOutermostDraggedNodes(cyNodes);
   if (outermost.length === 0) {
-    _activeDragExternalEdges = [];
     return;
+  }
+
+  // Si hubo `grab` interactivo pero el desplazamiento fue nulo o micro-temblor (< umbral),
+  // restaurar la posición exacta sin re-enrutar ni marcar el nodo como `pinned`.
+  const thresholdPx = typeof DRAG_MOVE_THRESHOLD_PX !== "undefined" ? DRAG_MOVE_THRESHOLD_PX : 3;
+  if (dragSnapshot && dragSnapshot.startPositions && !dragSnapshot.detached) {
+    const maxDisp = computeMaxDragDisplacement(state.cy, dragSnapshot.startPositions);
+    if (maxDisp < thresholdPx) {
+      state.cy.batch(() => {
+        for (const [id, orig] of dragSnapshot.startPositions.entries()) {
+          if (orig.isParent) {
+            continue;
+          }
+          const n = state.cy.getElementById(id);
+          if (n && n.length > 0 && !n.removed()) {
+            n.position({ x: orig.x, y: orig.y });
+          }
+        }
+      });
+      return;
+    }
   }
 
   const parentNodes = state.cy.nodes(":parent");
@@ -3315,7 +3638,6 @@ async function handleNodeDragFreeBatch(cyNodes) {
   }
 
   const { externalEdges } = collectScopeAndExternalEdges(state.cy, outermost);
-  _activeDragExternalEdges = [];
 
   // Re-enrutar localmente únicamente las aristas externas; las internas conservan su `.elk-routed` intacto.
   if (externalEdges.length > 0) {
@@ -3855,6 +4177,28 @@ function buildStylesheet() {
         "target-arrow-color": "#94a3b8",
         "arrow-scale": 0.95,
         "z-compound-depth": "top",
+      },
+    },
+    {
+      selector: 'edge[kind = "flow"].zoom-compact-label',
+      style: {
+        "text-opacity": 0,
+      },
+    },
+    {
+      selector: 'edge[kind = "flow"].flow-bg-muted',
+      style: {
+        "opacity": 0.28,
+        "text-opacity": 0,
+      },
+    },
+    {
+      selector: 'edge[kind = "flow"].flow-focus-active',
+      style: {
+        "opacity": 1,
+        "text-opacity": 1,
+        "width": 2.35,
+        "z-index": 26,
       },
     },
     {
@@ -4499,13 +4843,15 @@ function buildCreationElkInput(visibleNodes, visibleEdges, options) {
         "elk.direction": "DOWN",
         "elk.hierarchyHandling": "INCLUDE_CHILDREN",
         "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "44",
-        "elk.spacing.nodeNode": "28",
-        "elk.spacing.edgeNode": "18",
-        "elk.spacing.edgeEdge": "14",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "56",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "28",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "22",
+        "elk.spacing.nodeNode": "40",
+        "elk.spacing.edgeNode": "26",
+        "elk.spacing.edgeEdge": "22",
         "elk.padding": d.flowContainer === "true"
-          ? "[top=40,left=24,bottom=24,right=24]"
-          : "[top=46,left=24,bottom=24,right=24]",
+          ? "[top=44,left=28,bottom=28,right=28]"
+          : "[top=52,left=30,bottom=28,right=30]",
       };
     }
     elkNodes.set(d.id, {
@@ -5505,12 +5851,16 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
   const orderIndexById = new Map();
   const parentOf = new Map();
   let hasLayerContainers = false;
+  let expandedFnCount = 0;
 
   visibleNodes.forEach((item, idx) => {
     dataById.set(item.data.id, item.data);
     orderIndexById.set(item.data.id, idx);
     const size = estimateNodeSize(item.data);
     const isFlowBox = item.data.expandedFn === "true" || item.data.flowContainer === "true";
+    if (item.data.expandedFn === "true") {
+      expandedFnCount += 1;
+    }
     const isLayerBox = item.data.type === "layer";
     let nodeLayoutOptions = undefined;
     if (isLayerBox) {
@@ -5525,13 +5875,15 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
         "elk.direction": "DOWN",
         "elk.hierarchyHandling": "INCLUDE_CHILDREN",
         "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "44",
-        "elk.spacing.nodeNode": "28",
-        "elk.spacing.edgeNode": "18",
-        "elk.spacing.edgeEdge": "14",
+        "elk.layered.spacing.nodeNodeBetweenLayers": "56",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "28",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "22",
+        "elk.spacing.nodeNode": "40",
+        "elk.spacing.edgeNode": "26",
+        "elk.spacing.edgeEdge": "22",
         "elk.padding": item.data.flowContainer === "true"
-          ? "[top=40,left=24,bottom=24,right=24]"
-          : "[top=46,left=24,bottom=24,right=24]",
+          ? "[top=44,left=28,bottom=28,right=28]"
+          : "[top=52,left=30,bottom=28,right=30]",
       };
     }
     elkNodes.set(item.data.id, {
@@ -5654,14 +6006,26 @@ function buildElkInput(visibleNodes, visibleEdges, options) {
     elkEdges.push(makeElkEdge(edge));
   }
 
+  const multiIntraBoost = expandedFnCount >= 2
+    ? {
+        "elk.layered.spacing.nodeNodeBetweenLayers": "64",
+        "elk.layered.spacing.edgeNodeBetweenLayers": "28",
+        "elk.layered.spacing.edgeEdgeBetweenLayers": "22",
+        "elk.spacing.nodeNode": "48",
+        "elk.spacing.edgeNode": "28",
+        "elk.spacing.edgeEdge": "22",
+      }
+    : {};
   const rootLayoutOptions = hasLayerContainers
     ? {
         ...ELK_LAYOUT_OPTIONS,
+        ...multiIntraBoost,
         "elk.direction": "DOWN",
         "elk.partitioning.activate": "true",
       }
     : {
         ...ELK_LAYOUT_OPTIONS,
+        ...multiIntraBoost,
         "elk.direction": "DOWN",
       };
 
@@ -6227,13 +6591,53 @@ function applyElkEdgeRoutes(
 // y Resaltado de Hilos de Ejecución
 // ---------------------------------------------------------------------------
 
+function applyIntraZoomReadability() {
+  if (!state.cy) {
+    return;
+  }
+  const flowEdges = state.cy.edges('edge[kind = "flow"]');
+  if (flowEdges.length === 0) {
+    return;
+  }
+  const compactLabels = state.expandedFunctions.size >= 2 && state.cy.zoom() < 0.62;
+  flowEdges.toggleClass("zoom-compact-label", compactLabels);
+}
+
+function applyIntraMultiFunctionClarity() {
+  if (!state.cy) {
+    return;
+  }
+  const flowEdges = state.cy.edges('edge[kind = "flow"]');
+  flowEdges.removeClass("flow-bg-muted flow-focus-active");
+  applyIntraZoomReadability();
+
+  if (state.expandedFunctions.size < 2 || state.traceMode || state.activeFlowId) {
+    return;
+  }
+  const focusFnId = (state.hoveredNodeId && state.expandedFunctions.has(state.hoveredNodeId))
+    ? state.hoveredNodeId
+    : (state.selectedNodeId && state.expandedFunctions.has(state.selectedNodeId) ? state.selectedNodeId : null);
+  if (!focusFnId) {
+    return;
+  }
+  flowEdges.forEach((edge) => {
+    const srcOwner = edge.source().data("ownerFunctionId") || edge.source().id();
+    const tgtOwner = edge.target().data("ownerFunctionId") || edge.target().id();
+    if (srcOwner === focusFnId || tgtOwner === focusFnId) {
+      edge.addClass("flow-focus-active");
+    } else {
+      edge.addClass("flow-bg-muted");
+    }
+  });
+}
+
 function applyCanvasHighlights() {
   if (!state.cy) {
     return;
   }
   const all = state.cy.elements();
   all.removeClass(
-    "dimmed trace-focus trace-caller trace-callee trace-branch-active flow-active flow-root flow-active-edge edge-muted edge-reveal-in edge-reveal-out edge-reveal-internal",
+    "dimmed trace-focus trace-caller trace-callee trace-branch-active flow-active flow-root flow-active-edge edge-muted edge-reveal-in edge-reveal-out edge-reveal-internal flow-bg-muted flow-focus-active",
   );
 
   updateIsolateContextButtons();
@@ -6249,6 +6653,7 @@ function applyCanvasHighlights() {
   if (state.onDemandEdges) {
     applyOnDemandEdgeHighlight();
   }
+  applyIntraMultiFunctionClarity();
 }
 
 function applyOnDemandEdgeHighlight() {
@@ -9237,6 +9642,139 @@ function updateZoomIndicator() {
   el.textContent = `${pct}%`;
 }
 
+const INSPECTOR_WIDTH_STORAGE_KEY = "codemap.inspector.width";
+const INSPECTOR_WIDTH_DEFAULT = 350;
+const INSPECTOR_WIDTH_MIN = 280;
+
+function clampInspectorWidth(rawWidth) {
+  const vw = typeof window !== "undefined" ? (window.innerWidth || 1280) : 1280;
+  const maxWidth = Math.max(INSPECTOR_WIDTH_MIN + 40, Math.min(760, Math.round(vw * 0.62)));
+  const numeric = Number(rawWidth);
+  if (!Number.isFinite(numeric)) {
+    return INSPECTOR_WIDTH_DEFAULT;
+  }
+  return Math.round(Math.max(INSPECTOR_WIDTH_MIN, Math.min(maxWidth, numeric)));
+}
+
+function applyInspectorWidth(widthPx, { persist = false } = {}) {
+  const panel = document.getElementById("details-panel");
+  if (!panel) {
+    return;
+  }
+  const clamped = clampInspectorWidth(widthPx);
+  state.inspectorWidth = clamped;
+  if (!state.panelCollapsed) {
+    panel.style.width = `${clamped}px`;
+  }
+  if (persist) {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(INSPECTOR_WIDTH_STORAGE_KEY, String(clamped));
+      }
+    } catch (_err) {
+      // Ignorar errores de almacenamiento privado.
+    }
+  }
+}
+
+function notifyLayoutViewportResized() {
+  if (state.cy) {
+    state.cy.resize();
+  }
+  scheduleBridgeRender();
+  if (state.walkthrough && typeof state.walkthrough.onViewportChanged === "function") {
+    state.walkthrough.onViewportChanged();
+  }
+}
+
+function initInspectorPanelResizer() {
+  const panel = document.getElementById("details-panel");
+  const resizer = document.getElementById("details-panel-resizer");
+  if (!panel || !resizer) {
+    return;
+  }
+
+  let savedWidth = INSPECTOR_WIDTH_DEFAULT;
+  try {
+    if (typeof localStorage !== "undefined") {
+      const parsed = Number.parseInt(localStorage.getItem(INSPECTOR_WIDTH_STORAGE_KEY) || "", 10);
+      if (Number.isFinite(parsed)) {
+        savedWidth = parsed;
+      }
+    }
+  } catch (_err) {
+    // Ignorar errores de almacenamiento privado.
+  }
+  applyInspectorWidth(savedWidth, { persist: false });
+  resizer.classList.toggle("hidden-resizer", Boolean(state.panelCollapsed));
+
+  let dragging = false;
+  let rafId = null;
+  const scheduleResizeSync = () => {
+    if (rafId !== null) {
+      return;
+    }
+    rafId = window.requestAnimationFrame(() => {
+      rafId = null;
+      notifyLayoutViewportResized();
+    });
+  };
+
+  const onMouseMove = (event) => {
+    if (!dragging || state.panelCollapsed) {
+      return;
+    }
+    const workspace = panel.parentElement;
+    const rightEdge = workspace ? workspace.getBoundingClientRect().right : window.innerWidth;
+    applyInspectorWidth(rightEdge - event.clientX, { persist: false });
+    scheduleResizeSync();
+  };
+
+  const stopDragging = () => {
+    if (!dragging) {
+      return;
+    }
+    dragging = false;
+    panel.classList.remove("resizing");
+    resizer.classList.remove("dragging");
+    document.body.style.cursor = "";
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", stopDragging);
+    window.removeEventListener("blur", stopDragging);
+    applyInspectorWidth(state.inspectorWidth || INSPECTOR_WIDTH_DEFAULT, { persist: true });
+    notifyLayoutViewportResized();
+  };
+
+  resizer.addEventListener("mousedown", (event) => {
+    if (event.button !== 0 || state.panelCollapsed) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    dragging = true;
+    panel.classList.add("resizing");
+    resizer.classList.add("dragging");
+    document.body.style.cursor = "ew-resize";
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", stopDragging);
+    window.addEventListener("blur", stopDragging);
+  });
+
+  resizer.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    applyInspectorWidth(INSPECTOR_WIDTH_DEFAULT, { persist: true });
+    notifyLayoutViewportResized();
+  });
+
+  window.addEventListener("resize", () => {
+    if (!state.panelCollapsed) {
+      applyInspectorWidth(state.inspectorWidth || INSPECTOR_WIDTH_DEFAULT, { persist: false });
+    }
+    scheduleResizeSync();
+  });
+}
+
 function scheduleCanvasResize(panelEl) {
   let resized = false;
   const syncCanvasSize = () => {
@@ -9244,8 +9782,7 @@ function scheduleCanvasResize(panelEl) {
       return;
     }
     resized = true;
-    state.cy.resize();
-    scheduleBridgeRender();
+    notifyLayoutViewportResized();
   };
 
   const onTransitionEnd = (event) => {
@@ -9298,12 +9835,19 @@ function toggleLegend(forceCollapsed = null) {
 function toggleInspectorPanel(forceOpen = null) {
   const panel = document.getElementById("details-panel");
   const showBtn = document.getElementById("btn-show-panel");
+  const resizer = document.getElementById("details-panel-resizer");
   if (!panel || !showBtn) {
     return;
   }
   const shouldCollapse = forceOpen === null ? !state.panelCollapsed : !forceOpen;
   state.panelCollapsed = shouldCollapse;
   panel.classList.toggle("collapsed", shouldCollapse);
+  if (!shouldCollapse) {
+    panel.style.width = `${clampInspectorWidth(state.inspectorWidth || INSPECTOR_WIDTH_DEFAULT)}px`;
+  }
+  if (resizer) {
+    resizer.classList.toggle("hidden-resizer", shouldCollapse);
+  }
   showBtn.classList.toggle("hidden", !shouldCollapse);
   scheduleCanvasResize(panel);
 }
@@ -9433,6 +9977,7 @@ function bindControls() {
   document.getElementById("btn-close-help").addEventListener("click", closeHelpModal);
   document.getElementById("btn-collapse-panel").addEventListener("click", () => toggleInspectorPanel(false));
   document.getElementById("btn-show-panel").addEventListener("click", () => toggleInspectorPanel(true));
+  initInspectorPanelResizer();
 
   const flowSelect = document.getElementById("flow-select");
   if (flowSelect) {
@@ -9743,6 +10288,15 @@ function bindGlobalShortcuts() {
     }
     if (event.key === "Escape") {
       if (closeOpenModals()) {
+        return;
+      }
+      if (
+        state.walkthrough
+        && state.walkthrough.isActive()
+        && typeof state.walkthrough.getScope === "function"
+        && state.walkthrough.getScope().scope === "window"
+      ) {
+        state.walkthrough.stop();
         return;
       }
       if (closeMostRecentLeafFloatingWindow()) {
@@ -10312,11 +10866,13 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
           "elk.direction": "DOWN",
           "elk.hierarchyHandling": "INCLUDE_CHILDREN",
           "elk.edgeRouting": "ORTHOGONAL",
-          "elk.layered.spacing.nodeNodeBetweenLayers": "44",
-          "elk.spacing.nodeNode": "28",
-          "elk.spacing.edgeNode": "18",
-          "elk.spacing.edgeEdge": "14",
-          "elk.padding": "[top=22,left=22,bottom=22,right=22]",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "54",
+          "elk.layered.spacing.edgeNodeBetweenLayers": "26",
+          "elk.layered.spacing.edgeEdgeBetweenLayers": "20",
+          "elk.spacing.nodeNode": "38",
+          "elk.spacing.edgeNode": "24",
+          "elk.spacing.edgeEdge": "20",
+          "elk.padding": "[top=24,left=24,bottom=24,right=24]",
         }
       : {
           "elk.algorithm": "layered",
@@ -10583,6 +11139,7 @@ function bindFloatingSplitResizer(win) {
     document.body.style.cursor = "";
     window.removeEventListener("mousemove", onMouseMove);
     window.removeEventListener("mouseup", stopDragging);
+    window.removeEventListener("blur", stopDragging);
     scheduleSplitResize();
   };
 
@@ -10598,6 +11155,7 @@ function bindFloatingSplitResizer(win) {
     document.body.style.cursor = "col-resize";
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", stopDragging);
+    window.addEventListener("blur", stopDragging);
   };
 
   const onDblClick = (event) => {
@@ -10686,6 +11244,17 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
       modeSwitcherEl.appendChild(btn);
       modeButtons.set(m.key, btn);
     }
+  }
+
+  let walkthroughBtn = null;
+  if (subgraph.isFunctionFlow) {
+    walkthroughBtn = document.createElement("button");
+    walkthroughBtn.type = "button";
+    walkthroughBtn.className = "fw-btn fw-walkthrough-btn";
+    walkthroughBtn.textContent = "⚡ Recorrer";
+    walkthroughBtn.setAttribute("aria-pressed", "false");
+    walkthroughBtn.title = "Iniciar Recorrido Visual aislado dentro de esta ventana (sin alterar el grafo principal)";
+    actionsEl.appendChild(walkthroughBtn);
   }
 
   const fitBtn = document.createElement("button");
@@ -10853,6 +11422,7 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     badgeSpan,
     modeSwitcherEl,
     modeButtons,
+    walkthroughBtn,
     fitBtn,
     closeChainBtn,
     closeBtn,
@@ -11273,6 +11843,10 @@ function bindFloatingWindowDrag(win) {
     if (event.target.closest("button")) {
       return;
     }
+    if (win.activeDragCleanup) {
+      win.activeDragCleanup();
+      win.activeDragCleanup = null;
+    }
     event.preventDefault();
     focusFloatingWindow(win.id);
 
@@ -11299,24 +11873,33 @@ function bindFloatingWindowDrag(win) {
       win.el.style.left = `${nextLeft}px`;
       win.el.style.top = `${nextTop}px`;
       scheduleBridgeRender();
+      if (state.walkthrough && typeof state.walkthrough.onViewportChanged === "function") {
+        state.walkthrough.onViewportChanged();
+      }
     };
 
     const onMouseUp = () => {
       win.el.classList.remove("dragging");
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("blur", onMouseUp);
       win.activeDragCleanup = null;
       scheduleBridgeRender();
+      if (state.walkthrough && typeof state.walkthrough.onViewportChanged === "function") {
+        state.walkthrough.onViewportChanged();
+      }
     };
 
     win.activeDragCleanup = () => {
       win.el.classList.remove("dragging");
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("blur", onMouseUp);
     };
 
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", onMouseUp);
   };
 
   win.headerEl.addEventListener("mousedown", onMouseDown);
@@ -11541,6 +12124,7 @@ async function openFloatingWindow(
     badgeSpan: dom.badgeSpan,
     modeSwitcherEl: dom.modeSwitcherEl,
     modeButtons: dom.modeButtons,
+    walkthroughBtn: dom.walkthroughBtn,
     fitBtn: dom.fitBtn,
     closeChainBtn: dom.closeChainBtn,
     closeBtn: dom.closeBtn,
@@ -11636,6 +12220,37 @@ async function openFloatingWindow(
         saveFloatingCodePrefs();
         applyFloatingCodePrefsToAllWindows();
       }
+    });
+  }
+
+  if (dom.walkthroughBtn) {
+    dom.walkthroughBtn.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      focusFloatingWindow(win.id);
+      if (!state.walkthrough) {
+        return;
+      }
+      const wtScope = typeof state.walkthrough.getScope === "function"
+        ? state.walkthrough.getScope()
+        : { scope: "main", windowId: null };
+      if (state.walkthrough.isActive() && wtScope.scope === "window" && wtScope.windowId === win.id) {
+        state.walkthrough.stop();
+        return;
+      }
+      // Evitar que la barra superior `#walkthrough-hud` solape la cabecera de la ventana flotante.
+      const curTop = Number.parseFloat(win.el.style.top || "0") || 0;
+      if (curTop < 54) {
+        win.el.style.top = "54px";
+        scheduleBridgeRender();
+      }
+      await state.walkthrough.start({
+        scope: "window",
+        windowId: win.id,
+        rootId: win.targetId,
+        granularity: "step",
+        stepInto: false,
+        autoPlay: false,
+      });
     });
   }
 
@@ -11743,6 +12358,9 @@ async function openFloatingWindow(
   subCy.on("pan zoom position", () => {
     hideEdgeTooltip();
     scheduleBridgeRender();
+    if (state.walkthrough && typeof state.walkthrough.onViewportChanged === "function") {
+      state.walkthrough.onViewportChanged();
+    }
   });
 
   win.panCleanup = attachPanControls(
@@ -11787,6 +12405,9 @@ async function openFloatingWindow(
       }
       win.cy.resize();
       scheduleBridgeRender();
+      if (state.walkthrough && typeof state.walkthrough.onViewportChanged === "function") {
+        state.walkthrough.onViewportChanged();
+      }
     });
     ro.observe(dom.winEl);
     win.resizeObserver = ro;
@@ -11878,6 +12499,9 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
   }
 
   win.destroyed = true;
+  if (state.walkthrough && typeof state.walkthrough.onFloatingWindowClosed === "function") {
+    state.walkthrough.onFloatingWindowClosed(win.id);
+  }
   hideEdgeTooltip();
   hideNodeTooltip();
 
@@ -12244,8 +12868,24 @@ function renderFloatingBridges() {
 }
 
 // ---------------------------------------------------------------------------
-// Ciclo 8: Integración del Recorrido Visual Estático ("Chispa")
+// Ciclo 8 / 10: Integración del Recorrido Visual Estático
 // ---------------------------------------------------------------------------
+
+function updateFloatingWindowWalkthroughButtons(wtSnapshot) {
+  const isWinActive = Boolean(wtSnapshot && wtSnapshot.active && wtSnapshot.scope === "window" && wtSnapshot.windowId);
+  for (const win of state.floatingWindows.values()) {
+    if (!win || win.destroyed || !win.walkthroughBtn) {
+      continue;
+    }
+    const activeHere = isWinActive && wtSnapshot.windowId === win.id;
+    win.walkthroughBtn.classList.toggle("active", activeHere);
+    win.walkthroughBtn.setAttribute("aria-pressed", activeHere ? "true" : "false");
+    win.walkthroughBtn.textContent = activeHere ? "⏹ Detener" : "⚡ Recorrer";
+    win.walkthroughBtn.title = activeHere
+      ? "Detener Recorrido Visual en esta ventana"
+      : "Iniciar Recorrido Visual aislado dentro de esta ventana (sin alterar el grafo principal)";
+  }
+}
 
 function highlightFloatingCodeLineRange(win, startLine, endLine, { scroll = true } = {}) {
   if (!win || win.destroyed || !win.codeLinesEl) {
@@ -12303,6 +12943,10 @@ function initWalkthroughController() {
       return null;
     },
     getFloatingWindows: () => Array.from(state.floatingWindows.values()),
+    getFloatingWindowById: (winId) => state.floatingWindows.get(winId) || null,
+    onWalkthroughStateChanged: (snapshot) => {
+      updateFloatingWindowWalkthroughButtons(snapshot);
+    },
     highlightCodeTokens: (parentEl, lineText, language) => {
       appendHighlightedCodeTokens(parentEl, lineText, language);
     },
@@ -12344,7 +12988,11 @@ function initWalkthroughController() {
         },
       );
     },
-    prepareCanvasForTrace: async (trace) => {
+    prepareCanvasForTrace: async (trace, opts = {}) => {
+      if (opts && opts.scope === "window") {
+        // Recorrido aislado dentro de una ventana flotante: nunca expandir ni mutar el grafo principal `#cy`.
+        return;
+      }
       if (!trace || !Array.isArray(trace.events) || trace.events.length === 0) {
         return;
       }

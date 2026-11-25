@@ -141,7 +141,14 @@
     // 2. Llamadas externas / métodos estándar detectados en el rango de líneas.
     const extCalls = Array.isArray(fnNode.external_calls) ? fnNode.external_calls : [];
     for (const ext of extCalls) {
-      if (!ext || typeof ext.line !== "number" || ext.line < startLine || ext.line > hiEnd) {
+      if (!ext) {
+        continue;
+      }
+      const extLines = Array.isArray(ext.lines) && ext.lines.length > 0
+        ? ext.lines
+        : (typeof ext.line === "number" && ext.line > 0 ? [ext.line] : []);
+      const matchedLine = extLines.find((ln) => typeof ln === "number" && ln >= startLine && ln <= hiEnd);
+      if (matchedLine === undefined) {
         continue;
       }
       const apiId = ext.api_id || ext.symbol || "";
@@ -163,7 +170,7 @@
           output: dictEntry.output || "",
           example: dictEntry.example || "",
           docs_url: dictEntry.docs_url || ext.docs_url || "",
-          line: ext.line,
+          line: matchedLine,
         });
       } else {
         pushCandidate({
@@ -179,7 +186,7 @@
           output: "",
           example: "",
           docs_url: ext.docs_url || "",
-          line: ext.line,
+          line: matchedLine,
         });
       }
     }

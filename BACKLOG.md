@@ -9,10 +9,10 @@
 ## Under Observation & Edge Cases
 
 - [ ] **[HORIZONTE FUTURO — NO IMPLEMENTAR EN ESTA ITERACIÓN] Trazado Dinámico, RAM y Call Stack Real (`codemap trace`):**
-  - *Estado:* Documentado exclusivamente como referencia arquitectónica para garantizar que el contrato de eventos del *Recorrido Visual Estático* (Lote 3) nazca 100 % compatible con trazas reales. **No diseñar ni codificar todavía.**
+  - *Estado:* Documentado exclusivamente como referencia arquitectónica para garantizar que el contrato de eventos (`WalkthroughTrace` v1) del *Recorrido Visual* se mantenga 100 % compatible con trazas reales. **No diseñar ni codificar todavía.**
   - *Definición prevista para fase futura:*
     - **Activación Opt-in explícita:** Subcomando dedicado `codemap trace <ruta> -- <comando>` con advertencia explícita de que el código objetivo sí se ejecutará (con posibles efectos en disco o red).
-    - **Record & Replay sin tocar el repositorio:** Lanzador externo que graba la ejecución en `~/.codemap/<hash>/traces/<timestamp>.trace.json` para reproducción *Time-Travel* (adelante/atrás) sobre el mismo reproductor visual del Lote 3:
+    - **Record & Replay sin tocar el repositorio:** Lanzador externo que graba la ejecución en `~/.codemap/<hash>/traces/<timestamp>.trace.json` para reproducción *Time-Travel* (adelante/atrás) sobre el mismo reproductor visual:
       - *Python:* `sys.monitoring` (PEP 669 en Python 3.12+, fallback `sys.settrace` en 3.11), filtrando eventos fuera del directorio del proyecto.
       - *Node.js / JS / TS:* V8 Inspector Protocol (CDP) en loopback estricto (`127.0.0.1`), blackboxing de `node_modules` y soporte de pilas `async/await`.
     - **Capacidades adicionales sobre el visor:** Valores reales de variables en RAM con resaltado *diff* por paso, Call Stack real, ramas realmente ejecutadas, excepciones reales y tiempos en microsegundos.

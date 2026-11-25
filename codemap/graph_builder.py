@@ -45,6 +45,7 @@ from codemap.resolver import (
     find_binding,
     function_id,
     is_js_local_alias,
+    normalize_node_builtin_module,
     resolve_binding,
     resolve_call,
     resolve_html_bridges,
@@ -81,9 +82,25 @@ JS_NATIVE_OBJECTS = frozenset(
         "Reflect",
         "Intl",
         "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "URIError",
+        "EvalError",
+        "AggregateError",
+        "Buffer",
+        "process",
+        "globalThis",
+        "Atomics",
+        "WebAssembly",
+        "TextEncoder",
+        "TextDecoder",
         "document",
         "window",
         "navigator",
+        "history",
+        "location",
         "localStorage",
         "sessionStorage",
         "crypto",
@@ -103,8 +120,10 @@ JS_NATIVE_GLOBAL_FUNCTIONS = frozenset(
         "fetch",
         "setTimeout",
         "setInterval",
+        "setImmediate",
         "clearTimeout",
         "clearInterval",
+        "clearImmediate",
         "requestAnimationFrame",
         "cancelAnimationFrame",
         "parseInt",
@@ -124,9 +143,41 @@ JS_NATIVE_GLOBAL_FUNCTIONS = frozenset(
         "Date",
         "Map",
         "Set",
+        "WeakMap",
+        "WeakSet",
         "Promise",
         "RegExp",
         "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "URIError",
+        "EvalError",
+        "AggregateError",
+        "Buffer",
+        "Uint8Array",
+        "Int32Array",
+        "Float64Array",
+        "ArrayBuffer",
+        "DataView",
+        "TextEncoder",
+        "TextDecoder",
+        "Proxy",
+        "Event",
+        "CustomEvent",
+        "Blob",
+        "File",
+        "FileReader",
+        "MutationObserver",
+        "ResizeObserver",
+        "IntersectionObserver",
+        "Worker",
+        "BroadcastChannel",
+        "EventSource",
+        "ReadableStream",
+        "WritableStream",
+        "TransformStream",
         "FormData",
         "WebSocket",
         "AbortController",
@@ -771,10 +822,40 @@ def npm_package_name(module_specifier: str) -> str:
     return parts[0]
 
 
+def _canonical_js_imported_symbol(callee: str, binding: ImportBinding, base_module: str) -> str:
+    """Construye el símbolo canónico para un import/require JS/TS (soporta alias y submódulos)."""
+    mod_prefix = base_module.replace("/", ".")
+    if binding.imported_name and binding.imported_name != "default":
+        if callee == binding.local_name:
+            return f"{mod_prefix}.{binding.imported_name}"
+        if callee.startswith(binding.local_name + "."):
+            suffix = callee[len(binding.local_name) + 1 :]
+            return f"{mod_prefix}.{binding.imported_name}.{suffix}"
+    if callee == binding.local_name:
+        return mod_prefix
+    if callee.startswith(binding.local_name + "."):
+        suffix = callee[len(binding.local_name) + 1 :]
+        return f"{mod_prefix}.{suffix}"
+    return callee
+
+
 def classify_js_external(call: CallSite, analysis: FileAnalysis, index: ProjectIndex) -> dict | None:
-    """Resolve an unresolved JS/TS call to native MDN globals, std methods, or npm docs."""
+    """Resolve an unresolved JS/TS call to Node.js stdlib, native MDN globals, std methods, or npm docs."""
     binding = match_import_binding(analysis, call.callee)
     if binding is not None:
+        node_builtin = normalize_node_builtin_module(binding.module)
+        if node_builtin is not None:
+            root_mod, cleaned_mod = node_builtin
+            canonical = _canonical_js_imported_symbol(call.callee, binding, cleaned_mod)
+            return {
+                "api_id": f"node:{canonical}",
+                "symbol": canonical,
+                "call_expr": call.callee,
+                "module": f"node:{cleaned_mod}",
+                "kind": "stdlib",
+                "docs_url": f"https://nodejs.org/api/{quote(root_mod, safe='')}.html",
+                "line": call.line,
+            }
         if (
             is_js_local_alias(binding.module, analysis.path, index)
             or resolve_binding(binding, analysis, index) is not None
@@ -783,8 +864,9 @@ def classify_js_external(call: CallSite, analysis: FileAnalysis, index: ProjectI
         package = npm_package_name(binding.module)
         if not package:
             return None
+        canonical = _canonical_js_imported_symbol(call.callee, binding, package)
         return {
-            "api_id": f"npm:{package}:{call.callee}",
+            "api_id": f"npm:{package}:{canonical}",
             "symbol": call.callee,
             "call_expr": call.callee,
             "module": package,
@@ -878,16 +960,22 @@ def classify_js_external(call: CallSite, analysis: FileAnalysis, index: ProjectI
 
 
 def collect_external_calls(function: FunctionInfo, analysis: FileAnalysis, index: ProjectIndex) -> list[dict]:
-    """Collect deduplicated external library and native runtime calls for a function."""
+    """Collect deduplicated external library and native runtime calls for a function.
+
+    Conserva todas las líneas de invocación únicas en `lines` (manteniendo `line`
+    con la primera línea por retrocompatibilidad) para que Fichas Vivas muestre el
+    concepto en cada ocurrencia dentro de la función.
+    """
     results: list[dict] = []
-    seen: set[str] = set()
+    by_key: dict[str, dict] = {}
     is_python = analysis.language == "python"
     is_js = analysis.language in {"javascript", "typescript", "tsx"}
 
     for call in function.calls:
         if not call.is_invocation:
             continue
-        if resolve_call(call.callee, function, analysis, index):
+        resolved = resolve_call(call.callee, function, analysis, index)
+        if any(conf == CONFIRMED for _tid, conf in resolved):
             continue
         entry = (
             classify_python_external(call, analysis, index)
@@ -898,10 +986,19 @@ def collect_external_calls(function: FunctionInfo, analysis: FileAnalysis, index
         )
         if entry is None:
             continue
-        api_key = entry["api_id"]
-        if api_key in seen:
+        if resolved and entry.get("kind") == "method":
+            # Si hubo resolución inferida a un método de clase del proyecto, respetar prioridad interna
+            # para métodos genéricos (`.get()`, `.filter()`), salvo que sea stdlib/native/package explícito.
             continue
-        seen.add(api_key)
+        api_key = entry["api_id"]
+        existing = by_key.get(api_key)
+        if existing is not None:
+            if call.line > 0 and call.line not in existing["lines"]:
+                existing["lines"].append(call.line)
+                existing["lines"].sort()
+            continue
+        entry["lines"] = [call.line] if call.line > 0 else []
+        by_key[api_key] = entry
         results.append(entry)
     return results
 

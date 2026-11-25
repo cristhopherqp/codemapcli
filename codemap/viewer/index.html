@@ -68,7 +68,7 @@
           <span class="tool-icon" aria-hidden="true">🎯</span>
           <span class="tool-label">Modo Foco (T)</span>
         </button>
-        <button id="btn-walkthrough" class="action-btn sidebar-btn" type="button" aria-pressed="false" title="Recorrido Visual Estático / Chispa (Tecla W)">
+        <button id="btn-walkthrough" class="action-btn sidebar-btn" type="button" aria-pressed="false" title="Recorrido Visual Estático (Tecla W)">
           <span class="tool-icon" aria-hidden="true">⚡</span>
           <span class="tool-label">Recorrido Visual (W)</span>
         </button>
@@ -132,13 +132,14 @@
       <svg id="floating-bridges-svg" class="floating-bridges-svg" aria-hidden="true"></svg>
       <div id="walkthrough-hud" class="walkthrough-hud hidden" role="region" aria-label="Controles de Recorrido Visual Estático">
         <div class="wt-hud-row">
+          <span id="wt-scope-pill" class="wt-scope-pill hidden"></span>
           <div class="wt-transport-group">
             <button id="btn-wt-prev" class="wt-hud-btn" type="button" title="Paso atrás (←)">←</button>
             <button id="btn-wt-play" class="wt-hud-btn wt-play-btn" type="button" title="Reproducir / Pausar recorrido">▶</button>
             <button id="btn-wt-next" class="wt-hud-btn" type="button" title="Paso adelante (→)">→</button>
             <span id="wt-counter" class="wt-counter">0 / 0</span>
           </div>
-          <select id="wt-speed-select" class="wt-speed-select" title="Velocidad de ciclos de reloj" aria-label="Velocidad del recorrido">
+          <select id="wt-speed-select" class="wt-speed-select" title="Velocidad del recorrido" aria-label="Velocidad del recorrido">
             <option value="0.5">0.5×</option>
             <option value="1" selected>1×</option>
             <option value="2">2×</option>
@@ -146,9 +147,9 @@
           </select>
           <div class="wt-mode-group" role="group" aria-label="Modo de recorrido">
             <button id="btn-wt-mode-pulse" class="wt-hud-btn active" type="button" aria-pressed="true" title="Modo Pulso (Nivel 3): saltos función a función">Pulso (N3)</button>
-            <button id="btn-wt-mode-step" class="wt-hud-btn" type="button" aria-pressed="false" title="Modo Paso a Paso (Nivel 3+): instrucción por instrucción sincronizada con el código">Paso a Paso (N3+)</button>
+            <button id="btn-wt-mode-step" class="wt-hud-btn" type="button" aria-pressed="false" title="Modo Paso a Paso (Nivel 3+): instrucción por instrucción sincronizada con el código">Paso a Paso</button>
           </div>
-          <button id="btn-wt-step-into" class="wt-hud-btn active hidden" type="button" aria-pressed="true" title="Step Into / Step Over: profundizar en funciones hijas">↳ Profundizar: Sí</button>
+          <button id="btn-wt-step-into" class="wt-hud-btn active hidden" type="button" aria-pressed="true" title="Profundizar en funciones hijas (Step Into / Step Over)">↳ Profundizar</button>
           <button id="btn-wt-close" class="wt-hud-btn wt-close-btn" type="button" title="Cerrar Recorrido Visual (Esc)">✕</button>
         </div>
         <div id="wt-branch-bar" class="wt-branch-bar hidden">
@@ -229,6 +230,14 @@
       </aside>
     </section>
 
+    <div
+      id="details-panel-resizer"
+      class="details-panel-resizer"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Redimensionar panel Inspector"
+      title="Arrastra para redimensionar el Inspector · Doble clic para restaurar ancho"
+    ></div>
     <aside id="details-panel" class="details-panel">
       <div class="panel-topbar">
         <span class="panel-topbar-title">Inspector</span>
@@ -242,7 +251,7 @@
             <h3 id="active-flow-title" class="active-flow-title"></h3>
           </div>
           <div class="active-flow-actions">
-            <button id="btn-inspector-walkthrough-flow" class="call-action-btn" type="button" title="Iniciar Recorrido Visual Estático (Chispa) sobre este hilo">⚡ Recorrer</button>
+            <button id="btn-inspector-walkthrough-flow" class="call-action-btn" type="button" title="Iniciar Recorrido Visual Estático sobre este hilo">⚡ Recorrer</button>
             <button id="btn-inspector-isolate-flow" class="call-action-btn" type="button" title="Aislar únicamente este hilo en el lienzo">Aislar</button>
             <button id="btn-inspector-clear-flow" class="call-action-btn" type="button" title="Volver a Todos">Todos</button>
           </div>
@@ -260,10 +269,13 @@
           <span id="wt-stack-depth" class="wt-stack-depth">0 frames</span>
         </div>
         <ol id="wt-stack-list" class="wt-stack-list"></ol>
-        <div id="wt-code-preview-box" class="wt-code-preview-box hidden">
+        <div id="wt-code-preview-box" class="wt-code-preview-box wrap-enabled hidden">
           <div class="wt-code-preview-header">
             <span id="wt-code-meta" class="wt-code-meta">Código sincronizado</span>
-            <button id="btn-wt-open-split" class="call-action-btn" type="button" title="Abrir ventana flotante en modo Flujo y código">↗ Flujo y código</button>
+            <div class="wt-code-preview-actions">
+              <button id="btn-wt-wrap-code" class="call-action-btn wt-wrap-btn active" type="button" aria-pressed="true" title="Alternar ajuste de líneas largas (Word Wrap)">Ajustar líneas</button>
+              <button id="btn-wt-open-split" class="call-action-btn" type="button" title="Abrir ventana flotante en modo Flujo y código">↗ Flujo y código</button>
+            </div>
           </div>
           <div id="wt-code-lines" class="wt-code-lines"></div>
         </div>
@@ -596,7 +608,7 @@
         <li><span>Rueda / <kbd>+</kbd> / <kbd>-</kbd></span><span>Acercar o alejar zoom centrado</span></li>
         <li><span><kbd>F</kbd> o <kbd>Ctrl</kbd>+<kbd>0</kbd></span><span>Ajustar todo el grafo a la pantalla</span></li>
         <li><span><kbd>T</kbd> + <kbd>↑</kbd>/<kbd>↓</kbd> + <kbd>→</kbd>/<kbd>Enter</kbd></span><span>Modo Foco: elegir rama candidata y saltar</span></li>
-        <li><span><kbd>W</kbd> + <kbd>←</kbd>/<kbd>→</kbd></span><span>Recorrido Visual Estático (Chispa): Pulso (N3) y Paso a Paso (N3+)</span></li>
+        <li><span><kbd>W</kbd> + <kbd>←</kbd>/<kbd>→</kbd></span><span>Recorrido Visual Estático: Pulso (N3) y Paso a Paso (N3+)</span></li>
         <li><span><kbd>←</kbd> en Modo Foco</span><span>Retroceder en historial o elegir llamador</span></li>
         <li><span><kbd>Ctrl</kbd>+<kbd>K</kbd></span><span>Abrir buscador instantáneo</span></li>
         <li><span><kbd>R</kbd></span><span>Re-ordenar nodos no fijados (ELKjs)</span></li>
