@@ -915,7 +915,7 @@
     };
   }
 
-  function resolveVisibleCyNodeId(cy, rawId, nodesById) {
+  function resolveVisibleCyNodeId(cy, rawId, nodesById, resolveFallbackId = null) {
     if (!cy || !rawId) {
       return null;
     }
@@ -945,7 +945,44 @@
         cur = nodesById.get(cur.parent);
       }
     }
+    if (typeof resolveFallbackId === "function") {
+      const fallbackId = resolveFallbackId(rawId);
+      if (fallbackId) {
+        const fbEl = cy.getElementById(fallbackId);
+        if (fbEl && fbEl.length > 0 && fbEl.isNode()) {
+          return fallbackId;
+        }
+      }
+    }
     return null;
+  }
+
+  function computeCameraFollowPanStep(curPan, focusModelPt, viewportSize, zoom, dtSec, lambda = 9) {
+    if (!curPan || !focusModelPt || !viewportSize || !Number.isFinite(zoom) || zoom <= 0) {
+      return null;
+    }
+    if (!Number.isFinite(focusModelPt.x) || !Number.isFinite(focusModelPt.y)) {
+      return null;
+    }
+    const targetX = (viewportSize.width / 2) - focusModelPt.x * zoom;
+    const targetY = (viewportSize.height / 2) - focusModelPt.y * zoom;
+    const dx = targetX - curPan.x;
+    const dy = targetY - curPan.y;
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+      return null;
+    }
+    const dist = Math.hypot(dx, dy);
+    if (dist < 0.45) {
+      return { x: targetX, y: targetY, settled: true, moved: dist >= 0.05 };
+    }
+    const safeDt = Math.min(0.05, Math.max(0.001, Number.isFinite(dtSec) ? dtSec : 0.016));
+    const alpha = 1 - Math.exp(-Math.max(1, lambda) * safeDt);
+    return {
+      x: curPan.x + dx * alpha,
+      y: curPan.y + dy * alpha,
+      settled: false,
+      moved: true,
+    };
   }
 
   function parseEndpointOffsetPx(endpointStr) {
@@ -1081,9 +1118,10 @@
       return null;
     }
     const nodesById = options.nodesById || null;
+    const resolveFallbackId = options.resolveFallbackId || null;
     const isReturn = Boolean(options.reversed);
-    const visFrom = resolveVisibleCyNodeId(cy, fromId, nodesById);
-    const visTo = resolveVisibleCyNodeId(cy, toId, nodesById);
+    const visFrom = resolveVisibleCyNodeId(cy, fromId, nodesById, resolveFallbackId);
+    const visTo = resolveVisibleCyNodeId(cy, toId, nodesById, resolveFallbackId);
     if (!visFrom && !visTo) {
       return null;
     }
@@ -1175,9 +1213,14 @@
   // -------------------------------------------------------------------------
 
   class WalkthroughCanvasRenderer {
-    constructor(getTargetsFn, getNodesByIdFn) {
+    constructor(getTargetsFn, getNodesByIdFn, options = {}) {
       this._getTargets = getTargetsFn;
       this._getNodesById = getNodesByIdFn;
+      this._resolveFallbackId = options.resolveFallbackId || null;
+      this._runProgrammaticPan = options.runProgrammaticPan || null;
+      this._onCameraPan = options.onCameraPan || null;
+      this._followCamera = false;
+      this._lastFrameMs = 0;
       this._rafId = null;
       this._active = false;
       this._currentEvent = null;
@@ -1186,6 +1229,13 @@
       this._flashStartMs = 0;
       this._observers = new Map();
       this._mirrorCanvases = new Map();
+    }
+
+    setFollowCamera(enabled) {
+      this._followCamera = Boolean(enabled);
+      if (!this._followCamera) {
+        this._lastFrameMs = 0;
+      }
     }
 
     _ensureCanvasSized(canvas, containerEl) {
@@ -1324,12 +1374,35 @@
       return SPARK_COLORS.step;
     }
 
-    _renderTarget(ctx, width, height, cy, event, nowMs, nodesById) {
+    _resolveNodeModelCenter(cy, nodeId) {
+      if (!cy || !nodeId) {
+        return null;
+      }
+      const cyNode = cy.getElementById(nodeId);
+      if (!cyNode || cyNode.length === 0) {
+        return null;
+      }
+      if (typeof cyNode.boundingBox === "function") {
+        const bb = cyNode.boundingBox({ includeLabels: false });
+        if (bb && Number.isFinite(bb.x1) && Number.isFinite(bb.x2) && bb.w > 0 && bb.h > 0) {
+          return { x: (bb.x1 + bb.x2) / 2, y: (bb.y1 + bb.y2) / 2 };
+        }
+      }
+      if (typeof cyNode.position === "function") {
+        const pos = cyNode.position();
+        if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
+          return { x: pos.x, y: pos.y };
+        }
+      }
+      return null;
+    }
+
+    _renderTarget(ctx, width, height, cy, event, nowMs, nodesById, targetMeta = null) {
       ctx.clearRect(0, 0, width, height);
       if (!cy || !event) {
         return;
       }
-      const pan = cy.pan();
+      let pan = cy.pan();
       const zoom = cy.zoom();
       if (!pan || !Number.isFinite(zoom) || zoom <= 0) {
         return;
@@ -1342,13 +1415,77 @@
         ? 4 * rawProgress * rawProgress * rawProgress
         : 1 - Math.pow(-2 * rawProgress + 2, 3) / 2;
 
+      const resolveFallbackId = this._resolveFallbackId;
+      const isReturn = event.kind === "return";
+      const poly = extractEdgePolyline(cy, event.from, event.to, event.edge_id, {
+        nodesById,
+        resolveFallbackId,
+        reversed: isReturn,
+      });
+
+      let palette = this._pickEventPalette(event);
+      let activeT = easedT;
+      let activePoly = poly;
+
+      if (event.step_over && poly && poly.length >= 2) {
+        if (rawProgress <= 0.5) {
+          const halfP = rawProgress * 2;
+          activeT = halfP < 0.5 ? 2 * halfP * halfP : 1 - Math.pow(-2 * halfP + 2, 2) / 2;
+          palette = SPARK_COLORS.call;
+        } else {
+          const halfP = (rawProgress - 0.5) * 2;
+          activeT = 1 - (halfP < 0.5 ? 2 * halfP * halfP : 1 - Math.pow(-2 * halfP + 2, 2) / 2);
+          palette = event.has_return_value ? SPARK_COLORS.return_value : SPARK_COLORS.return;
+        }
+      }
+
+      const focusNodeId = resolveVisibleCyNodeId(
+        cy,
+        event.step_over ? event.from : (event.to || event.from),
+        nodesById,
+        resolveFallbackId,
+      );
+
+      // 0. Cámara de seguimiento suave (lerp exponencial, conserva intacto cy.zoom()).
+      if (this._followCamera && targetMeta && targetMeta.isPrimaryCamera) {
+        let focusModelPt = null;
+        if (activePoly && activePoly.length >= 2 && rawProgress < 0.99) {
+          focusModelPt = samplePolylineAt(activePoly, activeT);
+        }
+        if (!focusModelPt && focusNodeId) {
+          focusModelPt = this._resolveNodeModelCenter(cy, focusNodeId);
+        }
+        if (focusModelPt) {
+          const dtSec = this._lastFrameMs > 0 ? (nowMs - this._lastFrameMs) / 1000 : 0.016;
+          const lambda = rawProgress < 0.99 ? 8.5 : 10.5;
+          const step = computeCameraFollowPanStep(pan, focusModelPt, { width, height }, zoom, dtSec, lambda);
+          if (step && step.moved) {
+            const applyPan = () => {
+              cy.pan({ x: step.x, y: step.y });
+            };
+            if (typeof this._runProgrammaticPan === "function") {
+              this._runProgrammaticPan(cy, applyPan);
+            } else {
+              applyPan();
+            }
+            pan = cy.pan() || { x: step.x, y: step.y };
+            if (typeof this._onCameraPan === "function") {
+              this._onCameraPan(targetMeta);
+            }
+          }
+        }
+      }
+
       // 1. Destellos rojos concurrentes en ramas de error / guardas evaluadas (`flashed_edges`).
       const flashElapsed = Math.max(0, nowMs - this._flashStartMs);
       if (Array.isArray(event.flashed_edges) && event.flashed_edges.length > 0 && flashElapsed < FLASH_DURATION_MS) {
         const flashAlpha = Math.max(0, 1 - flashElapsed / FLASH_DURATION_MS);
         const flashT = Math.min(1, flashElapsed / (FLASH_DURATION_MS * 0.85));
         for (const fEdge of event.flashed_edges) {
-          const fPts = extractEdgePolyline(cy, fEdge.source, fEdge.target, fEdge.edge_id, { nodesById });
+          const fPts = extractEdgePolyline(cy, fEdge.source, fEdge.target, fEdge.edge_id, {
+            nodesById,
+            resolveFallbackId,
+          });
           if (!fPts || fPts.length < 2) {
             continue;
           }
@@ -1378,28 +1515,6 @@
       }
 
       // 2. Polilínea activa del evento y partícula de recorrido (ida, vuelta o ida+vuelta en Step Over).
-      const isReturn = event.kind === "return";
-      const poly = extractEdgePolyline(cy, event.from, event.to, event.edge_id, {
-        nodesById,
-        reversed: isReturn,
-      });
-
-      let palette = this._pickEventPalette(event);
-      let activeT = easedT;
-      let activePoly = poly;
-
-      if (event.step_over && poly && poly.length >= 2) {
-        if (rawProgress <= 0.5) {
-          const halfP = rawProgress * 2;
-          activeT = halfP < 0.5 ? 2 * halfP * halfP : 1 - Math.pow(-2 * halfP + 2, 2) / 2;
-          palette = SPARK_COLORS.call;
-        } else {
-          const halfP = (rawProgress - 0.5) * 2;
-          activeT = 1 - (halfP < 0.5 ? 2 * halfP * halfP : 1 - Math.pow(-2 * halfP + 2, 2) / 2);
-          palette = event.has_return_value ? SPARK_COLORS.return_value : SPARK_COLORS.return;
-        }
-      }
-
       if (activePoly && activePoly.length >= 2) {
         // Resaltado sutil de la arista activa.
         ctx.save();
@@ -1467,11 +1582,6 @@
       }
 
       // 3. Destello radial persistente / onda de llegada sobre el nodo o paso activo.
-      const focusNodeId = resolveVisibleCyNodeId(
-        cy,
-        event.step_over ? event.from : (event.to || event.from),
-        nodesById,
-      );
       if (focusNodeId) {
         const cyNode = cy.getElementById(focusNodeId);
         if (cyNode && cyNode.length > 0) {
@@ -1532,8 +1642,9 @@
         if (!sized || !sized.ctx) {
           continue;
         }
-        this._renderTarget(sized.ctx, sized.width, sized.height, target.cy, this._currentEvent, nowMs, nodesById);
+        this._renderTarget(sized.ctx, sized.width, sized.height, target.cy, this._currentEvent, nowMs, nodesById, target);
       }
+      this._lastFrameMs = nowMs;
       this._pruneStaleMirrors(activeWinIds);
     }
   }
@@ -1565,6 +1676,7 @@
     const wtState = {
       active: false,
       playing: false,
+      followCamera: false,
       scope: "main", // "main" | "window"
       windowId: null,
       granularity: "pulse", // "pulse" | "step"
@@ -1576,6 +1688,8 @@
       trace: null,
       index: 0,
       playTimer: null,
+      transitionToken: 0,
+      programmaticPanDepth: 0,
       sourceCache: new Map(),
       lastRenderedCodeKey: "",
       codeWrap: loadInitialCodeWrap(),
@@ -1591,6 +1705,45 @@
       }
       const floatingWins = hooks.getFloatingWindows ? hooks.getFloatingWindows() : [];
       return floatingWins.find((w) => w && !w.destroyed && w.id === wtState.windowId) || null;
+    };
+
+    const getActiveCameraCy = () => {
+      if (wtState.scope === "window") {
+        const targetWin = getScopedFloatingWindow();
+        return targetWin ? targetWin.cy : null;
+      }
+      return hooks.getCy ? hooks.getCy() : null;
+    };
+
+    const getActiveLevelSafe = () => {
+      if (hooks.getActiveLevel) {
+        const lvl = Number(hooks.getActiveLevel());
+        if (Number.isFinite(lvl) && lvl >= 1) {
+          return lvl;
+        }
+      }
+      return 3;
+    };
+
+    const getEffectiveGeneratorGranularity = () => {
+      if (wtState.scope === "window") {
+        return "step";
+      }
+      if (wtState.granularity !== "step") {
+        return "pulse";
+      }
+      // En Nivel 1 y Nivel 2 (+1 expande módulo→archivos o archivo→funciones),
+      // avanzamos evento a evento de llamada/retorno para que la luz viaje entre nodos visibles.
+      return getActiveLevelSafe() <= 2 ? "pulse" : "step";
+    };
+
+    const runProgrammaticPan = (_cy, fn) => {
+      wtState.programmaticPanDepth += 1;
+      try {
+        fn();
+      } finally {
+        wtState.programmaticPanDepth = Math.max(0, wtState.programmaticPanDepth - 1);
+      }
     };
 
     const clearMainCanvasOnly = () => {
@@ -1614,7 +1767,13 @@
           clearMainCanvasOnly();
           const targetWin = getScopedFloatingWindow();
           if (targetWin && targetWin.cy && targetWin.cyContainer) {
-            list.push({ cy: targetWin.cy, canvas: null, containerEl: targetWin.cyContainer, win: targetWin });
+            list.push({
+              cy: targetWin.cy,
+              canvas: null,
+              containerEl: targetWin.cyContainer,
+              win: targetWin,
+              isPrimaryCamera: true,
+            });
           }
           return list;
         }
@@ -1622,17 +1781,39 @@
         const mainCanvas = document.getElementById("walkthrough-canvas");
         const mainArea = document.getElementById("canvas-area");
         if (mainCy && mainCanvas && mainArea) {
-          list.push({ cy: mainCy, canvas: mainCanvas, containerEl: mainArea, win: null });
+          list.push({
+            cy: mainCy,
+            canvas: mainCanvas,
+            containerEl: mainArea,
+            win: null,
+            isPrimaryCamera: true,
+          });
         }
         const floatingWins = hooks.getFloatingWindows ? hooks.getFloatingWindows() : [];
         for (const win of floatingWins) {
           if (win && !win.destroyed && win.cy && win.cyContainer) {
-            list.push({ cy: win.cy, canvas: null, containerEl: win.cyContainer, win });
+            list.push({
+              cy: win.cy,
+              canvas: null,
+              containerEl: win.cyContainer,
+              win,
+              isPrimaryCamera: false,
+            });
           }
         }
         return list;
       },
       () => (hooks.getNodesById ? hooks.getNodesById() : null),
+      {
+        resolveFallbackId: hooks.resolveVisibleFallbackId || null,
+        runProgrammaticPan,
+        onCameraPan: (targetMeta) => {
+          positionActionCard();
+          if (targetMeta && targetMeta.win && hooks.onFloatingCameraPan) {
+            hooks.onFloatingCameraPan(targetMeta.win);
+          }
+        },
+      },
     );
 
     const applyCodeWrapState = () => {
@@ -1662,9 +1843,11 @@
     const getSnapshotState = () => ({
       active: wtState.active,
       playing: wtState.playing,
+      followCamera: wtState.followCamera,
       scope: wtState.scope,
       windowId: wtState.windowId,
       granularity: wtState.granularity,
+      effectiveGranularity: getEffectiveGeneratorGranularity(),
       stepInto: wtState.stepInto,
       speed: wtState.speed,
       index: wtState.index,
@@ -1777,14 +1960,26 @@
       }
 
       const stepIntoBtn = document.getElementById("btn-wt-step-into");
+      const showStepInto = !isWindowScope
+        && wtState.granularity === "step"
+        && getEffectiveGeneratorGranularity() === "step";
       if (stepIntoBtn) {
-        stepIntoBtn.classList.toggle("hidden", isWindowScope || wtState.granularity !== "step");
+        stepIntoBtn.classList.toggle("hidden", !showStepInto);
         stepIntoBtn.classList.toggle("active", wtState.stepInto);
         stepIntoBtn.setAttribute("aria-pressed", wtState.stepInto ? "true" : "false");
         stepIntoBtn.textContent = wtState.stepInto ? "↳ Profundizar" : "↷ Sin hijas";
         stepIntoBtn.title = wtState.stepInto
           ? "Profundizar en funciones hijas: Sí (Step Into). Clic para cambiar a Step Over"
           : "Profundizar en funciones hijas: No (Step Over). Clic para profundizar";
+      }
+
+      const followBtn = document.getElementById("btn-wt-follow");
+      if (followBtn) {
+        followBtn.classList.toggle("active", Boolean(wtState.followCamera));
+        followBtn.setAttribute("aria-pressed", wtState.followCamera ? "true" : "false");
+        followBtn.title = wtState.followCamera
+          ? "Cámara de seguimiento activa (conserva tu zoom). Arrastra el mapa o haz clic para desactivar"
+          : "Activar cámara de seguimiento suave conservando tu zoom actual";
       }
 
       // Píldoras de bifurcación (if / switch / try-catch).
@@ -1831,7 +2026,13 @@
         if (wtState.scope === "window") {
           modeBadgeEl.textContent = "Ventana · Paso a Paso";
         } else {
-          modeBadgeEl.textContent = wtState.granularity === "step" ? "Paso a Paso · N3+" : "Pulso · N3";
+          const lvl = getActiveLevelSafe();
+          const lvlTag = lvl >= 4 ? "N3+" : `N${lvl}`;
+          if (wtState.granularity === "step") {
+            modeBadgeEl.textContent = lvl < 4 ? `Paso a Paso · ${lvlTag} (+1)` : "Paso a Paso · N3+";
+          } else {
+            modeBadgeEl.textContent = `Pulso · ${lvlTag}`;
+          }
         }
       }
 
@@ -1888,7 +2089,12 @@
       const targetWin = wtState.scope === "window" ? getScopedFloatingWindow() : null;
       const cy = targetWin ? targetWin.cy : (hooks.getCy ? hooks.getCy() : null);
       const nodesById = hooks.getNodesById ? hooks.getNodesById() : null;
-      const focusId = resolveVisibleCyNodeId(cy, cur.step_over ? cur.from : (cur.to || cur.from), nodesById);
+      const focusId = resolveVisibleCyNodeId(
+        cy,
+        cur.step_over ? cur.from : (cur.to || cur.from),
+        nodesById,
+        hooks.resolveVisibleFallbackId || null,
+      );
       const cyNode = cy && focusId ? cy.getElementById(focusId) : null;
 
       let offsetX = 0;
@@ -2097,16 +2303,38 @@
       }
     };
 
-    const applyCurrentEvent = () => {
+    const applyCurrentEvent = async ({ rescheduleAfter = false } = {}) => {
+      const token = ++wtState.transitionToken;
       const cur = getCurrentEvent();
+      if (rescheduleAfter) {
+        clearPlayTimer();
+      }
       updateHudControls();
       renderStackPanel();
+
+      if (cur && hooks.syncActiveEventExpansion) {
+        await hooks.syncActiveEventExpansion(cur, {
+          scope: wtState.scope,
+          windowId: wtState.windowId,
+          granularity: wtState.granularity,
+          effectiveGranularity: getEffectiveGeneratorGranularity(),
+          followCamera: wtState.followCamera,
+        });
+        if (!wtState.active || token !== wtState.transitionToken) {
+          return false;
+        }
+      }
+
       renderActionCard();
       renderer.setEvent(cur, getStepDurationMs());
       if (cur && hooks.onEventActive) {
         hooks.onEventActive(cur);
       }
       syncCodeForCurrentEvent();
+      if (rescheduleAfter && wtState.active && wtState.playing && token === wtState.transitionToken) {
+        scheduleNextTick();
+      }
+      return true;
     };
 
     const scheduleNextTick = () => {
@@ -2126,8 +2354,7 @@
           return;
         }
         wtState.index = Math.min(events.length - 1, wtState.index + 1);
-        applyCurrentEvent();
-        scheduleNextTick();
+        void applyCurrentEvent({ rescheduleAfter: true });
       }, getStepDurationMs());
     };
 
@@ -2137,10 +2364,11 @@
         return false;
       }
       const prevSeq = preserveIndex ? wtState.index : 0;
+      const effectiveGranularity = getEffectiveGeneratorGranularity();
       const trace = generateStaticWalkthrough(rawGraph, {
         rootId: wtState.rootId,
         flowId: wtState.flowId,
-        granularity: wtState.granularity,
+        granularity: effectiveGranularity,
         stepInto: wtState.stepInto,
         branchOverrides: wtState.branchOverrides,
       });
@@ -2155,11 +2383,13 @@
         await hooks.prepareCanvasForTrace(trace, {
           scope: wtState.scope,
           windowId: wtState.windowId,
+          granularity: wtState.granularity,
+          effectiveGranularity,
         });
       }
 
-      applyCurrentEvent();
-      if (autoPlay && trace.events.length > 1) {
+      await applyCurrentEvent({ rescheduleAfter: false });
+      if (autoPlay && trace.events.length > 1 && wtState.active) {
         wtState.playing = true;
         updateHudControls();
         scheduleNextTick();
@@ -2178,6 +2408,10 @@
       wtState.playing = false;
       wtState.scope = nextScope;
       wtState.windowId = nextScope === "window" ? options.windowId : null;
+      if (options.followCamera !== undefined) {
+        wtState.followCamera = Boolean(options.followCamera);
+        renderer.setFollowCamera(wtState.followCamera);
+      }
       if (nextScope === "window") {
         wtState.granularity = "step";
         wtState.stepInto = false;
@@ -2202,7 +2436,7 @@
       return true;
     };
 
-    const loadExternalTrace = async (externalTrace, { autoPlay = false, scope = "main", windowId = null } = {}) => {
+    const loadExternalTrace = async (externalTrace, { autoPlay = false, scope = "main", windowId = null, followCamera } = {}) => {
       clearPlayTimer();
       const normalized = normalizeTrace(externalTrace);
       if (normalized.events.length === 0) {
@@ -2212,6 +2446,10 @@
       wtState.playing = false;
       wtState.scope = scope === "window" && windowId ? "window" : "main";
       wtState.windowId = wtState.scope === "window" ? windowId : null;
+      if (followCamera !== undefined) {
+        wtState.followCamera = Boolean(followCamera);
+        renderer.setFollowCamera(wtState.followCamera);
+      }
       wtState.trace = normalized;
       wtState.granularity = normalized.granularity;
       wtState.stepInto = normalized.step_into;
@@ -2225,10 +2463,12 @@
         await hooks.prepareCanvasForTrace(normalized, {
           scope: wtState.scope,
           windowId: wtState.windowId,
+          granularity: wtState.granularity,
+          effectiveGranularity: normalized.granularity,
         });
       }
-      applyCurrentEvent();
-      if (autoPlay && normalized.events.length > 1) {
+      await applyCurrentEvent({ rescheduleAfter: false });
+      if (autoPlay && normalized.events.length > 1 && wtState.active) {
         wtState.playing = true;
         updateHudControls();
         scheduleNextTick();
@@ -2237,6 +2477,8 @@
     };
 
     const stop = () => {
+      const prevScope = wtState.scope;
+      wtState.transitionToken += 1;
       clearPlayTimer();
       wtState.active = false;
       wtState.playing = false;
@@ -2259,6 +2501,9 @@
       if (vocabDock) {
         vocabDock.replaceChildren();
         vocabDock.classList.add("hidden");
+      }
+      if (hooks.onWalkthroughStopped) {
+        void hooks.onWalkthroughStopped({ scope: prevScope });
       }
       notifyStateChanged();
     };
@@ -2289,7 +2534,9 @@
       }
       if (wtState.index >= wtState.trace.events.length - 1) {
         wtState.index = 0;
-        applyCurrentEvent();
+        wtState.playing = true;
+        void applyCurrentEvent({ rescheduleAfter: true });
+        return;
       }
       wtState.playing = true;
       updateHudControls();
@@ -2298,26 +2545,28 @@
 
     const stepForward = () => {
       if (!wtState.active || !wtState.trace || wtState.trace.events.length === 0) {
-        return;
+        return Promise.resolve(false);
       }
       wtState.playing = false;
       clearPlayTimer();
       if (wtState.index < wtState.trace.events.length - 1) {
         wtState.index += 1;
-        applyCurrentEvent();
+        return applyCurrentEvent({ rescheduleAfter: false });
       }
+      return Promise.resolve(false);
     };
 
     const stepBackward = () => {
       if (!wtState.active || !wtState.trace || wtState.trace.events.length === 0) {
-        return;
+        return Promise.resolve(false);
       }
       wtState.playing = false;
       clearPlayTimer();
       if (wtState.index > 0) {
         wtState.index -= 1;
-        applyCurrentEvent();
+        return applyCurrentEvent({ rescheduleAfter: false });
       }
+      return Promise.resolve(false);
     };
 
     const setSpeed = (newSpeed) => {
@@ -2332,6 +2581,33 @@
       }
     };
 
+    const setFollowCamera = (enabled) => {
+      const next = Boolean(enabled);
+      if (wtState.followCamera === next) {
+        return wtState.followCamera;
+      }
+      wtState.followCamera = next;
+      renderer.setFollowCamera(next);
+      updateHudControls();
+      return wtState.followCamera;
+    };
+
+    const toggleFollowCamera = () => setFollowCamera(!wtState.followCamera);
+
+    const notifyManualPan = (cyInstance = null) => {
+      if (!wtState.active || !wtState.followCamera || wtState.programmaticPanDepth > 0) {
+        return false;
+      }
+      const activeCy = getActiveCameraCy();
+      if (cyInstance && activeCy && cyInstance !== activeCy) {
+        return false;
+      }
+      wtState.followCamera = false;
+      renderer.setFollowCamera(false);
+      updateHudControls();
+      return true;
+    };
+
     const setGranularity = async (mode) => {
       const clean = mode === "step" ? "step" : "pulse";
       if (wtState.granularity === clean) {
@@ -2341,8 +2617,20 @@
       clearPlayTimer();
       wtState.granularity = clean;
       if (wtState.active) {
+        if (clean === "pulse" && hooks.restoreWalkthroughExpansion) {
+          await hooks.restoreWalkthroughExpansion({ scope: wtState.scope, keepSnapshot: true });
+        }
         await rebuildTrace({ preserveIndex: false, autoPlay: false });
       }
+    };
+
+    const onLevelChanged = async () => {
+      if (!wtState.active || wtState.scope !== "main") {
+        return;
+      }
+      wtState.playing = false;
+      clearPlayTimer();
+      await rebuildTrace({ preserveIndex: false, autoPlay: false });
     };
 
     const toggleStepInto = async () => {
@@ -2411,6 +2699,7 @@
           toggleStepInto();
         }
       });
+      bindClick("btn-wt-follow", toggleFollowCamera);
       bindClick("btn-wt-close", stop);
       bindClick("btn-wt-wrap-code", toggleCodeWrap);
       bindClick("btn-wt-open-split", () => {
@@ -2443,11 +2732,15 @@
       stepForward,
       stepBackward,
       setSpeed,
+      setFollowCamera,
+      toggleFollowCamera,
+      notifyManualPan,
       setGranularity,
       toggleStepInto,
       toggleCodeWrap,
       selectBranchOption,
       onViewportChanged,
+      onLevelChanged,
       onLiveGraphUpdated,
       onFloatingWindowClosed,
       refreshVocabView,
@@ -2468,6 +2761,7 @@
     samplePolylineAt,
     modelToScreen,
     resolveVisibleCyNodeId,
+    computeCameraFollowPanStep,
     extractEdgePolyline,
     WalkthroughCanvasRenderer,
     createController: createWalkthroughController,

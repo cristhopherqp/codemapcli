@@ -116,6 +116,11 @@ const ENTRY_KIND_LABELS = {
 
 const NOTE_AUTOSAVE_MS = 500;
 const LARGE_PROJECT_FUNCTION_LIMIT = 25;
+const MAIN_MIN_ZOOM = 0.02;
+const MAIN_MAX_ZOOM = 4;
+const FW_MIN_ZOOM = 0.05;
+const FW_MAX_ZOOM = 4;
+const DYNAMIC_MIN_ZOOM_FLOOR = 0.005;
 
 const DEFAULT_ARCH_LAYERS = [
   { index: 0, id: "layer::0", key: "entries", label: "Entradas / UI" },
@@ -222,6 +227,19 @@ const state = {
   windowIdCounter: 0,
   windowZCounter: 30,
   bridgeRenderRaf: null,
+  zoomEditActive: false,
+  mainBgPanCleanup: null,
+  walkthroughExpansion: {
+    hasSnapshot: false,
+    activeLevel: null,
+    groupingMode: null,
+    preCollapsed: new Set(),
+    preExpanded: new Set(),
+    tempOpenedContainers: new Set(),
+    tempCollapsedContainers: new Set(),
+    tempExpandedFunctions: new Set(),
+    activeTargetKey: null,
+  },
   walkthrough: null,
   ws: null,
   cy: null,
@@ -1233,6 +1251,7 @@ async function exitNHops({ refresh = true } = {}) {
 }
 
 async function applyLevel(level, { forceShowAll = false, preserveNHops = false } = {}) {
+  resetWalkthroughExpansionSnapshot();
   state.activeLevel = level;
   state.preFlowCollapsedContainers = null;
   state.isolatedFileId = null;
@@ -1296,6 +1315,15 @@ async function applyLevel(level, { forceShowAll = false, preserveNHops = false }
     const sel = state.nodesById.get(state.selectedNodeId);
     updateIsolateFileButton(sel);
     updateExploreNHopsButton(sel);
+  }
+  if (
+    state.walkthrough
+    && state.walkthrough.isActive()
+    && typeof state.walkthrough.getScope === "function"
+    && state.walkthrough.getScope().scope === "main"
+    && typeof state.walkthrough.onLevelChanged === "function"
+  ) {
+    await state.walkthrough.onLevelChanged();
   }
 }
 
@@ -2394,8 +2422,8 @@ function initCytoscape() {
     elements: [],
     style: buildStylesheet(),
     wheelSensitivity: 0.25,
-    minZoom: 0.15,
-    maxZoom: 3,
+    minZoom: MAIN_MIN_ZOOM,
+    maxZoom: MAIN_MAX_ZOOM,
   });
 
   state.cy.on("tap", "node", async (event) => {
@@ -2511,6 +2539,11 @@ function initCytoscape() {
   bindEdgeTooltipEvents();
   state.mainTooltipCleanup = bindNodeDocstringTooltip(state.cy, document.getElementById("canvas-area"));
   bindCanvasPanControls();
+  if (state.mainBgPanCleanup) {
+    state.mainBgPanCleanup();
+    state.mainBgPanCleanup = null;
+  }
+  state.mainBgPanCleanup = attachManualBackgroundPanDetector(state.cy);
   state.cy.on("zoom", () => {
     updateZoomIndicator();
     applyIntraZoomReadability();
@@ -4449,7 +4482,7 @@ async function refreshGraphView({ fit = true } = {}) {
   state.cy.add([...nodes, ...edges]);
   await runElkLayout(nodes, edges);
   if (fit) {
-    state.cy.fit(undefined, 36);
+    fitCyWithDynamicMinZoom(state.cy, undefined, 36, MAIN_MIN_ZOOM);
   }
   updateZoomIndicator();
   updateNHopsHud();
@@ -9522,7 +9555,7 @@ function attachPanControls(
     }
     cyInst.pan({ x: panDrag.startPanX + dx, y: panDrag.startPanY + dy });
     if (typeof onPanMove === "function") {
-      onPanMove(event);
+      onPanMove(event, panDrag.didMove);
     }
   };
 
@@ -9585,6 +9618,46 @@ function attachPanControls(
   };
 }
 
+function attachManualBackgroundPanDetector(cyInstance) {
+  if (!cyInstance || typeof cyInstance.on !== "function") {
+    return () => {};
+  }
+  let bgPointerDown = false;
+  const onCyDown = (event) => {
+    if (event.target !== cyInstance) {
+      bgPointerDown = false;
+      return;
+    }
+    const orig = event.originalEvent;
+    if (!orig || orig.type === "touchstart" || orig.button === 0) {
+      bgPointerDown = true;
+    }
+  };
+  const onCyPan = () => {
+    if (bgPointerDown && state.walkthrough && typeof state.walkthrough.notifyManualPan === "function") {
+      state.walkthrough.notifyManualPan(cyInstance);
+    }
+  };
+  const clearDown = () => {
+    bgPointerDown = false;
+  };
+  cyInstance.on("mousedown touchstart", onCyDown);
+  cyInstance.on("pan", onCyPan);
+  window.addEventListener("mouseup", clearDown);
+  window.addEventListener("touchend", clearDown);
+  window.addEventListener("blur", clearDown);
+  return () => {
+    bgPointerDown = false;
+    if (typeof cyInstance.off === "function") {
+      cyInstance.off("mousedown touchstart", onCyDown);
+      cyInstance.off("pan", onCyPan);
+    }
+    window.removeEventListener("mouseup", clearDown);
+    window.removeEventListener("touchend", clearDown);
+    window.removeEventListener("blur", clearDown);
+  };
+}
+
 function bindCanvasPanControls() {
   if (state.mainPanCleanup) {
     state.mainPanCleanup();
@@ -9593,6 +9666,11 @@ function bindCanvasPanControls() {
   const container = document.getElementById("cy");
   const area = document.getElementById("canvas-area");
   state.mainPanCleanup = attachPanControls(() => state.cy, container, area, {
+    onPanMove: (_event, didMove) => {
+      if (didMove && state.walkthrough && typeof state.walkthrough.notifyManualPan === "function") {
+        state.walkthrough.notifyManualPan(state.cy);
+      }
+    },
     onMiddleClick: ({ cy, clientX, clientY }) => {
       const hitNode = hitTestCyNodeAtClientPoint(cy, clientX, clientY);
       if (!hitNode) {
@@ -9611,9 +9689,61 @@ function bindCanvasPanControls() {
   });
 }
 
+function fitCyWithDynamicMinZoom(cy, eles = undefined, padding = 36, baseMinZoom = MAIN_MIN_ZOOM) {
+  if (!cy) {
+    return;
+  }
+  const container = typeof cy.container === "function" ? cy.container() : null;
+  const targetEles = eles || (typeof cy.elements === "function" ? cy.elements() : null);
+  let nextMinZoom = baseMinZoom;
+  if (container && targetEles && targetEles.length > 0 && typeof targetEles.boundingBox === "function") {
+    const bb = targetEles.boundingBox();
+    const availW = Math.max(40, (container.clientWidth || 0) - padding * 2);
+    const availH = Math.max(40, (container.clientHeight || 0) - padding * 2);
+    if (bb && bb.w > 0 && bb.h > 0 && availW > 0 && availH > 0) {
+      const neededZoom = Math.min(availW / bb.w, availH / bb.h);
+      if (Number.isFinite(neededZoom) && neededZoom < baseMinZoom) {
+        nextMinZoom = Math.max(DYNAMIC_MIN_ZOOM_FLOOR, neededZoom * 0.92);
+      }
+    }
+  }
+  if (typeof cy.minZoom === "function") {
+    cy.minZoom(nextMinZoom);
+  }
+  cy.fit(eles, padding);
+}
+
+function parseZoomPercentInput(rawText, minPct = 2, maxPct = 400) {
+  if (rawText === null || rawText === undefined) {
+    return null;
+  }
+  const cleaned = String(rawText).trim().replace(/%$/g, "").replace(",", ".").trim();
+  if (!cleaned || !/^\d+(?:\.\d+)?$/.test(cleaned)) {
+    return null;
+  }
+  const num = Number(cleaned);
+  if (!Number.isFinite(num) || num <= 0) {
+    return null;
+  }
+  const lo = Math.max(1, Number.isFinite(minPct) ? minPct : 2);
+  const hi = Math.max(lo, Number.isFinite(maxPct) ? maxPct : 400);
+  return Math.min(hi, Math.max(lo, num));
+}
+
+function formatZoomPercent(zoomLevel) {
+  if (!Number.isFinite(zoomLevel) || zoomLevel <= 0) {
+    return "100%";
+  }
+  const pct = zoomLevel * 100;
+  if (pct < 1) {
+    return `${Math.max(0.5, Number(pct.toFixed(1)))}%`;
+  }
+  return `${Math.round(pct)}%`;
+}
+
 function fitGraphToScreen() {
   if (state.cy) {
-    state.cy.fit(undefined, 40);
+    fitCyWithDynamicMinZoom(state.cy, undefined, 40, MAIN_MIN_ZOOM);
     updateZoomIndicator();
   }
 }
@@ -9626,11 +9756,30 @@ function zoomByFactor(factor) {
   const renderedPosition = container
     ? { x: container.clientWidth / 2, y: container.clientHeight / 2 }
     : undefined;
-  const minZoom = typeof state.cy.minZoom === "function" ? state.cy.minZoom() : 0.15;
-  const maxZoom = typeof state.cy.maxZoom === "function" ? state.cy.maxZoom() : 3;
+  const minZoom = typeof state.cy.minZoom === "function" ? state.cy.minZoom() : MAIN_MIN_ZOOM;
+  const maxZoom = typeof state.cy.maxZoom === "function" ? state.cy.maxZoom() : MAIN_MAX_ZOOM;
   const nextZoom = Math.min(maxZoom, Math.max(minZoom, state.cy.zoom() * factor));
   state.cy.zoom({ level: nextZoom, renderedPosition });
   updateZoomIndicator();
+}
+
+function setZoomPercentCentered(percent) {
+  if (!state.cy || !Number.isFinite(percent)) {
+    return false;
+  }
+  const minZoom = typeof state.cy.minZoom === "function" ? state.cy.minZoom() : MAIN_MIN_ZOOM;
+  const maxZoom = typeof state.cy.maxZoom === "function" ? state.cy.maxZoom() : MAIN_MAX_ZOOM;
+  const minPct = Math.max(1, Math.min(Math.round(MAIN_MIN_ZOOM * 100), Math.floor(minZoom * 100)));
+  const maxPct = Math.round(maxZoom * 100);
+  const clampedPct = Math.min(maxPct, Math.max(minPct, percent));
+  const level = Math.min(maxZoom, Math.max(minZoom, clampedPct / 100));
+  const container = typeof state.cy.container === "function" ? state.cy.container() : null;
+  const renderedPosition = container
+    ? { x: container.clientWidth / 2, y: container.clientHeight / 2 }
+    : undefined;
+  state.cy.zoom({ level, renderedPosition });
+  updateZoomIndicator();
+  return true;
 }
 
 function updateZoomIndicator() {
@@ -9638,8 +9787,63 @@ function updateZoomIndicator() {
   if (!el || !state.cy) {
     return;
   }
-  const pct = Math.round(state.cy.zoom() * 100);
-  el.textContent = `${pct}%`;
+  el.textContent = formatZoomPercent(state.cy.zoom());
+}
+
+function closeZoomEdit({ focusIndicator = false } = {}) {
+  const indicator = document.getElementById("zoom-indicator");
+  const input = document.getElementById("zoom-input");
+  state.zoomEditActive = false;
+  if (input) {
+    input.classList.add("hidden");
+  }
+  if (indicator) {
+    indicator.classList.remove("hidden");
+    updateZoomIndicator();
+    if (focusIndicator) {
+      indicator.focus();
+    }
+  }
+}
+
+function beginZoomEdit() {
+  const indicator = document.getElementById("zoom-indicator");
+  const input = document.getElementById("zoom-input");
+  if (!indicator || !input || !state.cy) {
+    return;
+  }
+  state.zoomEditActive = true;
+  const currentPct = Math.max(1, Math.round(state.cy.zoom() * 100));
+  input.value = String(currentPct);
+  indicator.classList.add("hidden");
+  input.classList.remove("hidden");
+  input.focus();
+  input.select();
+}
+
+function commitZoomEdit() {
+  if (!state.zoomEditActive) {
+    return;
+  }
+  const input = document.getElementById("zoom-input");
+  if (input && state.cy) {
+    const minZoom = typeof state.cy.minZoom === "function" ? state.cy.minZoom() : MAIN_MIN_ZOOM;
+    const maxZoom = typeof state.cy.maxZoom === "function" ? state.cy.maxZoom() : MAIN_MAX_ZOOM;
+    const minPct = Math.max(1, Math.min(Math.round(MAIN_MIN_ZOOM * 100), Math.floor(minZoom * 100)));
+    const maxPct = Math.round(maxZoom * 100);
+    const parsed = parseZoomPercentInput(input.value, minPct, maxPct);
+    if (parsed !== null) {
+      setZoomPercentCentered(parsed);
+    }
+  }
+  closeZoomEdit({ focusIndicator: false });
+}
+
+function cancelZoomEdit() {
+  if (!state.zoomEditActive) {
+    return;
+  }
+  closeZoomEdit({ focusIndicator: true });
 }
 
 const INSPECTOR_WIDTH_STORAGE_KEY = "codemap.inspector.width";
@@ -9933,7 +10137,26 @@ function bindControls() {
   }
   const zoomIndicator = document.getElementById("zoom-indicator");
   if (zoomIndicator) {
-    zoomIndicator.addEventListener("click", fitGraphToScreen);
+    zoomIndicator.addEventListener("click", beginZoomEdit);
+  }
+  const zoomInput = document.getElementById("zoom-input");
+  if (zoomInput) {
+    zoomInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        commitZoomEdit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelZoomEdit();
+      }
+    });
+    zoomInput.addEventListener("blur", () => {
+      if (state.zoomEditActive) {
+        commitZoomEdit();
+      }
+    });
   }
 
   document.getElementById("btn-relayout").addEventListener("click", () => {
@@ -10287,6 +10510,11 @@ function bindGlobalShortcuts() {
       return;
     }
     if (event.key === "Escape") {
+      if (state.zoomEditActive) {
+        event.preventDefault();
+        cancelZoomEdit();
+        return;
+      }
       if (closeOpenModals()) {
         return;
       }
@@ -10929,7 +11157,7 @@ async function runSubElkLayout(subCy, visibleNodes, visibleEdges, isFunctionFlow
     );
   });
   subCy.resize();
-  subCy.fit(undefined, 22);
+  fitCyWithDynamicMinZoom(subCy, undefined, 22, FW_MIN_ZOOM);
 }
 
 function computeFloatingWindowPosition(parentWindowId) {
@@ -10939,13 +11167,16 @@ function computeFloatingWindowPosition(parentWindowId) {
   const winW = Math.min(460, Math.max(320, Math.round(areaW * 0.44)));
   const winH = Math.min(360, Math.max(250, Math.round(areaH * 0.52)));
 
+  const hudActive = Boolean(state.walkthrough && typeof state.walkthrough.isActive === "function" && state.walkthrough.isActive());
+  const minTop = hudActive ? 58 : 12;
+  const baseTop = hudActive ? 58 : 24;
   let left = 24;
-  let top = 24;
+  let top = baseTop;
   const parentWin = parentWindowId ? state.floatingWindows.get(parentWindowId) : null;
   if (parentWin && parentWin.el) {
     const siblingIndex = parentWin.childWindowIds.size;
     const pLeft = parseFloat(parentWin.el.style.left) || 24;
-    const pTop = parseFloat(parentWin.el.style.top) || 24;
+    const pTop = parseFloat(parentWin.el.style.top) || baseTop;
     const pWidth = parentWin.el.offsetWidth || winW;
     const tryRight = pLeft + pWidth + 36;
     if (tryRight + winW <= areaW - 12) {
@@ -10958,14 +11189,14 @@ function computeFloatingWindowPosition(parentWindowId) {
   } else {
     const rootOffset = state.floatingWindows.size;
     left = 24 + (rootOffset % 5) * 34;
-    top = 24 + (rootOffset % 4) * 30;
+    top = baseTop + (rootOffset % 4) * 30;
   }
 
   const maxLeft = Math.max(12, areaW - winW - 12);
-  const maxTop = Math.max(12, areaH - winH - 12);
+  const maxTop = Math.max(minTop, areaH - winH - 12);
   return {
     left: Math.round(Math.min(maxLeft, Math.max(12, left))),
-    top: Math.round(Math.min(maxTop, Math.max(12, top))),
+    top: Math.round(Math.min(maxTop, Math.max(minTop, top))),
     width: winW,
     height: winH,
   };
@@ -11826,7 +12057,7 @@ async function setFloatingWindowViewMode(win, mode) {
       if (!win.destroyed && win.cy) {
         applyFloatingSplitRatio(win);
         win.cy.resize();
-        win.cy.fit(undefined, 18);
+        fitCyWithDynamicMinZoom(win.cy, undefined, 18, FW_MIN_ZOOM);
         scheduleBridgeRender();
       }
     });
@@ -12108,8 +12339,8 @@ async function openFloatingWindow(
     elements: [...subgraph.nodes, ...subgraph.edges],
     style: buildStylesheet(),
     wheelSensitivity: 0.25,
-    minZoom: 0.2,
-    maxZoom: 3,
+    minZoom: FW_MIN_ZOOM,
+    maxZoom: FW_MAX_ZOOM,
   });
 
   const win = {
@@ -12258,7 +12489,7 @@ async function openFloatingWindow(
     event.stopPropagation();
     focusFloatingWindow(win.id);
     if (win.cy && !win.destroyed) {
-      win.cy.fit(undefined, 22);
+      fitCyWithDynamicMinZoom(win.cy, undefined, 22, FW_MIN_ZOOM);
       scheduleBridgeRender();
     }
   });
@@ -12369,7 +12600,12 @@ async function openFloatingWindow(
     win.bodyEl,
     {
       onPanStart: () => focusFloatingWindow(win.id),
-      onPanMove: () => scheduleBridgeRender(),
+      onPanMove: (_event, didMove) => {
+        scheduleBridgeRender();
+        if (didMove && state.walkthrough && typeof state.walkthrough.notifyManualPan === "function") {
+          state.walkthrough.notifyManualPan(win.cy);
+        }
+      },
       onMiddleClick: ({ cy, clientX, clientY }) => {
         const hitNode = hitTestCyNodeAtClientPoint(cy, clientX, clientY);
         if (!hitNode) {
@@ -12393,6 +12629,7 @@ async function openFloatingWindow(
   if (state.spacePanning) {
     applySpacePanToCy(subCy, win.bodyEl, true);
   }
+  win.manualBgPanCleanup = attachManualBackgroundPanDetector(subCy);
   win.tooltipCleanup = bindNodeDocstringTooltip(subCy, win.bodyEl);
 
   if (typeof ResizeObserver !== "undefined") {
@@ -12540,6 +12777,10 @@ function closeFloatingWindow(winId, { forceCascade = false } = {}) {
       // Ignorar errores de observador ya desconectado.
     }
     win.resizeObserver = null;
+  }
+  if (win.manualBgPanCleanup) {
+    win.manualBgPanCleanup();
+    win.manualBgPanCleanup = null;
   }
   if (win.cy) {
     try {
@@ -12915,27 +13156,403 @@ function highlightFloatingCodeLineRange(win, startLine, endLine, { scroll = true
   renderFloatingWindowVocab(win);
 }
 
+function resetWalkthroughExpansionSnapshot() {
+  const we = state.walkthroughExpansion;
+  if (!we) {
+    return;
+  }
+  we.hasSnapshot = false;
+  we.activeLevel = null;
+  we.groupingMode = null;
+  we.preCollapsed.clear();
+  we.preExpanded.clear();
+  we.tempOpenedContainers.clear();
+  we.tempCollapsedContainers.clear();
+  we.tempExpandedFunctions.clear();
+  we.activeTargetKey = null;
+}
+
+function captureWalkthroughExpansionSnapshot() {
+  const we = state.walkthroughExpansion;
+  if (!we) {
+    return;
+  }
+  if (
+    we.hasSnapshot
+    && we.activeLevel === state.activeLevel
+    && we.groupingMode === state.groupingMode
+  ) {
+    return;
+  }
+  we.hasSnapshot = true;
+  we.activeLevel = state.activeLevel;
+  we.groupingMode = state.groupingMode;
+  we.preCollapsed = new Set(state.collapsedContainers);
+  we.preExpanded = new Set(state.expandedFunctions);
+  we.tempOpenedContainers.clear();
+  we.tempCollapsedContainers.clear();
+  we.tempExpandedFunctions.clear();
+  we.activeTargetKey = null;
+}
+
+function clearWalkthroughTempDeltas() {
+  const we = state.walkthroughExpansion;
+  if (!we) {
+    return false;
+  }
+  let changed = false;
+  for (const id of we.tempOpenedContainers) {
+    if (we.preCollapsed.has(id) && !state.collapsedContainers.has(id)) {
+      state.collapsedContainers.add(id);
+      changed = true;
+    }
+  }
+  for (const id of we.tempCollapsedContainers) {
+    if (!we.preCollapsed.has(id) && state.collapsedContainers.has(id)) {
+      state.collapsedContainers.delete(id);
+      changed = true;
+    }
+  }
+  for (const id of we.tempExpandedFunctions) {
+    if (!we.preExpanded.has(id) && state.expandedFunctions.has(id)) {
+      state.expandedFunctions.delete(id);
+      changed = true;
+    }
+  }
+  we.tempOpenedContainers.clear();
+  we.tempCollapsedContainers.clear();
+  we.tempExpandedFunctions.clear();
+  we.activeTargetKey = null;
+  return changed;
+}
+
+function resolveOwnerFunctionIdForWalkthrough(ev) {
+  if (!ev) {
+    return null;
+  }
+  const rawCandidate = ev.fn_id || ev.to || ev.from || null;
+  if (!rawCandidate) {
+    return null;
+  }
+  if (state.nodesById.has(rawCandidate)) {
+    return rawCandidate;
+  }
+  const parts = String(rawCandidate).split("::");
+  if (parts.length >= 3) {
+    const ownerFn = parts.slice(0, -1).join("::");
+    if (state.nodesById.has(ownerFn)) {
+      return ownerFn;
+    }
+  }
+  return rawCandidate;
+}
+
+function resolveVisibleFallbackLayerId(rawNodeId) {
+  if (state.groupingMode !== "layers" || !rawNodeId) {
+    return null;
+  }
+  const node = state.nodesById.get(rawNodeId);
+  if (!node) {
+    return null;
+  }
+  const target = state.activeLevel <= 2 && node.type === "function" && node.parent
+    ? (state.nodesById.get(node.parent) || node)
+    : node;
+  const layerIdx = getNodeArchLayer(target);
+  return Number.isFinite(layerIdx) ? `layer::${layerIdx}` : null;
+}
+
+function computeWalkthroughSelectiveExpansionPlan(ev, opts = {}) {
+  const we = state.walkthroughExpansion;
+  if (!we || !we.hasSnapshot || !ev) {
+    return null;
+  }
+  if (opts.scope === "window" || opts.granularity !== "step" || state.activeLevel >= 4) {
+    return null;
+  }
+  const ownerId = resolveOwnerFunctionIdForWalkthrough(ev);
+  if (!ownerId) {
+    return null;
+  }
+  const ownerNode = state.nodesById.get(ownerId);
+  if (!ownerNode) {
+    return null;
+  }
+  const fileId = resolveFileIdForNode(ownerId);
+  const fileNode = fileId ? state.nodesById.get(fileId) : null;
+
+  const openContainers = [];
+  const collapseContainers = [];
+  const expandFunctions = [];
+
+  const collectAncestorModules = (startNode) => {
+    const mods = [];
+    let cur = startNode;
+    const seen = new Set();
+    while (cur && cur.parent && !seen.has(cur.parent)) {
+      seen.add(cur.parent);
+      const pNode = state.nodesById.get(cur.parent);
+      if (pNode && pNode.type === "module") {
+        mods.push(pNode.id);
+      }
+      cur = pNode;
+    }
+    return mods;
+  };
+
+  if (state.activeLevel === 1) {
+    if (state.groupingMode === "layers") {
+      const layerTarget = fileNode || ownerNode;
+      const layerIdx = getNodeArchLayer(layerTarget);
+      const layerId = `layer::${layerIdx}`;
+      if (we.preCollapsed.has(layerId)) {
+        openContainers.push(layerId);
+        for (const n of (state.rawGraph && state.rawGraph.nodes) || []) {
+          if (
+            n.type === "file"
+            && getNodeArchLayer(n) === layerIdx
+            && countDescendantFunctions(n.id) > 0
+            && !we.preCollapsed.has(n.id)
+          ) {
+            collapseContainers.push(n.id);
+          }
+        }
+      }
+      return { key: `L1:layer:${layerId}`, openContainers, collapseContainers, expandFunctions };
+    }
+
+    if (!fileNode) {
+      return null;
+    }
+    const ancestorModules = collectAncestorModules(fileNode);
+    if (ancestorModules.length > 0) {
+      const ancestorSet = new Set(ancestorModules);
+      const collapsedAncestors = ancestorModules.filter((mId) => we.preCollapsed.has(mId));
+      if (collapsedAncestors.length > 0) {
+        for (const mId of collapsedAncestors) {
+          openContainers.push(mId);
+        }
+        // Colapsar temporalmente archivos (y submódulos hermanos) dentro de los módulos abiertos para expansión estricta +1.
+        for (const mId of ancestorModules) {
+          const children = state.childrenByParent.get(mId) || [];
+          for (const child of children) {
+            if (child.type === "file" && countDescendantFunctions(child.id) > 0 && !we.preCollapsed.has(child.id)) {
+              collapseContainers.push(child.id);
+            } else if (
+              child.type === "module"
+              && !ancestorSet.has(child.id)
+              && countDescendantFunctions(child.id) > 0
+              && !we.preCollapsed.has(child.id)
+            ) {
+              collapseContainers.push(child.id);
+            }
+          }
+        }
+      }
+      return { key: `L1:mod:${ancestorModules[0]}`, openContainers, collapseContainers, expandFunctions };
+    }
+
+    // Archivo en la raíz sin módulo padre: su +1 abre el archivo para mostrar sus funciones.
+    if (we.preCollapsed.has(fileNode.id)) {
+      openContainers.push(fileNode.id);
+    }
+    return { key: `L1:rootfile:${fileNode.id}`, openContainers, collapseContainers, expandFunctions };
+  }
+
+  if (state.activeLevel === 2) {
+    if (!fileNode) {
+      return null;
+    }
+    if (state.groupingMode === "layers") {
+      const layerIdx = getNodeArchLayer(fileNode);
+      const layerId = `layer::${layerIdx}`;
+      if (we.preCollapsed.has(layerId)) {
+        openContainers.push(layerId);
+        for (const n of (state.rawGraph && state.rawGraph.nodes) || []) {
+          if (
+            n.type === "file"
+            && n.id !== fileNode.id
+            && getNodeArchLayer(n) === layerIdx
+            && countDescendantFunctions(n.id) > 0
+            && !we.preCollapsed.has(n.id)
+          ) {
+            collapseContainers.push(n.id);
+          }
+        }
+      }
+    } else {
+      const ancestorModules = collectAncestorModules(fileNode);
+      const ancestorSet = new Set(ancestorModules);
+      for (const mId of ancestorModules) {
+        if (we.preCollapsed.has(mId)) {
+          openContainers.push(mId);
+          for (const child of state.childrenByParent.get(mId) || []) {
+            if (
+              child.type === "file"
+              && child.id !== fileNode.id
+              && countDescendantFunctions(child.id) > 0
+              && !we.preCollapsed.has(child.id)
+            ) {
+              collapseContainers.push(child.id);
+            } else if (
+              child.type === "module"
+              && !ancestorSet.has(child.id)
+              && countDescendantFunctions(child.id) > 0
+              && !we.preCollapsed.has(child.id)
+            ) {
+              collapseContainers.push(child.id);
+            }
+          }
+        }
+      }
+    }
+    if (we.preCollapsed.has(fileNode.id)) {
+      openContainers.push(fileNode.id);
+    }
+    return { key: `L2:file:${fileNode.id}`, openContainers, collapseContainers, expandFunctions };
+  }
+
+  if (state.activeLevel === 3) {
+    if (ownerNode.type !== "function") {
+      return null;
+    }
+    if (state.groupingMode === "layers") {
+      const layerId = `layer::${getNodeArchLayer(ownerNode)}`;
+      if (we.preCollapsed.has(layerId)) {
+        openContainers.push(layerId);
+      }
+    } else {
+      if (fileNode && we.preCollapsed.has(fileNode.id)) {
+        openContainers.push(fileNode.id);
+      }
+      for (const mId of collectAncestorModules(fileNode || ownerNode)) {
+        if (we.preCollapsed.has(mId)) {
+          openContainers.push(mId);
+        }
+      }
+    }
+    if (
+      Array.isArray(ownerNode.internal_flow)
+      && ownerNode.internal_flow.length > 0
+      && !we.preExpanded.has(ownerNode.id)
+    ) {
+      expandFunctions.push(ownerNode.id);
+    }
+    return { key: `L3:fn:${ownerNode.id}`, openContainers, collapseContainers, expandFunctions };
+  }
+
+  return null;
+}
+
+async function syncWalkthroughSelectiveExpansion(ev, opts = {}) {
+  if (opts && opts.scope === "window") {
+    return { relayouted: false };
+  }
+  captureWalkthroughExpansionSnapshot();
+  const we = state.walkthroughExpansion;
+  const plan = computeWalkthroughSelectiveExpansionPlan(ev, opts);
+
+  if (!plan) {
+    const reverted = clearWalkthroughTempDeltas();
+    if (reverted) {
+      const prevZoom = state.cy ? state.cy.zoom() : null;
+      const prevPan = state.cy ? { ...state.cy.pan() } : null;
+      await refreshGraphView({ fit: false });
+      if (state.cy && Number.isFinite(prevZoom)) {
+        state.cy.zoom(prevZoom);
+        if (prevPan && (!opts || !opts.followCamera)) {
+          state.cy.pan(prevPan);
+        }
+        updateZoomIndicator();
+      }
+      return { relayouted: true };
+    }
+    return { relayouted: false };
+  }
+
+  if (we.activeTargetKey === plan.key) {
+    return { relayouted: false };
+  }
+
+  let changed = clearWalkthroughTempDeltas();
+  for (const id of plan.openContainers) {
+    if (state.collapsedContainers.delete(id)) {
+      changed = true;
+    }
+    if (we.preCollapsed.has(id)) {
+      we.tempOpenedContainers.add(id);
+    }
+  }
+  for (const id of plan.collapseContainers) {
+    if (!state.collapsedContainers.has(id)) {
+      state.collapsedContainers.add(id);
+      changed = true;
+    }
+    if (!we.preCollapsed.has(id)) {
+      we.tempCollapsedContainers.add(id);
+    }
+  }
+  for (const fid of plan.expandFunctions) {
+    if (!state.expandedFunctions.has(fid)) {
+      state.expandedFunctions.add(fid);
+      changed = true;
+    }
+    if (!we.preExpanded.has(fid)) {
+      we.tempExpandedFunctions.add(fid);
+    }
+  }
+  we.activeTargetKey = plan.key;
+
+  if (!changed) {
+    return { relayouted: false };
+  }
+
+  const prevZoom = state.cy ? state.cy.zoom() : null;
+  const prevPan = state.cy ? { ...state.cy.pan() } : null;
+  await refreshGraphView({ fit: false });
+  if (state.cy && Number.isFinite(prevZoom)) {
+    state.cy.zoom(prevZoom);
+    if (prevPan && (!opts || !opts.followCamera)) {
+      state.cy.pan(prevPan);
+    }
+    updateZoomIndicator();
+  }
+  return { relayouted: true };
+}
+
+async function restoreWalkthroughExpansion({ scope = "main", keepSnapshot = false } = {}) {
+  if (scope === "window") {
+    return false;
+  }
+  const changed = clearWalkthroughTempDeltas();
+  if (!keepSnapshot) {
+    resetWalkthroughExpansionSnapshot();
+  }
+  if (changed && state.cy) {
+    const prevZoom = state.cy.zoom();
+    const prevPan = { ...state.cy.pan() };
+    await refreshGraphView({ fit: false });
+    if (state.cy && Number.isFinite(prevZoom)) {
+      state.cy.zoom(prevZoom);
+      state.cy.pan(prevPan);
+      updateZoomIndicator();
+    }
+  }
+  return changed;
+}
+
 function initWalkthroughController() {
   if (typeof window === "undefined" || !window.CodeMapWalkthrough) {
     return;
   }
-  const ensureAncestorsOpen = (nodeId) => {
-    let changed = false;
-    let cur = state.nodesById.get(nodeId);
-    while (cur && cur.parent) {
-      if (state.collapsedContainers.delete(cur.parent)) {
-        changed = true;
-      }
-      cur = state.nodesById.get(cur.parent);
-    }
-    return changed;
-  };
 
   state.walkthrough = window.CodeMapWalkthrough.createController({
     getCy: () => state.cy,
     getRawGraph: () => state.rawGraph,
     getNodesById: () => state.nodesById,
     getActiveFlowId: () => state.activeFlowId,
+    getActiveLevel: () => state.activeLevel,
+    resolveVisibleFallbackId: (rawNodeId) => resolveVisibleFallbackLayerId(rawNodeId),
     getPreferredRootId: () => {
       if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
         return state.selectedNodeId;
@@ -12944,6 +13561,9 @@ function initWalkthroughController() {
     },
     getFloatingWindows: () => Array.from(state.floatingWindows.values()),
     getFloatingWindowById: (winId) => state.floatingWindows.get(winId) || null,
+    onFloatingCameraPan: () => {
+      scheduleBridgeRender();
+    },
     onWalkthroughStateChanged: (snapshot) => {
       updateFloatingWindowWalkthroughButtons(snapshot);
     },
@@ -12996,52 +13616,15 @@ function initWalkthroughController() {
       if (!trace || !Array.isArray(trace.events) || trace.events.length === 0) {
         return;
       }
-      let needsRefresh = false;
-
-      // En Modo Pulso (N3) o Paso a Paso (N3+), aseguramos funciones visibles (>= Nivel 3).
-      if (state.activeLevel < 3) {
-        state.activeLevel = 3;
-        updateLevelButtons(3);
-        state.collapsedContainers.clear();
-        needsRefresh = true;
-      }
-
-      if (trace.granularity === "step") {
-        const fnIds = [];
-        const seen = new Set();
-        for (const ev of trace.events) {
-          if (ev.fn_id && !seen.has(ev.fn_id)) {
-            seen.add(ev.fn_id);
-            const rawFn = state.nodesById.get(ev.fn_id);
-            if (rawFn && rawFn.type === "function" && Array.isArray(rawFn.internal_flow) && rawFn.internal_flow.length > 0) {
-              fnIds.push(ev.fn_id);
-              if (fnIds.length >= 8) {
-                break;
-              }
-            }
-          }
-        }
-        for (const fid of fnIds) {
-          if (ensureAncestorsOpen(fid)) {
-            needsRefresh = true;
-          }
-          if (!state.expandedFunctions.has(fid)) {
-            state.expandedFunctions.add(fid);
-            needsRefresh = true;
-          }
-        }
-      } else {
-        for (const ev of trace.events) {
-          if (ev.fn_id && ensureAncestorsOpen(ev.fn_id)) {
-            needsRefresh = true;
-          }
-        }
-      }
-
-      if (needsRefresh) {
-        await refreshGraphView({ fit: false });
-      }
+      // Capturamos la instantánea exacta de expansiones manuales sin forzar cambios de nivel global.
+      captureWalkthroughExpansionSnapshot();
     },
+    syncActiveEventExpansion: async (ev, opts = {}) => syncWalkthroughSelectiveExpansion(ev, opts),
+    restoreWalkthroughExpansion: async (opts = {}) => restoreWalkthroughExpansion(opts),
+    onWalkthroughStopped: async (opts = {}) => restoreWalkthroughExpansion({
+      scope: opts && opts.scope ? opts.scope : "main",
+      keepSnapshot: false,
+    }),
     syncFloatingCodeForEvent: (ev) => {
       if (!ev || !ev.fn_id) {
         return;

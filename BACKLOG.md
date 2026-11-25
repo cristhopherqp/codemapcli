@@ -2,7 +2,11 @@
 
 *The suggested actions are only possible standard steps to take, not the exact root cause of the problem. You should take them into account, but if the issue lies elsewhere, you must find the root cause and fix it.*
 
-> **Principio transversal:** Todas las funcionalidades activas deben mantener **cero intrusión** sobre los repositorios analizados (sin crear ni modificar archivos en el proyecto objetivo; toda persistencia vive en `~/.codemap/<hash>/` o `~/.codemap/`) y operar de forma **100 % estática** sobre `tree-sitter`, `graph.json`, Cytoscape.js/ELKjs y `GET /source`.
+---
+
+## Improvements & Refactoring
+
+*(Sin ítems activos pendientes. El lote del Ciclo 11 fue completado y archivado en `docs/history/2026-11-cycle-11-dense-navigation-and-walkthrough.md`.)*
 
 ---
 

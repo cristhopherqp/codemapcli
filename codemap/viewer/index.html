@@ -51,7 +51,8 @@
 
       <div class="zoom-controls" aria-label="Control de zoom">
         <button id="btn-zoom-out" class="zoom-step-btn" type="button" title="Alejar (-)">−</button>
-        <button id="zoom-indicator" class="zoom-indicator" type="button" title="Ajustar grafo a la pantalla (F o Ctrl+0)">100%</button>
+        <button id="zoom-indicator" class="zoom-indicator" type="button" title="Haz clic para escribir un porcentaje de zoom (2%–400%)">100%</button>
+        <input id="zoom-input" class="zoom-input hidden" type="text" inputmode="numeric" maxlength="5" aria-label="Porcentaje de zoom (2 a 400)" title="Escribe un porcentaje (2–400), Enter para aplicar, Esc para cancelar">
         <button id="btn-zoom-in" class="zoom-step-btn" type="button" title="Acercar (+)">+</button>
       </div>
     </div>
@@ -146,10 +147,11 @@
             <option value="4">4×</option>
           </select>
           <div class="wt-mode-group" role="group" aria-label="Modo de recorrido">
-            <button id="btn-wt-mode-pulse" class="wt-hud-btn active" type="button" aria-pressed="true" title="Modo Pulso (Nivel 3): saltos función a función">Pulso (N3)</button>
-            <button id="btn-wt-mode-step" class="wt-hud-btn" type="button" aria-pressed="false" title="Modo Paso a Paso (Nivel 3+): instrucción por instrucción sincronizada con el código">Paso a Paso</button>
+            <button id="btn-wt-mode-pulse" class="wt-hud-btn active" type="button" aria-pressed="true" title="Modo Pulso: saltos función a función conservando el nivel actual">Pulso</button>
+            <button id="btn-wt-mode-step" class="wt-hud-btn" type="button" aria-pressed="false" title="Modo Paso a Paso: expande +1 nivel solo el nodo activo">Paso a Paso</button>
           </div>
           <button id="btn-wt-step-into" class="wt-hud-btn active hidden" type="button" aria-pressed="true" title="Profundizar en funciones hijas (Step Into / Step Over)">↳ Profundizar</button>
+          <button id="btn-wt-follow" class="wt-hud-btn wt-follow-btn" type="button" aria-pressed="false" title="Seguir suavemente la luz del recorrido conservando tu zoom actual">🎥 Seguir</button>
           <button id="btn-wt-close" class="wt-hud-btn wt-close-btn" type="button" title="Cerrar Recorrido Visual (Esc)">✕</button>
         </div>
         <div id="wt-branch-bar" class="wt-branch-bar hidden">
