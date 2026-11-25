@@ -227,6 +227,7 @@ const state = {
   windowIdCounter: 0,
   windowZCounter: 30,
   bridgeRenderRaf: null,
+  refreshToken: 0,
   zoomEditActive: false,
   mainBgPanCleanup: null,
   walkthroughExpansion: {
@@ -239,6 +240,7 @@ const state = {
     tempCollapsedContainers: new Set(),
     tempExpandedFunctions: new Set(),
     activeTargetKey: null,
+    lastActiveAnchorId: null,
   },
   walkthrough: null,
   ws: null,
@@ -4463,7 +4465,149 @@ function buildStylesheet() {
   ];
 }
 
-async function refreshGraphView({ fit = true } = {}) {
+function computeAnchoredPanForLayoutSwap(anchorScreenBefore, anchorModelAfter, zoom) {
+  if (!anchorScreenBefore || !anchorModelAfter || !Number.isFinite(zoom) || zoom <= 0) {
+    return null;
+  }
+  if (
+    !Number.isFinite(anchorScreenBefore.x) || !Number.isFinite(anchorScreenBefore.y)
+    || !Number.isFinite(anchorModelAfter.x) || !Number.isFinite(anchorModelAfter.y)
+  ) {
+    return null;
+  }
+  return {
+    x: anchorScreenBefore.x - anchorModelAfter.x * zoom,
+    y: anchorScreenBefore.y - anchorModelAfter.y * zoom,
+  };
+}
+
+function resolveVisibleCyIdForAnchor(cy, rawId) {
+  if (!cy || !rawId || typeof cy.getElementById !== "function") {
+    return null;
+  }
+  const direct = cy.getElementById(rawId);
+  if (direct && direct.length > 0 && typeof direct.isNode === "function" && direct.isNode()) {
+    return rawId;
+  }
+  let candidate = rawId;
+  const parts = String(candidate).split("::");
+  if (parts.length >= 3) {
+    const fnCandidate = parts.slice(0, -1).join("::");
+    const fnEl = cy.getElementById(fnCandidate);
+    if (fnEl && fnEl.length > 0 && fnEl.isNode()) {
+      return fnCandidate;
+    }
+    candidate = fnCandidate;
+  }
+  let cur = state.nodesById.get(candidate);
+  const seen = new Set();
+  while (cur && cur.parent && !seen.has(cur.parent)) {
+    seen.add(cur.parent);
+    const pEl = cy.getElementById(cur.parent);
+    if (pEl && pEl.length > 0 && pEl.isNode()) {
+      return cur.parent;
+    }
+    cur = state.nodesById.get(cur.parent);
+  }
+  const layerFallback = resolveVisibleFallbackLayerId(candidate);
+  if (layerFallback) {
+    const fbEl = cy.getElementById(layerFallback);
+    if (fbEl && fbEl.length > 0 && fbEl.isNode()) {
+      return layerFallback;
+    }
+  }
+  return null;
+}
+
+function readAnchorModelPoint(cyNode, mode = "top") {
+  if (!cyNode || cyNode.length === 0) {
+    return null;
+  }
+  if (typeof cyNode.boundingBox === "function") {
+    const bb = cyNode.boundingBox({ includeLabels: false });
+    if (bb && Number.isFinite(bb.x1) && Number.isFinite(bb.y1) && bb.w > 0 && bb.h > 0) {
+      return mode === "center"
+        ? { x: (bb.x1 + bb.x2) / 2, y: (bb.y1 + bb.y2) / 2 }
+        : { x: (bb.x1 + bb.x2) / 2, y: bb.y1 };
+    }
+  }
+  if (typeof cyNode.position === "function") {
+    const pos = cyNode.position();
+    if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
+      return { x: pos.x, y: pos.y };
+    }
+  }
+  return null;
+}
+
+function captureViewportAnchorBeforeSwap(cy, anchorSpec) {
+  if (!cy || !anchorSpec) {
+    return null;
+  }
+  const candidates = Array.isArray(anchorSpec.candidateIds)
+    ? anchorSpec.candidateIds
+    : (anchorSpec.nodeId ? [anchorSpec.nodeId] : []);
+  const mode = anchorSpec.mode === "center" ? "center" : "top";
+  const prevZoom = typeof cy.zoom === "function" ? cy.zoom() : null;
+  const prevPan = typeof cy.pan === "function" ? cy.pan() : null;
+  if (!Number.isFinite(prevZoom) || prevZoom <= 0 || !prevPan) {
+    return null;
+  }
+  for (const candId of candidates) {
+    if (!candId) {
+      continue;
+    }
+    const visId = resolveVisibleCyIdForAnchor(cy, candId);
+    if (!visId) {
+      continue;
+    }
+    const cyNode = cy.getElementById(visId);
+    const modelPt = readAnchorModelPoint(cyNode, mode);
+    if (modelPt) {
+      return {
+        candidateId: candId,
+        mode,
+        beforeScreen: {
+          x: modelPt.x * prevZoom + prevPan.x,
+          y: modelPt.y * prevZoom + prevPan.y,
+        },
+        prevZoom,
+        prevPan: { x: prevPan.x, y: prevPan.y },
+      };
+    }
+  }
+  return null;
+}
+
+function applyViewportAnchorAfterSwap(cy, captured) {
+  if (!cy || !captured) {
+    return false;
+  }
+  const visId = resolveVisibleCyIdForAnchor(cy, captured.candidateId);
+  const afterNode = visId ? cy.getElementById(visId) : null;
+  const afterModel = afterNode ? readAnchorModelPoint(afterNode, captured.mode) : null;
+  const nextPan = afterModel
+    ? computeAnchoredPanForLayoutSwap(captured.beforeScreen, afterModel, captured.prevZoom)
+    : captured.prevPan;
+
+  const applyVp = () => {
+    if (Number.isFinite(captured.prevZoom)) {
+      cy.zoom(captured.prevZoom);
+    }
+    if (nextPan) {
+      cy.pan(nextPan);
+    }
+  };
+  if (state.walkthrough && typeof state.walkthrough.runProgrammaticPan === "function") {
+    state.walkthrough.runProgrammaticPan(cy, applyVp);
+  } else {
+    applyVp();
+  }
+  return Boolean(afterModel && nextPan);
+}
+
+async function refreshGraphView({ fit = true, viewportAnchor = null, preserveViewport = false } = {}) {
+  const myToken = ++state.refreshToken;
   hideEdgeTooltip();
   hideNodeTooltip();
   state.hoveredNodeId = null;
@@ -4478,11 +4622,41 @@ async function refreshGraphView({ fit = true } = {}) {
     edges: callEdges.length,
   };
 
-  state.cy.elements().remove();
-  state.cy.add([...nodes, ...edges]);
-  await runElkLayout(nodes, edges);
+  // Calcular ELK antes de modificar Cytoscape para realizar un intercambio atómico
+  // sin frames en blanco, sin apilado temporal en (0, 0) y con rutas ortogonales intactas.
+  const computedLayout = await computeElkLayoutResult(nodes, edges);
+  if (myToken !== state.refreshToken) {
+    return;
+  }
+
+  const prevZoom = state.cy ? state.cy.zoom() : null;
+  const prevPan = state.cy ? { ...state.cy.pan() } : null;
+  const capturedAnchor = (!fit && viewportAnchor)
+    ? captureViewportAnchorBeforeSwap(state.cy, viewportAnchor)
+    : null;
+
+  state.cy.batch(() => {
+    state.cy.elements().remove();
+    state.cy.add([...nodes, ...edges]);
+  });
+  applyComputedElkLayout(computedLayout, nodes);
+
   if (fit) {
     fitCyWithDynamicMinZoom(state.cy, undefined, 36, MAIN_MIN_ZOOM);
+  } else if (capturedAnchor) {
+    applyViewportAnchorAfterSwap(state.cy, capturedAnchor);
+  } else if (preserveViewport && state.cy && Number.isFinite(prevZoom)) {
+    const restoreVp = () => {
+      state.cy.zoom(prevZoom);
+      if (prevPan) {
+        state.cy.pan(prevPan);
+      }
+    };
+    if (state.walkthrough && typeof state.walkthrough.runProgrammaticPan === "function") {
+      state.walkthrough.runProgrammaticPan(state.cy, restoreVp);
+    } else {
+      restoreVp();
+    }
   }
   updateZoomIndicator();
   updateNHopsHud();
@@ -5785,7 +5959,7 @@ function applyScopedPinsToLayout(cy, elkPositions, containerOffsets, pinnedPosit
   return { rigidShiftByNodeId, individuallyPinnedIds };
 }
 
-async function runElkLayout(visibleNodes, visibleEdges) {
+async function computeElkLayoutResult(visibleNodes, visibleEdges) {
   const isCreationOrder = state.layoutOrderMode === "creation";
   let elkGraph;
   let creationMeta = null;
@@ -5801,6 +5975,11 @@ async function runElkLayout(visibleNodes, visibleEdges) {
   const elkPositions = new Map();
   const containerOffsets = new Map([["root", { x: 0, y: 0 }]]);
   collectAbsolutePositions(layouted, 0, 0, elkPositions, containerOffsets);
+  return { layouted, elkPositions, containerOffsets, isCreationOrder, creationMeta };
+}
+
+function applyComputedElkLayout(computed, visibleNodes) {
+  const { layouted, elkPositions, containerOffsets, isCreationOrder, creationMeta } = computed;
 
   const contextKey = getCurrentLayoutContextKey();
   const ignorePins = Boolean(computeSubgraphFilter());
@@ -5871,6 +6050,11 @@ async function runElkLayout(visibleNodes, visibleEdges) {
   if (externalEdgesToReroute.length > 0) {
     rerouteExternalEdgesLocally(state.cy, externalEdgesToReroute);
   }
+}
+
+async function runElkLayout(visibleNodes, visibleEdges) {
+  const computed = await computeElkLayoutResult(visibleNodes, visibleEdges);
+  applyComputedElkLayout(computed, visibleNodes);
 }
 
 function buildElkInput(visibleNodes, visibleEdges, options) {
@@ -10515,6 +10699,11 @@ function bindGlobalShortcuts() {
         cancelZoomEdit();
         return;
       }
+      if (document.activeElement && document.activeElement.id === "wt-speed-select") {
+        event.preventDefault();
+        document.activeElement.blur();
+        return;
+      }
       if (closeOpenModals()) {
         return;
       }
@@ -13170,6 +13359,7 @@ function resetWalkthroughExpansionSnapshot() {
   we.tempCollapsedContainers.clear();
   we.tempExpandedFunctions.clear();
   we.activeTargetKey = null;
+  we.lastActiveAnchorId = null;
 }
 
 function captureWalkthroughExpansionSnapshot() {
@@ -13193,6 +13383,7 @@ function captureWalkthroughExpansionSnapshot() {
   we.tempCollapsedContainers.clear();
   we.tempExpandedFunctions.clear();
   we.activeTargetKey = null;
+  we.lastActiveAnchorId = null;
 }
 
 function clearWalkthroughTempDeltas() {
@@ -13444,6 +13635,34 @@ function computeWalkthroughSelectiveExpansionPlan(ev, opts = {}) {
   return null;
 }
 
+function resolveScaleAnchorIdForNode(rawNodeId) {
+  if (!rawNodeId) {
+    return null;
+  }
+  const ownerId = resolveOwnerFunctionIdForWalkthrough({ fn_id: rawNodeId });
+  if (!ownerId) {
+    return null;
+  }
+  if (state.activeLevel === 1) {
+    if (state.groupingMode === "layers") {
+      return resolveVisibleFallbackLayerId(ownerId) || ownerId;
+    }
+    const fileId = resolveFileIdForNode(ownerId);
+    const fileNode = fileId ? state.nodesById.get(fileId) : null;
+    if (fileNode && fileNode.parent) {
+      const pNode = state.nodesById.get(fileNode.parent);
+      if (pNode && pNode.type === "module") {
+        return pNode.id;
+      }
+    }
+    return fileId || ownerId;
+  }
+  if (state.activeLevel === 2) {
+    return resolveFileIdForNode(ownerId) || ownerId;
+  }
+  return ownerId;
+}
+
 async function syncWalkthroughSelectiveExpansion(ev, opts = {}) {
   if (opts && opts.scope === "window") {
     return { relayouted: false };
@@ -13451,29 +13670,31 @@ async function syncWalkthroughSelectiveExpansion(ev, opts = {}) {
   captureWalkthroughExpansionSnapshot();
   const we = state.walkthroughExpansion;
   const plan = computeWalkthroughSelectiveExpansionPlan(ev, opts);
+  const fromAnchor = ev && ev.from ? resolveScaleAnchorIdForNode(ev.from) : null;
+  const toAnchor = ev ? resolveScaleAnchorIdForNode(ev.fn_id || ev.to || ev.from) : null;
 
   if (!plan) {
+    const anchorCandidates = [we.lastActiveAnchorId, toAnchor, fromAnchor].filter(Boolean);
     const reverted = clearWalkthroughTempDeltas();
     if (reverted) {
-      const prevZoom = state.cy ? state.cy.zoom() : null;
-      const prevPan = state.cy ? { ...state.cy.pan() } : null;
-      await refreshGraphView({ fit: false });
-      if (state.cy && Number.isFinite(prevZoom)) {
-        state.cy.zoom(prevZoom);
-        if (prevPan && (!opts || !opts.followCamera)) {
-          state.cy.pan(prevPan);
-        }
-        updateZoomIndicator();
-      }
+      await refreshGraphView({
+        fit: false,
+        viewportAnchor: anchorCandidates.length > 0 ? { candidateIds: anchorCandidates, mode: "top" } : null,
+        preserveViewport: true,
+      });
       return { relayouted: true };
     }
     return { relayouted: false };
   }
 
   if (we.activeTargetKey === plan.key) {
+    if (toAnchor) {
+      we.lastActiveAnchorId = toAnchor;
+    }
     return { relayouted: false };
   }
 
+  const prevAnchor = we.lastActiveAnchorId;
   let changed = clearWalkthroughTempDeltas();
   for (const id of plan.openContainers) {
     if (state.collapsedContainers.delete(id)) {
@@ -13502,21 +13723,20 @@ async function syncWalkthroughSelectiveExpansion(ev, opts = {}) {
     }
   }
   we.activeTargetKey = plan.key;
+  we.lastActiveAnchorId = toAnchor || fromAnchor || prevAnchor || null;
 
   if (!changed) {
     return { relayouted: false };
   }
 
-  const prevZoom = state.cy ? state.cy.zoom() : null;
-  const prevPan = state.cy ? { ...state.cy.pan() } : null;
-  await refreshGraphView({ fit: false });
-  if (state.cy && Number.isFinite(prevZoom)) {
-    state.cy.zoom(prevZoom);
-    if (prevPan && (!opts || !opts.followCamera)) {
-      state.cy.pan(prevPan);
-    }
-    updateZoomIndicator();
-  }
+  // Anclamos el encabezado del nodo saliente (o entrante si abre in-place) en su píxel exacto
+  // antes/después del intercambio atómico ELK para eliminar cualquier salto visual de pantalla.
+  const anchorCandidates = [fromAnchor, prevAnchor, toAnchor].filter(Boolean);
+  await refreshGraphView({
+    fit: false,
+    viewportAnchor: anchorCandidates.length > 0 ? { candidateIds: anchorCandidates, mode: "top" } : null,
+    preserveViewport: true,
+  });
   return { relayouted: true };
 }
 
@@ -13524,19 +13744,18 @@ async function restoreWalkthroughExpansion({ scope = "main", keepSnapshot = fals
   if (scope === "window") {
     return false;
   }
+  const we = state.walkthroughExpansion;
+  const anchorId = we ? we.lastActiveAnchorId : null;
   const changed = clearWalkthroughTempDeltas();
   if (!keepSnapshot) {
     resetWalkthroughExpansionSnapshot();
   }
   if (changed && state.cy) {
-    const prevZoom = state.cy.zoom();
-    const prevPan = { ...state.cy.pan() };
-    await refreshGraphView({ fit: false });
-    if (state.cy && Number.isFinite(prevZoom)) {
-      state.cy.zoom(prevZoom);
-      state.cy.pan(prevPan);
-      updateZoomIndicator();
-    }
+    await refreshGraphView({
+      fit: false,
+      viewportAnchor: anchorId ? { candidateIds: [anchorId], mode: "top" } : null,
+      preserveViewport: true,
+    });
   }
   return changed;
 }

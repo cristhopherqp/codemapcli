@@ -470,6 +470,7 @@ eval(extractFn('captureWalkthroughExpansionSnapshot'));
 eval(extractFn('clearWalkthroughTempDeltas'));
 eval(extractFn('resolveOwnerFunctionIdForWalkthrough'));
 eval(extractFn('resolveVisibleFallbackLayerId'));
+eval(extractFn('resolveScaleAnchorIdForNode'));
 eval(extractFn('computeWalkthroughSelectiveExpansionPlan'));
 eval(extractFn('syncWalkthroughSelectiveExpansion'));
 eval(extractFn('restoreWalkthroughExpansion'));
@@ -760,6 +761,194 @@ const ctrl = wt.createController({
         proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, f"Falló prueba async/granularidad:\n{proc.stderr}")
         self.assertIn("ASYNC_GRANULARITY_OK", proc.stdout)
+
+    def test_atomic_elk_swap_and_zero_jump_viewport_anchor_headless(self) -> None:
+        app_src = APP_JS.read_text(encoding="utf-8")
+        # Verificar que refreshGraphView calcula ELK antes de remover elementos de Cytoscape.
+        rg_start = app_src.index("async function refreshGraphView(")
+        rg_end = app_src.index("function shiftElkSubtreeY(", rg_start)
+        rg_body = app_src[rg_start:rg_end]
+        self.assertLess(
+            rg_body.index("computeElkLayoutResult("),
+            rg_body.index("state.cy.elements().remove()"),
+            "refreshGraphView debe calcular ELK antes de vaciar Cytoscape para intercambio atómico",
+        )
+
+        node_script = (
+            f"const fs = require('fs');\n"
+            f"const src = fs.readFileSync({json.dumps(str(APP_JS))}, 'utf8');\n"
+            """
+function extractFn(name) {
+  const marker = 'function ' + name + '(';
+  const start = src.indexOf(marker);
+  if (start === -1) throw new Error('No se encontró ' + name);
+  const sigEnd = src.indexOf(') {', start);
+  const bodyStart = sigEnd + 2;
+  let depth = 0;
+  for (let i = bodyStart; i < src.length; i += 1) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error('Llaves desbalanceadas en ' + name);
+}
+
+let programmaticRuns = 0;
+const state = {
+  nodesById: new Map([['f.py::main', { id: 'f.py::main', parent: 'f.py' }]]),
+  groupingMode: 'folders',
+  activeLevel: 3,
+  walkthrough: {
+    runProgrammaticPan: (_cy, fn) => {
+      programmaticRuns += 1;
+      fn();
+    },
+  },
+};
+function resolveVisibleFallbackLayerId() { return null; }
+
+eval(extractFn('computeAnchoredPanForLayoutSwap'));
+eval(extractFn('resolveVisibleCyIdForAnchor'));
+eval(extractFn('readAnchorModelPoint'));
+eval(extractFn('captureViewportAnchorBeforeSwap'));
+eval(extractFn('applyViewportAnchorAfterSwap'));
+
+// Simular nodo 'f.py::main' que antes del relayout está en model (100, 120) con pan (50, 40) y zoom 1.6
+// y tras abrir/cerrar lógica interna ELK lo reubica globalmente a model (340, 480).
+let curZoom = 1.6;
+let curPan = { x: 50, y: 40 };
+let curBox = { x1: 40, x2: 160, y1: 120, y2: 160, w: 120, h: 40 }; // top-center = (100, 120)
+const mockCy = {
+  zoom(v) { if (v !== undefined) curZoom = v; return curZoom; },
+  pan(v) { if (v !== undefined) curPan = { x: v.x, y: v.y }; return curPan; },
+  getElementById(id) {
+    if (id !== 'f.py::main') return { length: 0 };
+    return {
+      length: 1,
+      isNode: () => true,
+      boundingBox: () => curBox,
+      position: () => ({ x: (curBox.x1 + curBox.x2) / 2, y: (curBox.y1 + curBox.y2) / 2 }),
+    };
+  },
+};
+
+const captured = captureViewportAnchorBeforeSwap(mockCy, { candidateIds: ['f.py::main'], mode: 'top' });
+if (!captured) throw new Error('No se capturó ancla de viewport');
+const screenBeforeX = 100 * 1.6 + 50;
+const screenBeforeY = 120 * 1.6 + 40;
+
+// Tras relayout ELK, el nodo se desplaza globalmente y crece en altura (top-center = (340, 480)).
+curBox = { x1: 260, x2: 420, y1: 480, y2: 780, w: 160, h: 300 };
+const applied = applyViewportAnchorAfterSwap(mockCy, captured);
+if (!applied) throw new Error('applyViewportAnchorAfterSwap devolvió false');
+if (programmaticRuns !== 1) throw new Error('El pan compensado debió ejecutarse vía runProgrammaticPan');
+if (Math.abs(curZoom - 1.6) > 1e-9) throw new Error('El zoom se alteró: ' + curZoom);
+
+const screenAfterX = 340 * curZoom + curPan.x;
+const screenAfterY = 480 * curZoom + curPan.y;
+if (Math.abs(screenAfterX - screenBeforeX) > 1e-6 || Math.abs(screenAfterY - screenBeforeY) > 1e-6) {
+  throw new Error(`El encabezado saltó en pantalla: antes (${screenBeforeX},${screenBeforeY}) vs después (${screenAfterX},${screenAfterY})`);
+}
+console.log('ANCHOR_ZERO_JUMP_OK');
+"""
+        )
+        proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, f"Falló prueba de ancla anti-salto:\n{proc.stderr}")
+        self.assertIn("ANCHOR_ZERO_JUMP_OK", proc.stdout)
+
+    def test_arrowless_free_range_speed_control_wheel_and_manual_input(self) -> None:
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('id="wt-speed-select"', html)
+        self.assertNotIn('<select id="wt-speed-select"', html)
+        self.assertNotIn('type="number"', html)
+
+        node_script = (
+            f"const wt = require({json.dumps(str(WALKTHROUGH_JS))});\n"
+            """
+// 1. Parseo y acotado 0.1x - 4x
+const parseCases = [
+  ['0.1', 0.1],
+  ['0.25', 0.25],
+  ['0,3', 0.3],
+  ['1.5x', 1.5],
+  ['2.4×', 2.4],
+  ['4', 4],
+  ['0.02', 0.1],
+  ['9.5', 4],
+  ['0', null],
+  ['-1', null],
+  ['abc', null],
+  ['', null],
+];
+for (const [raw, expected] of parseCases) {
+  const got = wt.parseWalkthroughSpeedInput(raw);
+  if (got !== expected) {
+    throw new Error(`parseWalkthroughSpeedInput(${JSON.stringify(raw)}) = ${got}, esperado ${expected}`);
+  }
+}
+
+// 2. Rueda del mouse sin deriva flotante (0.1 + 0.1 + 0.1 === 0.3) y límites [0.1, 4]
+let sp = 0.1;
+sp = wt.stepWalkthroughSpeedByWheel(sp, 120); // bajar desde 0.1 queda en 0.1
+if (sp !== 0.1) throw new Error('Rueda abajo desde 0.1 dio ' + sp);
+sp = wt.stepWalkthroughSpeedByWheel(sp, -120); // 0.2
+sp = wt.stepWalkthroughSpeedByWheel(sp, -120); // 0.3
+if (sp !== 0.3) throw new Error('Deriva flotante en rueda: ' + sp);
+sp = wt.stepWalkthroughSpeedByWheel(3.8, -120, true); // Shift + rueda sube 0.5 -> acota a 4
+if (sp !== 4) throw new Error('Tope superior 4x falló: ' + sp);
+if (wt.formatWalkthroughSpeed(0.1) !== '0.1×' || wt.formatWalkthroughSpeed(4) !== '4×') {
+  throw new Error('Formato de velocidad incorrecto');
+}
+
+// 3. Controlador DOM: wheel sobre #wt-speed-select bloquea propagación y actualiza velocidad hasta 0.1x
+const listeners = new Map();
+const speedInputEl = {
+  id: 'wt-speed-select',
+  value: '1×',
+  addEventListener(evt, fn) { listeners.set(evt, fn); },
+  select() {},
+  blur() {},
+  classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+  setAttribute() {},
+};
+global.document = {
+  activeElement: null,
+  getElementById: (id) => (id === 'wt-speed-select' ? speedInputEl : null),
+  createElement: () => ({ classList: { add(){}, remove(){}, toggle(){} }, setAttribute(){}, appendChild(){} }),
+  createDocumentFragment: () => ({ appendChild(){} }),
+};
+global.window = {
+  devicePixelRatio: 1,
+  requestAnimationFrame: () => 1,
+  cancelAnimationFrame: () => {},
+  setTimeout,
+  clearTimeout,
+};
+const ctrl = wt.createController({ getCy: () => null, getRawGraph: () => null, getNodesById: () => new Map() });
+ctrl.bindDomEvents();
+ctrl.setSpeed(0.1);
+if (ctrl.getState().speed !== 0.1 || speedInputEl.value !== '0.1×') {
+  throw new Error('setSpeed(0.1) no aplicó 0.1×: ' + JSON.stringify(ctrl.getState()) + ' / ' + speedInputEl.value);
+}
+let prevented = false;
+let stopped = false;
+listeners.get('wheel')({
+  deltaY: -100,
+  shiftKey: false,
+  preventDefault() { prevented = true; },
+  stopPropagation() { stopped = true; },
+});
+if (!prevented || !stopped || ctrl.getState().speed !== 0.2 || speedInputEl.value !== '0.2×') {
+  throw new Error('Evento wheel en velocidad falló: ' + JSON.stringify({ prevented, stopped, speed: ctrl.getState().speed, val: speedInputEl.value }));
+}
+console.log('FREE_SPEED_OK');
+"""
+        )
+        proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, f"Falló prueba de velocidad libre:\n{proc.stderr}")
+        self.assertIn("FREE_SPEED_OK", proc.stdout)
 
 
 if __name__ == "__main__":

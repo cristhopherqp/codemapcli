@@ -140,12 +140,16 @@
             <button id="btn-wt-next" class="wt-hud-btn" type="button" title="Paso adelante (→)">→</button>
             <span id="wt-counter" class="wt-counter">0 / 0</span>
           </div>
-          <select id="wt-speed-select" class="wt-speed-select" title="Velocidad del recorrido" aria-label="Velocidad del recorrido">
-            <option value="0.5">0.5×</option>
-            <option value="1" selected>1×</option>
-            <option value="2">2×</option>
-            <option value="4">4×</option>
-          </select>
+          <input
+            id="wt-speed-select"
+            class="wt-speed-select"
+            type="text"
+            inputmode="decimal"
+            maxlength="5"
+            value="1×"
+            aria-label="Velocidad del recorrido (0.1x a 4x)"
+            title="Velocidad (0.1×–4×): usa la rueda del mouse o haz clic para escribir un valor"
+          >
           <div class="wt-mode-group" role="group" aria-label="Modo de recorrido">
             <button id="btn-wt-mode-pulse" class="wt-hud-btn active" type="button" aria-pressed="true" title="Modo Pulso: saltos función a función conservando el nivel actual">Pulso</button>
             <button id="btn-wt-mode-step" class="wt-hud-btn" type="button" aria-pressed="false" title="Modo Paso a Paso: expande +1 nivel solo el nodo activo">Paso a Paso</button>

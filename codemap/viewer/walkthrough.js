@@ -14,6 +14,49 @@
   const FLASH_DURATION_MS = 380;
   const BASE_STEP_DURATION_MS = 950;
   const PULSE_STEP_DURATION_MS = 820;
+  const MIN_WALKTHROUGH_SPEED = 0.1;
+  const MAX_WALKTHROUGH_SPEED = 4;
+  const SPEED_WHEEL_STEP = 0.1;
+
+  function clampWalkthroughSpeed(rawSpeed) {
+    const num = Number(rawSpeed);
+    if (!Number.isFinite(num) || num <= 0) {
+      return null;
+    }
+    const clamped = Math.min(MAX_WALKTHROUGH_SPEED, Math.max(MIN_WALKTHROUGH_SPEED, num));
+    return Math.round(clamped * 100) / 100;
+  }
+
+  function parseWalkthroughSpeedInput(rawText) {
+    if (rawText === null || rawText === undefined) {
+      return null;
+    }
+    const cleaned = String(rawText).trim().replace(/[x×]$/i, "").replace(",", ".").trim();
+    if (!cleaned || !/^\d+(?:\.\d+)?$/.test(cleaned)) {
+      return null;
+    }
+    return clampWalkthroughSpeed(Number(cleaned));
+  }
+
+  function formatWalkthroughSpeed(speed) {
+    const clean = clampWalkthroughSpeed(speed);
+    if (clean === null) {
+      return "1×";
+    }
+    return `${Number(clean.toFixed(2))}×`;
+  }
+
+  function stepWalkthroughSpeedByWheel(currentSpeed, deltaY, shiftKey = false) {
+    const base = clampWalkthroughSpeed(currentSpeed) ?? 1;
+    if (!Number.isFinite(deltaY) || deltaY === 0) {
+      return base;
+    }
+    const step = shiftKey ? 0.5 : SPEED_WHEEL_STEP;
+    const dir = deltaY < 0 ? 1 : -1;
+    const rawNext = base + dir * step;
+    const rounded = Math.round(rawNext * 10) / 10;
+    return clampWalkthroughSpeed(rounded) ?? base;
+  }
 
   const SPARK_COLORS = {
     call: { core: "#ecfeff", glow: "#22d3ee", trail: "rgba(34, 211, 238, 0.78)" },
@@ -1870,7 +1913,8 @@
 
     const getStepDurationMs = () => {
       const base = wtState.granularity === "step" ? BASE_STEP_DURATION_MS : PULSE_STEP_DURATION_MS;
-      return Math.round(base / Math.max(0.25, wtState.speed));
+      const safeSpeed = clampWalkthroughSpeed(wtState.speed) ?? 1;
+      return Math.round(base / safeSpeed);
     };
 
     const getCurrentEvent = () => {
@@ -1926,9 +1970,12 @@
         counterEl.textContent = total > 0 ? `${wtState.index + 1} / ${total}` : "0 / 0";
       }
 
-      const speedSelect = document.getElementById("wt-speed-select");
-      if (speedSelect) {
-        speedSelect.value = String(wtState.speed);
+      const speedInput = document.getElementById("wt-speed-select");
+      if (speedInput) {
+        const isEditingSpeed = typeof document !== "undefined" && document.activeElement === speedInput;
+        if (!isEditingSpeed) {
+          speedInput.value = formatWalkthroughSpeed(wtState.speed);
+        }
       }
 
       const isWindowScope = wtState.scope === "window";
@@ -2569,16 +2616,23 @@
       return Promise.resolve(false);
     };
 
-    const setSpeed = (newSpeed) => {
-      const parsed = Number(newSpeed);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        return;
+    const setSpeed = (newSpeed, { forceDisplay = false } = {}) => {
+      const parsed = typeof newSpeed === "string"
+        ? parseWalkthroughSpeedInput(newSpeed)
+        : clampWalkthroughSpeed(newSpeed);
+      if (parsed === null) {
+        return false;
       }
       wtState.speed = parsed;
+      const speedInput = document.getElementById("wt-speed-select");
+      if (speedInput && (forceDisplay || (typeof document !== "undefined" && document.activeElement !== speedInput))) {
+        speedInput.value = formatWalkthroughSpeed(wtState.speed);
+      }
       updateHudControls();
       if (wtState.playing) {
         scheduleNextTick();
       }
+      return true;
     };
 
     const setFollowCamera = (enabled) => {
@@ -2710,9 +2764,57 @@
         }
       });
 
-      const speedSelect = document.getElementById("wt-speed-select");
-      if (speedSelect) {
-        speedSelect.addEventListener("change", (event) => setSpeed(event.target.value));
+      const speedInput = document.getElementById("wt-speed-select");
+      if (speedInput) {
+        speedInput.value = formatWalkthroughSpeed(wtState.speed);
+        speedInput.addEventListener("wheel", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const next = stepWalkthroughSpeedByWheel(wtState.speed, event.deltaY, Boolean(event.shiftKey));
+          setSpeed(next, { forceDisplay: true });
+          if (typeof document !== "undefined" && document.activeElement === speedInput) {
+            speedInput.value = String(wtState.speed);
+            if (typeof speedInput.select === "function") {
+              speedInput.select();
+            }
+          }
+        }, { passive: false });
+        speedInput.addEventListener("focus", () => {
+          speedInput.value = String(wtState.speed);
+          if (typeof speedInput.select === "function") {
+            speedInput.select();
+          }
+        });
+        speedInput.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.stopPropagation();
+            const parsed = parseWalkthroughSpeedInput(speedInput.value);
+            if (parsed !== null) {
+              setSpeed(parsed, { forceDisplay: true });
+            } else {
+              speedInput.value = formatWalkthroughSpeed(wtState.speed);
+            }
+            if (typeof speedInput.blur === "function") {
+              speedInput.blur();
+            }
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            speedInput.value = formatWalkthroughSpeed(wtState.speed);
+            if (typeof speedInput.blur === "function") {
+              speedInput.blur();
+            }
+          }
+        });
+        speedInput.addEventListener("blur", () => {
+          const parsed = parseWalkthroughSpeedInput(speedInput.value);
+          if (parsed !== null && parsed !== wtState.speed) {
+            setSpeed(parsed, { forceDisplay: true });
+          } else {
+            speedInput.value = formatWalkthroughSpeed(wtState.speed);
+          }
+        });
       }
       applyCodeWrapState();
     };
@@ -2735,6 +2837,7 @@
       setFollowCamera,
       toggleFollowCamera,
       notifyManualPan,
+      runProgrammaticPan,
       setGranularity,
       toggleStepInto,
       toggleCodeWrap,
@@ -2751,8 +2854,14 @@
     WALKTHROUGH_SCHEMA_VERSION,
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_EVENTS,
+    MIN_WALKTHROUGH_SPEED,
+    MAX_WALKTHROUGH_SPEED,
     SPARK_COLORS,
     ACTION_META,
+    clampWalkthroughSpeed,
+    parseWalkthroughSpeedInput,
+    formatWalkthroughSpeed,
+    stepWalkthroughSpeedByWheel,
     StaticWalkthroughGenerator: {
       generate: generateStaticWalkthrough,
       normalizeTrace,
