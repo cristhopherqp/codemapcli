@@ -1849,6 +1849,9 @@
       }
       if (!wtState.active || !cur || !cur.fn_id) {
         box.classList.add("hidden");
+        if (hooks.renderWalkthroughVocab) {
+          hooks.renderWalkthroughVocab(null, null);
+        }
         return;
       }
 
@@ -1861,6 +1864,9 @@
       const showInlineCode = wtState.granularity === "step" || (cur.line && cur.line > 0);
       if (!showInlineCode) {
         box.classList.add("hidden");
+        if (hooks.renderWalkthroughVocab) {
+          hooks.renderWalkthroughVocab(null, null);
+        }
         return;
       }
       box.classList.remove("hidden");
@@ -1877,6 +1883,9 @@
       }
       if (!sourceData || !Array.isArray(sourceData.lines) || sourceData.lines.length === 0) {
         box.classList.add("hidden");
+        if (hooks.renderWalkthroughVocab) {
+          hooks.renderWalkthroughVocab(null, null);
+        }
         return;
       }
 
@@ -1905,11 +1914,13 @@
         const kindCls = cur.kind === "throw" || cur.kind === "catch"
           ? " wt-line-error"
           : (cur.kind === "return" ? " wt-line-return" : "");
-        row.className = `wt-code-row${isActiveLine ? ` active${kindCls}` : ""}`;
+        const hasLineNote = Boolean(hooks.hasLineNote && hooks.hasLineNote(sourceData.file_id, lineObj.number));
+        row.className = `wt-code-row${isActiveLine ? ` active${kindCls}` : ""}${hasLineNote ? " has-line-note" : ""}`;
+        row.dataset.line = String(lineObj.number);
 
         const numSpan = document.createElement("span");
         numSpan.className = "wt-code-lineno";
-        numSpan.textContent = String(lineObj.number);
+        numSpan.textContent = hasLineNote ? `📝${lineObj.number}` : String(lineObj.number);
 
         const textSpan = document.createElement("span");
         textSpan.className = "wt-code-text";
@@ -1924,6 +1935,10 @@
         frag.appendChild(row);
       }
       linesEl.appendChild(frag);
+
+      if (hooks.renderWalkthroughVocab) {
+        hooks.renderWalkthroughVocab(cur, sourceData);
+      }
     };
 
     const applyCurrentEvent = () => {
@@ -2064,6 +2079,11 @@
       if (codeBox) {
         codeBox.classList.add("hidden");
       }
+      const vocabDock = document.getElementById("wt-vocab-dock");
+      if (vocabDock) {
+        vocabDock.replaceChildren();
+        vocabDock.classList.add("hidden");
+      }
     };
 
     const toggle = async (options = {}) => {
@@ -2177,6 +2197,14 @@
       }
     };
 
+    const refreshVocabView = () => {
+      if (!wtState.active) {
+        return;
+      }
+      wtState.lastRenderedCodeKey = "";
+      syncCodeForCurrentEvent();
+    };
+
     const bindDomEvents = () => {
       const bindClick = (id, fn) => {
         const el = document.getElementById(id);
@@ -2235,6 +2263,7 @@
       selectBranchOption,
       onViewportChanged,
       onLiveGraphUpdated,
+      refreshVocabView,
     };
   }
 

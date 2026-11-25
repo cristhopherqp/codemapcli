@@ -26,6 +26,7 @@ from aiohttp import WSMsgType, web
 from codemap.exporter import build_ai_markdown, serialize_ai_graph
 from codemap.known_apis_storage import load_known_apis, update_known_apis
 from codemap.notes_storage import load_notes, update_notes
+from codemap.vocab import load_vocab_dictionary
 from codemap.watcher import start_watcher
 
 VIEWER_DIR = Path(__file__).parent / "viewer"
@@ -144,6 +145,7 @@ def create_app(
     app.router.add_post("/notes.json", handle_post_notes)
     app.router.add_get("/known-apis", handle_get_known_apis)
     app.router.add_post("/known-apis", handle_post_known_apis)
+    app.router.add_get("/vocab-dictionary", handle_get_vocab_dictionary)
     app.router.add_get("/ws", handle_websocket)
     app.router.add_static("/", VIEWER_DIR, show_index=False)
     app.on_shutdown.append(close_websockets)
@@ -287,6 +289,10 @@ async def handle_get_source(request: web.Request) -> web.Response:
         },
         headers=NO_STORE_HEADERS,
     )
+
+
+async def handle_get_vocab_dictionary(_request: web.Request) -> web.Response:
+    return web.json_response(load_vocab_dictionary(), headers=NO_STORE_HEADERS)
 
 
 async def handle_get_notes(request: web.Request) -> web.Response:

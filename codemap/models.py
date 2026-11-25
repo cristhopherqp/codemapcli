@@ -146,6 +146,7 @@ class FunctionInfo:
     is_constructor: bool = False
     calls: list[CallSite] = field(default_factory=list)
     var_refs: list[VarRefSite] = field(default_factory=list)
+    vocab_by_line: dict[int, list[str]] = field(default_factory=dict)
     internal_flow: list[FlowStep] = field(default_factory=list)
     branch_count: int = 0      # if / elif / case ...
     return_count: int = 0

@@ -967,6 +967,12 @@ def build_function_nodes(
                 fn_node["class_name"] = function.class_name
             if function.is_constructor:
                 fn_node["is_constructor"] = True
+            if function.vocab_by_line:
+                fn_node["vocab_by_line"] = {
+                    str(ln): list(ids)
+                    for ln, ids in sorted(function.vocab_by_line.items())
+                    if ids
+                }
             nodes.append(fn_node)
     return nodes
 

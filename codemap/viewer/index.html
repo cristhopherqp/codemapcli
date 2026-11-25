@@ -267,6 +267,7 @@
           </div>
           <div id="wt-code-lines" class="wt-code-lines"></div>
         </div>
+        <div id="wt-vocab-dock" class="vocab-dock hidden" aria-label="Fichas vivas de vocabulario de la línea activa"></div>
       </section>
 
       <div class="details-empty" id="details-empty">
@@ -474,11 +475,11 @@
     </div>
   </div>
 
-  <!-- Modal de Inventario Global de APIs y Aprendizaje -->
-  <div id="apis-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Inventario de APIs y métodos">
+  <!-- Modal de Inventario Global de APIs y Vocabulario -->
+  <div id="apis-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Inventario de APIs y vocabulario técnico">
     <div class="modal-card modal-card-wide">
       <div class="modal-titlebar">
-        <h2>Inventario de APIs y Métodos</h2>
+        <h2>Inventario de APIs y Vocabulario</h2>
         <button id="btn-close-apis" type="button">Cerrar</button>
       </div>
       <div class="apis-toolbar">
@@ -486,11 +487,16 @@
           <button id="tab-apis-pending" class="apis-tab active" type="button" data-tab="pending">Por aprender (0)</button>
           <button id="tab-apis-known" class="apis-tab" type="button" data-tab="known">Aprendidas (0)</button>
         </div>
+        <div class="apis-category-filters" role="group" aria-label="Filtrar por categoría">
+          <button id="filter-apis-all" class="apis-cat-btn active" type="button" data-cat="all">Todos</button>
+          <button id="filter-apis-only" class="apis-cat-btn" type="button" data-cat="apis">APIs</button>
+          <button id="filter-apis-vocab" class="apis-cat-btn" type="button" data-cat="vocab">Sintaxis y SO</button>
+        </div>
         <input
           id="apis-search-input"
           class="search-input apis-search"
           type="text"
-          placeholder="Filtrar por API, método, módulo o tipo…"
+          placeholder="Filtrar por API, operador, POSIX o categoría…"
           autocomplete="off"
         />
       </div>
@@ -604,6 +610,7 @@
     </div>
   </div>
 
+  <script src="./vocab.js"></script>
   <script src="./walkthrough.js"></script>
   <script src="./app.js"></script>
 </body>

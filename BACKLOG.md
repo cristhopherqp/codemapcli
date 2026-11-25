@@ -6,27 +6,6 @@
 
 ---
 
-## Improvements & Refactoring
-
-### Lote 4 — Fichas Vivas de Vocabulario Técnico ("Anki en vivo")
-
-- [ ] **Micro-diccionario estático de sintaxis/SO, contratos `Entrada → Salida` y glosario progresivo que se desvanece:**
-  - *Objetivo:* Reducir la fricción al leer operadores, métodos nativos o códigos del sistema poco familiares durante la inspección, ocultando progresivamente lo que el usuario ya domina a nivel global.
-  - *Solución técnica sugerida:*
-    - **Micro-diccionario estático empaquetado (`codemap/vocab_dictionary.json` + extracción AST en parsers):**
-      - Incluir un diccionario JSON ligero (sin IA ni ejecución) con descripciones concisas de **Entrada → Salida** (qué recibe, qué transforma y qué devuelve en una frase sencilla) para:
-        - Modismos y operadores AST frecuentes de JS/TS y Python (`?.`, `??`, `await`, desestructuración, spread `...`, comprensiones, decoradores, etc.).
-        - Métodos estándar frecuentes (enriqueciendo las entradas de `external_calls`).
-        - Códigos de error POSIX y literales de control habituales (`ENOENT`, `EACCES`, `ECONNREFUSED`, `'\0'`, etc.).
-    - **Enriquecimiento del Inventario Global (`known_apis_storage.py`, `notes_storage.py`):**
-      - Reutilizar `~/.codemap/known_apis.json` para persistir el estado aprendido/pendiente tanto de APIs como de conceptos de sintaxis/SO, preservando retrocompatibilidad con entradas existentes.
-      - Permitir guardar notas/explicaciones personales asociadas a una línea concreta en `~/.codemap/<hash>/notes.json` (análogo a las notas por nodo, sin tocar el repositorio analizado).
-    - **Glosario progresivo en el visor (`app.js`, `styles.css`):**
-      - Al inspeccionar una línea en **Modo Paso a Paso** o en la vista dividida **Flujo y código**, mostrar micro-tarjetas únicamente para los elementos de esa línea aún marcados como **pendientes**.
-      - Incluir en cada tarjeta el botón **`✓ Ya la sé`** (marca el concepto globalmente y lo desvanece en el proyecto actual y futuros) y acceso rápido a editar la nota personal de esa línea.
-
----
-
 ## Under Observation & Edge Cases
 
 - [ ] **[HORIZONTE FUTURO — NO IMPLEMENTAR EN ESTA ITERACIÓN] Trazado Dinámico, RAM y Call Stack Real (`codemap trace`):**

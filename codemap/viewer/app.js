@@ -155,8 +155,9 @@ const LEGACY_PIN_FALLBACK_KEY = {
 
 const state = {
   rawGraph: null,
-  notes: { nodes: {}, orphans: [] },
+  notes: { nodes: {}, orphans: [], line_notes: {} },
   knownApis: { version: 1, known: {} },
+  vocabDict: { version: 1, entries: {} },
   nodesById: new Map(),
   childrenByParent: new Map(),
   flowsById: new Map(),
@@ -207,9 +208,11 @@ const state = {
   traceBranchCandidates: [],
   traceBranchIndex: 0,
   noteSaveTimer: null,
+  recentLineNoteStatus: null,
   searchMatches: [],
   searchActiveIndex: 0,
   apisModalTab: "pending",
+  apisModalCategory: "all",
   apisSearchQuery: "",
   floatingWindows: new Map(),
   floatingWindowByTarget: new Map(),
@@ -230,18 +233,23 @@ const state = {
 
 async function initViewer() {
   state.elk = new ELK();
-  const [graphRes, notesRes, apisRes] = await Promise.all([
+  const [graphRes, notesRes, apisRes, vocabRes] = await Promise.all([
     fetch("/graph.json", { cache: "no-store" }),
     fetch("/notes.json", { cache: "no-store" }),
     fetch("/known-apis", { cache: "no-store" }),
+    fetch("/vocab-dictionary", { cache: "no-store" }),
   ]);
   if (!graphRes.ok) {
     throw new Error(`No se pudo cargar /graph.json (${graphRes.status})`);
   }
 
   state.rawGraph = await graphRes.json();
-  state.notes = notesRes.ok ? await notesRes.json() : { nodes: {}, orphans: [] };
+  state.notes = notesRes.ok ? await notesRes.json() : { nodes: {}, orphans: [], line_notes: {} };
+  if (!state.notes.line_notes || typeof state.notes.line_notes !== "object") {
+    state.notes.line_notes = {};
+  }
   state.knownApis = apisRes.ok ? await apisRes.json() : { version: 1, known: {} };
+  state.vocabDict = vocabRes.ok ? await vocabRes.json() : { version: 1, entries: {} };
   indexGraph(state.rawGraph);
 
   renderHeader(state.rawGraph.meta, state.rawGraph.edges.length);
@@ -285,7 +293,11 @@ function connectWebSocket() {
       await applyLiveUpdate(msg.graph, msg.notes);
     } else if (msg.type === "notes_updated" && msg.notes) {
       state.notes = msg.notes;
+      if (!state.notes.line_notes || typeof state.notes.line_notes !== "object") {
+        state.notes.line_notes = {};
+      }
       updateOrphansBadge();
+      refreshAllVocabViews();
     } else if (msg.type === "known_apis_updated" && msg.known_apis) {
       applyKnownApisState(msg.known_apis);
     }
@@ -313,6 +325,9 @@ async function applyLiveUpdate(newGraph, newNotes) {
   state.rawGraph = newGraph;
   if (newNotes) {
     state.notes = newNotes;
+    if (!state.notes.line_notes || typeof state.notes.line_notes !== "object") {
+      state.notes.line_notes = {};
+    }
   }
   indexGraph(state.rawGraph);
   pruneStaleExpansionState();
@@ -338,6 +353,7 @@ async function applyLiveUpdate(newGraph, newNotes) {
   if (!document.getElementById("apis-modal").classList.contains("hidden")) {
     renderApisModal();
   }
+  refreshAllVocabViews();
   applyCanvasHighlights();
   if (state.walkthrough) {
     await state.walkthrough.onLiveGraphUpdated();
@@ -7858,6 +7874,9 @@ const EXTERNAL_KIND_LABELS = {
   native: "Nativo JS",
   method: "Método",
   package: "Paquete",
+  syntax: "Sintaxis",
+  posix: "POSIX",
+  control: "Control",
 };
 
 function getApiKey(apiItem) {
@@ -7901,12 +7920,38 @@ function getProjectExternalApisMap() {
   return map;
 }
 
+function getProjectInventoryMap() {
+  const map = getProjectExternalApisMap();
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  if (vocabHelper) {
+    for (const [apiId, item] of map.entries()) {
+      const dictEntry = vocabHelper.getDictionaryEntry(state.vocabDict, apiId);
+      if (dictEntry) {
+        item.title = item.title || dictEntry.title || "";
+        item.input = item.input || dictEntry.input || "";
+        item.transform = item.transform || dictEntry.transform || "";
+        item.output = item.output || dictEntry.output || "";
+        if (!item.docs_url && dictEntry.docs_url) {
+          item.docs_url = dictEntry.docs_url;
+        }
+      }
+    }
+    const vocabMap = vocabHelper.collectProjectVocabItems(state.rawGraph, state.vocabDict);
+    for (const [vocabId, vItem] of vocabMap.entries()) {
+      if (!map.has(vocabId)) {
+        map.set(vocabId, vItem);
+      }
+    }
+  }
+  return map;
+}
+
 function updateKnownApisButton() {
   const btn = document.getElementById("btn-known-apis");
   if (!btn) {
     return;
   }
-  const projectApis = getProjectExternalApisMap();
+  const projectApis = getProjectInventoryMap();
   let pendingCount = 0;
   for (const apiId of projectApis.keys()) {
     if (!isApiKnown(apiId)) {
@@ -7923,7 +7968,7 @@ function updateKnownApisButton() {
     badgeEl.textContent = pendingCount > 0 ? String(pendingCount) : "";
     badgeEl.classList.toggle("hidden", pendingCount === 0);
   }
-  btn.title = `APIs (${pendingCount} pendientes / ${knownCount} aprendidas)`;
+  btn.title = `Inventario de APIs y Vocabulario (${pendingCount} pendientes / ${knownCount} aprendidas)`;
 }
 
 function applyKnownApisState(newKnownApis) {
@@ -7936,6 +7981,154 @@ function applyKnownApisState(newKnownApis) {
   if (modal && !modal.classList.contains("hidden")) {
     renderApisModal();
   }
+  refreshAllVocabViews();
+}
+
+function getFloatingLineText(win, lineNumber) {
+  if (!win || !win.sourceData || !Array.isArray(win.sourceData.lines)) {
+    return "";
+  }
+  const found = win.sourceData.lines.find((item) => item.number === lineNumber);
+  return found ? (found.text || "") : "";
+}
+
+function refreshFloatingWindowLineNoteMarkers(win) {
+  if (!win || win.destroyed || !win.codeLinesEl || !win.sourceData) {
+    return;
+  }
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  const fileId = win.sourceData.file_id || "";
+  const rows = win.codeLinesEl.querySelectorAll(".fw-code-line");
+  rows.forEach((row) => {
+    const lineNum = Number(row.dataset.line || "0");
+    const hasNote = Boolean(vocabHelper && vocabHelper.getLineNote(state.notes, fileId, lineNum));
+    row.classList.toggle("has-line-note", hasNote);
+    const numSpan = row.querySelector(".fw-code-lineno");
+    if (numSpan) {
+      numSpan.textContent = hasNote ? `📝${lineNum}` : String(lineNum);
+    }
+  });
+}
+
+function refreshWalkthroughLineNoteMarkers(fileId) {
+  const linesEl = document.getElementById("wt-code-lines");
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  if (!linesEl || !vocabHelper || !fileId) {
+    return;
+  }
+  const rows = linesEl.querySelectorAll(".wt-code-row");
+  rows.forEach((row) => {
+    const lineNum = Number(row.dataset.line || "0");
+    const hasNote = Boolean(vocabHelper.getLineNote(state.notes, fileId, lineNum));
+    row.classList.toggle("has-line-note", hasNote);
+    const numSpan = row.querySelector(".wt-code-lineno");
+    if (numSpan) {
+      numSpan.textContent = hasNote ? `📝${lineNum}` : String(lineNum);
+    }
+  });
+}
+
+function getRecentLineNoteStatus(fileId, line) {
+  const recent = state.recentLineNoteStatus;
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  if (!recent || Date.now() > recent.expiresAt) {
+    return "";
+  }
+  const key = vocabHelper ? vocabHelper.getLineNoteKey(fileId, line) : `${fileId}::${line}`;
+  return recent.key === key ? recent.text : "";
+}
+
+function renderFloatingWindowVocab(win) {
+  if (!win || win.destroyed || !win.vocabDockEl) {
+    return;
+  }
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  if (!vocabHelper || !win.sourceData || !win.activeCodeLine) {
+    win.vocabDockEl.replaceChildren();
+    win.vocabDockEl.classList.add("hidden");
+    return;
+  }
+  const fnNode = state.nodesById.get(win.targetId) || null;
+  const fileId = win.sourceData.file_id || (fnNode && fnNode.parent) || "";
+  vocabHelper.renderVocabDock(
+    win.vocabDockEl,
+    {
+      fnNode,
+      fileId,
+      line: win.activeCodeLine,
+      endLine: win.activeCodeEndLine || win.activeCodeLine,
+      lineText: getFloatingLineText(win, win.activeCodeLine),
+      vocabDict: state.vocabDict,
+      knownApis: state.knownApis,
+      notes: state.notes,
+      statusText: getRecentLineNoteStatus(fileId, win.activeCodeLine),
+    },
+    {
+      onMarkKnown: (item) => setApiKnownStatus(item, true),
+      onSaveLineNote: (fId, ln, text, hash) => saveLineNote(fId, ln, text, hash, { skipContainer: win.vocabDockEl }),
+    },
+  );
+}
+
+function refreshAllVocabViews({ skipContainer = null, updatedFileId = "" } = {}) {
+  for (const win of state.floatingWindows.values()) {
+    if (!win || win.destroyed || !win.isFunctionFlow || !win.sourceData) {
+      continue;
+    }
+    refreshFloatingWindowLineNoteMarkers(win);
+    if (win.vocabDockEl && win.vocabDockEl !== skipContainer) {
+      renderFloatingWindowVocab(win);
+    }
+  }
+  if (state.walkthrough && typeof state.walkthrough.isActive === "function" && state.walkthrough.isActive()) {
+    const wtDock = document.getElementById("wt-vocab-dock");
+    if (wtDock && wtDock === skipContainer) {
+      refreshWalkthroughLineNoteMarkers(updatedFileId);
+    } else if (typeof state.walkthrough.refreshVocabView === "function") {
+      state.walkthrough.refreshVocabView();
+    }
+  }
+}
+
+async function saveLineNote(fileId, line, noteText, lineHash, { skipContainer = null } = {}) {
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  const key = vocabHelper ? vocabHelper.getLineNoteKey(fileId, line) : `${fileId}::${line}`;
+  if (!key) {
+    return null;
+  }
+  const trimmed = String(noteText || "").trim();
+  const entryPayload = trimmed
+    ? {
+        file_id: fileId,
+        line: Number(line),
+        note: trimmed,
+        line_hash: String(lineHash || ""),
+      }
+    : null;
+  const response = await fetch("/notes.json", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      line_notes: {
+        [key]: entryPayload,
+      },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`No se pudo guardar nota de línea (${response.status})`);
+  }
+  const updated = await response.json();
+  state.notes = updated;
+  if (!state.notes.line_notes || typeof state.notes.line_notes !== "object") {
+    state.notes.line_notes = {};
+  }
+  state.recentLineNoteStatus = {
+    key,
+    text: trimmed ? "Guardada ✓" : "Borrada",
+    expiresAt: Date.now() + 2500,
+  };
+  refreshAllVocabViews({ skipContainer, updatedFileId: fileId });
+  return updated;
 }
 
 async function setApiKnownStatus(apiItem, markKnown) {
@@ -8359,8 +8552,14 @@ function switchApisTab(tabName) {
   renderApisModal();
 }
 
+function switchApisCategory(category) {
+  state.apisModalCategory = category === "apis" || category === "vocab" ? category : "all";
+  renderApisModal();
+}
+
 function renderApisModal() {
-  const projectMap = getProjectExternalApisMap();
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
+  const projectMap = getProjectInventoryMap();
   const knownMap = (state.knownApis && state.knownApis.known) || {};
 
   const pendingItems = [];
@@ -8371,11 +8570,19 @@ function renderApisModal() {
   }
   pendingItems.sort((a, b) => (b.usageCount - a.usageCount) || a.symbol.localeCompare(b.symbol));
 
-  const knownItems = Object.values(knownMap).map((entry) => ({
-    ...entry,
-    inCurrentProject: projectMap.has(entry.api_id),
-    usageCount: projectMap.has(entry.api_id) ? projectMap.get(entry.api_id).usageCount : 0,
-  }));
+  const knownItems = Object.values(knownMap).map((entry) => {
+    const dictEntry = vocabHelper ? vocabHelper.getDictionaryEntry(state.vocabDict, entry.api_id) : null;
+    return {
+      ...entry,
+      title: (dictEntry && dictEntry.title) || "",
+      input: (dictEntry && dictEntry.input) || "",
+      transform: (dictEntry && dictEntry.transform) || "",
+      output: (dictEntry && dictEntry.output) || "",
+      docs_url: entry.docs_url || (dictEntry && dictEntry.docs_url) || "",
+      inCurrentProject: projectMap.has(entry.api_id),
+      usageCount: projectMap.has(entry.api_id) ? projectMap.get(entry.api_id).usageCount : 0,
+    };
+  });
   knownItems.sort((a, b) => Number(b.inCurrentProject) - Number(a.inCurrentProject) || a.symbol.localeCompare(b.symbol));
 
   document.getElementById("tab-apis-pending").textContent = `Por aprender (${pendingItems.length})`;
@@ -8383,31 +8590,48 @@ function renderApisModal() {
   document.getElementById("tab-apis-pending").classList.toggle("active", state.apisModalTab === "pending");
   document.getElementById("tab-apis-known").classList.toggle("active", state.apisModalTab === "known");
 
+  const catAllBtn = document.getElementById("filter-apis-all");
+  const catApisBtn = document.getElementById("filter-apis-only");
+  const catVocabBtn = document.getElementById("filter-apis-vocab");
+  if (catAllBtn) catAllBtn.classList.toggle("active", state.apisModalCategory === "all");
+  if (catApisBtn) catApisBtn.classList.toggle("active", state.apisModalCategory === "apis");
+  if (catVocabBtn) catVocabBtn.classList.toggle("active", state.apisModalCategory === "vocab");
+
   const query = (state.apisSearchQuery || "").trim().toLowerCase();
   const sourceList = state.apisModalTab === "pending" ? pendingItems : knownItems;
   const filtered = sourceList.filter((item) => {
+    if (state.apisModalCategory !== "all") {
+      const isVocab = vocabHelper ? vocabHelper.isVocabConcept(item.api_id, item.kind) : false;
+      if (state.apisModalCategory === "vocab" && !isVocab) {
+        return false;
+      }
+      if (state.apisModalCategory === "apis" && isVocab) {
+        return false;
+      }
+    }
     if (!query) {
       return true;
     }
-    const haystack = `${item.symbol} ${item.module || ""} ${item.kind || ""} ${item.call_expr || ""}`.toLowerCase();
+    const haystack = `${item.symbol} ${item.title || ""} ${item.module || ""} ${item.kind || ""} ${item.call_expr || ""} ${item.input || ""} ${item.output || ""}`.toLowerCase();
     return haystack.includes(query);
   });
 
   const hint = document.getElementById("apis-summary-hint");
   if (state.apisModalTab === "pending") {
     hint.textContent = pendingItems.length === 0
-      ? "No quedan APIs o métodos pendientes en este proyecto."
-      : `Mostrando ${filtered.length} de ${pendingItems.length} APIs pendientes en este proyecto.`;
+      ? "No quedan APIs ni conceptos de vocabulario pendientes en este proyecto."
+      : `Mostrando ${filtered.length} de ${pendingItems.length} conceptos pendientes en este proyecto.`;
   } else {
     hint.textContent = knownItems.length === 0
-      ? "Aún no has marcado ninguna API en ~/.codemap/known_apis.json."
-      : `Inventario global compartido (~/.codemap/known_apis.json): ${filtered.length} de ${knownItems.length} aprendidas.`;
+      ? "Aún no has marcado ninguna API ni concepto en ~/.codemap/known_apis.json."
+      : `Inventario global compartido (~/.codemap/known_apis.json): ${filtered.length} de ${knownItems.length} aprendidos.`;
   }
 
   const list = document.getElementById("apis-list");
-  list.innerHTML = "";
+  list.replaceChildren();
 
   for (const item of filtered) {
+    const isVocab = vocabHelper ? vocabHelper.isVocabConcept(item.api_id, item.kind) : false;
     const li = document.createElement("li");
     li.className = "orphan-card";
 
@@ -8416,7 +8640,9 @@ function renderApisModal() {
 
     const name = document.createElement("span");
     name.className = "call-name";
-    name.textContent = `${item.symbol}()`;
+    name.textContent = isVocab
+      ? (item.title ? `${item.symbol} — ${item.title}` : item.symbol)
+      : `${item.symbol}()`;
     header.appendChild(name);
 
     const origin = document.createElement("span");
@@ -8425,11 +8651,25 @@ function renderApisModal() {
     header.appendChild(origin);
     li.appendChild(header);
 
+    if (item.input || item.output) {
+      const contractSummary = document.createElement("div");
+      contractSummary.className = "apis-contract-summary";
+      const parts = [];
+      if (item.input) {
+        parts.push(`Entrada: ${item.input}`);
+      }
+      if (item.output) {
+        parts.push(`Salida: ${item.output}`);
+      }
+      contractSummary.textContent = parts.join("  →  ");
+      li.appendChild(contractSummary);
+    }
+
     const meta = document.createElement("div");
     meta.className = "orphan-meta";
     meta.textContent = state.apisModalTab === "pending"
-      ? `Detectada en ${item.usageCount} ${item.usageCount === 1 ? "función" : "funciones"}`
-      : `Marcada el ${(item.marked_at || "").slice(0, 10) || "—"}${item.inCurrentProject ? ` · ${item.usageCount} usos en este proyecto` : ""}`;
+      ? `Detectado en ${item.usageCount} ${item.usageCount === 1 ? "función" : "funciones"}`
+      : `Marcado el ${(item.marked_at || "").slice(0, 10) || "—"}${item.inCurrentProject ? ` · ${item.usageCount} usos en este proyecto` : ""}`;
     li.appendChild(meta);
 
     const actions = document.createElement("div");
@@ -8461,7 +8701,7 @@ function renderApisModal() {
     toggleBtn.type = "button";
     if (state.apisModalTab === "pending") {
       toggleBtn.className = "call-action-btn known-api-btn";
-      toggleBtn.textContent = "✓ Marcar como aprendida";
+      toggleBtn.textContent = "✓ Ya la sé";
       toggleBtn.addEventListener("click", () => setApiKnownStatus(item, true));
     } else {
       toggleBtn.className = "call-action-btn api-unmark-btn";
@@ -9243,6 +9483,18 @@ function bindControls() {
 
   document.getElementById("tab-apis-pending").addEventListener("click", () => switchApisTab("pending"));
   document.getElementById("tab-apis-known").addEventListener("click", () => switchApisTab("known"));
+  const filterApisAllBtn = document.getElementById("filter-apis-all");
+  if (filterApisAllBtn) {
+    filterApisAllBtn.addEventListener("click", () => switchApisCategory("all"));
+  }
+  const filterApisOnlyBtn = document.getElementById("filter-apis-only");
+  if (filterApisOnlyBtn) {
+    filterApisOnlyBtn.addEventListener("click", () => switchApisCategory("apis"));
+  }
+  const filterApisVocabBtn = document.getElementById("filter-apis-vocab");
+  if (filterApisVocabBtn) {
+    filterApisVocabBtn.addEventListener("click", () => switchApisCategory("vocab"));
+  }
   document.getElementById("apis-search-input").addEventListener("input", (event) => {
     state.apisSearchQuery = event.target.value || "";
     renderApisModal();
@@ -10484,6 +10736,7 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
   let zoomInBtn = null;
   let copyCodeBtn = null;
   let codeLinesEl = null;
+  let vocabDockEl = null;
   if (subgraph.isFunctionFlow) {
     splitResizerEl = document.createElement("div");
     splitResizerEl.className = "fw-split-resizer";
@@ -10563,6 +10816,12 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     codeScroll.appendChild(codeLinesEl);
     codePaneEl.appendChild(codeToolbar);
     codePaneEl.appendChild(codeScroll);
+
+    vocabDockEl = document.createElement("div");
+    vocabDockEl.className = "vocab-dock fw-vocab-dock hidden";
+    vocabDockEl.setAttribute("aria-label", "Fichas vivas de vocabulario y notas por línea");
+    codePaneEl.appendChild(vocabDockEl);
+
     bodyEl.appendChild(codePaneEl);
   }
 
@@ -10609,6 +10868,7 @@ function createFloatingWindowElement(winId, targetNode, parentWin, initialRect, 
     zoomInBtn,
     copyCodeBtn,
     codeLinesEl,
+    vocabDockEl,
     statsEl,
     hintEl,
   };
@@ -10725,7 +10985,7 @@ function findBestFlowStepForLine(fnId, lineNum) {
   return matching[0];
 }
 
-function highlightFloatingCodeForStep(win, stepId, { scroll = true } = {}) {
+function highlightFloatingCodeForStep(win, stepId, { scroll = true, skipVocab = false } = {}) {
   if (!win || win.destroyed || !win.codeLinesEl) {
     return;
   }
@@ -10753,6 +11013,11 @@ function highlightFloatingCodeForStep(win, stepId, { scroll = true } = {}) {
   if (scroll && firstMatch && typeof firstMatch.scrollIntoView === "function") {
     firstMatch.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+  if (!skipVocab) {
+    win.activeCodeLine = range.startLine;
+    win.activeCodeEndLine = range.endLine;
+    renderFloatingWindowVocab(win);
+  }
 }
 
 function renderFloatingWindowSource(win, sourceData) {
@@ -10766,6 +11031,7 @@ function renderFloatingWindowSource(win, sourceData) {
     empty.className = "fw-code-status";
     empty.textContent = "Sin código fuente disponible.";
     win.codeLinesEl.appendChild(empty);
+    renderFloatingWindowVocab(win);
     return;
   }
 
@@ -10776,15 +11042,17 @@ function renderFloatingWindowSource(win, sourceData) {
     win.codeMetaEl.title = `${sourceData.file_id || ""} (líneas ${sourceData.start_line}-${sourceData.end_line})`;
   }
 
+  const vocabHelper = typeof window !== "undefined" ? window.CodeMapVocab : null;
   const fragment = document.createDocumentFragment();
   for (const lineObj of sourceData.lines) {
     const row = document.createElement("div");
-    row.className = "fw-code-line";
+    const hasLineNote = Boolean(vocabHelper && vocabHelper.getLineNote(state.notes, sourceData.file_id, lineObj.number));
+    row.className = hasLineNote ? "fw-code-line has-line-note" : "fw-code-line";
     row.dataset.line = String(lineObj.number);
 
     const numSpan = document.createElement("span");
     numSpan.className = "fw-code-lineno";
-    numSpan.textContent = String(lineObj.number);
+    numSpan.textContent = hasLineNote ? `📝${lineObj.number}` : String(lineObj.number);
 
     const textSpan = document.createElement("span");
     textSpan.className = "fw-code-text";
@@ -10802,7 +11070,7 @@ function renderFloatingWindowSource(win, sourceData) {
       if (matchedStep) {
         win.selectedStepId = matchedStep.id;
         selectNode(win.targetId, matchedStep.id);
-        highlightFloatingCodeForStep(win, matchedStep.id, { scroll: false });
+        highlightFloatingCodeForStep(win, matchedStep.id, { scroll: false, skipVocab: true });
         if (win.viewMode === "split" && win.cy) {
           const cyStep = win.cy.getElementById(`${win.targetId}::${matchedStep.id}`);
           if (cyStep && cyStep.length > 0) {
@@ -10813,6 +11081,9 @@ function renderFloatingWindowSource(win, sourceData) {
         win.codeLinesEl.querySelectorAll(".fw-code-line").forEach((el) => el.classList.remove("highlighted-step"));
         row.classList.add("highlighted-step");
       }
+      win.activeCodeLine = lineObj.number;
+      win.activeCodeEndLine = lineObj.number;
+      renderFloatingWindowVocab(win);
     });
 
     fragment.appendChild(row);
@@ -10821,6 +11092,27 @@ function renderFloatingWindowSource(win, sourceData) {
 
   if (win.selectedStepId) {
     highlightFloatingCodeForStep(win, win.selectedStepId, { scroll: true });
+  } else {
+    const fnNode = state.nodesById.get(win.targetId) || null;
+    let initialLine = sourceData.start_line || 0;
+    if (vocabHelper && fnNode) {
+      for (const lineObj of sourceData.lines) {
+        const items = vocabHelper.collectLineVocabItems(
+          fnNode,
+          lineObj.number,
+          lineObj.number,
+          state.vocabDict,
+          state.knownApis,
+        );
+        if (items.length > 0) {
+          initialLine = lineObj.number;
+          break;
+        }
+      }
+    }
+    win.activeCodeLine = initialLine;
+    win.activeCodeEndLine = initialLine;
+    renderFloatingWindowVocab(win);
   }
 }
 
@@ -11264,6 +11556,9 @@ async function openFloatingWindow(
     zoomInBtn: dom.zoomInBtn,
     copyCodeBtn: dom.copyCodeBtn,
     codeLinesEl: dom.codeLinesEl,
+    vocabDockEl: dom.vocabDockEl,
+    activeCodeLine: 0,
+    activeCodeEndLine: 0,
     statsEl: dom.statsEl,
     hintEl: dom.hintEl,
     cy: subCy,
@@ -11975,6 +12270,9 @@ function highlightFloatingCodeLineRange(win, startLine, endLine, { scroll = true
   if (scroll && firstMatch && typeof firstMatch.scrollIntoView === "function") {
     firstMatch.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+  win.activeCodeLine = startLine;
+  win.activeCodeEndLine = hiEnd;
+  renderFloatingWindowVocab(win);
 }
 
 function initWalkthroughController() {
@@ -12007,6 +12305,44 @@ function initWalkthroughController() {
     getFloatingWindows: () => Array.from(state.floatingWindows.values()),
     highlightCodeTokens: (parentEl, lineText, language) => {
       appendHighlightedCodeTokens(parentEl, lineText, language);
+    },
+    hasLineNote: (fileId, lineNumber) => Boolean(
+      window.CodeMapVocab && window.CodeMapVocab.getLineNote(state.notes, fileId, lineNumber)
+    ),
+    renderWalkthroughVocab: (cur, sourceData) => {
+      const dock = document.getElementById("wt-vocab-dock");
+      if (!dock || !window.CodeMapVocab) {
+        return;
+      }
+      if (!cur || !cur.fn_id || !sourceData) {
+        dock.replaceChildren();
+        dock.classList.add("hidden");
+        return;
+      }
+      const fnNode = state.nodesById.get(cur.fn_id) || null;
+      const line = cur.line > 0 ? cur.line : (sourceData.start_line || 0);
+      const endLine = cur.end_line && cur.end_line >= line ? cur.end_line : line;
+      const lineObj = Array.isArray(sourceData.lines)
+        ? sourceData.lines.find((item) => item.number === line)
+        : null;
+      window.CodeMapVocab.renderVocabDock(
+        dock,
+        {
+          fnNode,
+          fileId: sourceData.file_id || (fnNode && fnNode.parent) || "",
+          line,
+          endLine,
+          lineText: lineObj ? lineObj.text : "",
+          vocabDict: state.vocabDict,
+          knownApis: state.knownApis,
+          notes: state.notes,
+          statusText: getRecentLineNoteStatus(sourceData.file_id || (fnNode && fnNode.parent) || "", line),
+        },
+        {
+          onMarkKnown: (item) => setApiKnownStatus(item, true),
+          onSaveLineNote: (fId, ln, text, hash) => saveLineNote(fId, ln, text, hash, { skipContainer: dock }),
+        },
+      );
     },
     prepareCanvasForTrace: async (trace) => {
       if (!trace || !Array.isArray(trace.events) || trace.events.length === 0) {

@@ -22,4 +22,4 @@ codemap = "codemap.cli:main"
 include = ["codemap*"]
 
 [tool.setuptools.package-data]
-codemap = ["viewer/*.html", "viewer/*.css", "viewer/*.js", "viewer/vendor/*.js"]
+codemap = ["*.json", "viewer/*.html", "viewer/*.css", "viewer/*.js", "viewer/vendor/*.js"]

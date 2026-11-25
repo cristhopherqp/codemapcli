@@ -13,6 +13,7 @@ from tree_sitter import Node
 
 from codemap.fingerprint import compute_fingerprint
 from codemap.languages import get_parser
+from codemap.vocab import extract_python_vocab_by_line
 from codemap.models import (
     EDGE_CALLBACK_REF,
     EDGE_DIRECT_CALL,
@@ -739,6 +740,7 @@ def build_function(
         param_count=len(params),
         calls=calls,
         var_refs=collect_python_var_refs(node, source, function_nodes),
+        vocab_by_line=extract_python_vocab_by_line(node, source, function_nodes),
         internal_flow=build_flow(
             params,
             body,

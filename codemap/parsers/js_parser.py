@@ -14,6 +14,7 @@ from tree_sitter import Node
 
 from codemap.fingerprint import compute_fingerprint
 from codemap.languages import get_parser
+from codemap.vocab import extract_js_vocab_by_line
 from codemap.models import (
     EDGE_DIRECT_CALL,
     EDGE_EVENT_LISTENER,
@@ -1102,6 +1103,7 @@ def build_function(
         param_count=len(params),
         calls=calls,
         var_refs=collect_js_var_refs(node, source, functions),
+        vocab_by_line=extract_js_vocab_by_line(node, source, functions),
         internal_flow=build_flow(
             params,
             body,

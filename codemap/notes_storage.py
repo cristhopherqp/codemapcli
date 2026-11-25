@@ -119,24 +119,88 @@ def has_user_content(entry: dict) -> bool:
     )
 
 
+def _parse_line_note_key(key: str) -> tuple[str, int] | None:
+    if not isinstance(key, str) or "::" not in key:
+        return None
+    file_part, line_part = key.rsplit("::", 1)
+    file_part = file_part.strip()
+    if not file_part or not line_part.isdigit():
+        return None
+    line_num = int(line_part)
+    return (file_part, line_num) if line_num > 0 else None
+
+
+def normalize_line_note_entry(key: str, raw: object) -> tuple[str, dict] | None:
+    """Normaliza una nota personal por línea (`file_id::line`) descartando notas vacías."""
+    parsed = _parse_line_note_key(key)
+    if isinstance(raw, str):
+        note_text = raw.strip()
+        if not note_text or parsed is None:
+            return None
+        file_id, line_num = parsed
+        return f"{file_id}::{line_num}", {
+            "file_id": file_id,
+            "line": line_num,
+            "note": note_text,
+            "line_hash": "",
+            "updated_at": _utc_now_iso(),
+        }
+    if not isinstance(raw, dict):
+        return None
+    note_text = str(raw.get("note") or "").strip()
+    if not note_text:
+        return None
+    file_id = str(raw.get("file_id") or (parsed[0] if parsed else "")).strip()
+    raw_line = raw.get("line")
+    if isinstance(raw_line, bool) or not isinstance(raw_line, int) or raw_line <= 0:
+        line_num = parsed[1] if parsed else 0
+    else:
+        line_num = raw_line
+    if not file_id or line_num <= 0:
+        return None
+    line_hash = str(raw.get("line_hash") or "").strip()[:32]
+    updated_at = str(raw.get("updated_at") or _utc_now_iso()).strip()
+    canonical_key = f"{file_id}::{line_num}"
+    return canonical_key, {
+        "file_id": file_id,
+        "line": line_num,
+        "note": note_text,
+        "line_hash": line_hash,
+        "updated_at": updated_at,
+    }
+
+
+def _normalize_line_notes_map(raw_line_notes: object) -> dict[str, dict]:
+    if not isinstance(raw_line_notes, dict):
+        return {}
+    clean: dict[str, dict] = {}
+    for key, val in raw_line_notes.items():
+        normalized = normalize_line_note_entry(str(key), val)
+        if normalized is not None:
+            clean[normalized[0]] = normalized[1]
+    return clean
+
+
 def load_notes(target_path: str) -> dict:
     """Carga notes.json o devuelve la estructura vacía si aún no existe."""
     path = notes_path(target_path)
     if not path.is_file():
-        return {"nodes": {}, "orphans": []}
+        return {"nodes": {}, "orphans": [], "line_notes": {}}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"nodes": {}, "orphans": []}
+        return {"nodes": {}, "orphans": [], "line_notes": {}}
 
     raw_nodes = raw.get("nodes") if isinstance(raw, dict) else {}
     raw_orphans = raw.get("orphans") if isinstance(raw, dict) else []
+    raw_line_notes = raw.get("line_notes") if isinstance(raw, dict) else {}
     nodes = {
         node_id: normalize_node_entry(entry)
         for node_id, entry in (raw_nodes or {}).items()
     }
     orphans = list(raw_orphans) if isinstance(raw_orphans, list) else []
-    return {"nodes": nodes, "orphans": orphans}
+    line_notes = _normalize_line_notes_map(raw_line_notes)
+    return {"nodes": nodes, "orphans": orphans, "line_notes": line_notes}
 
 
 def save_notes(target_path: str, notes: dict) -> Path:
@@ -149,6 +213,7 @@ def save_notes(target_path: str, notes: dict) -> Path:
                 for node_id, entry in notes.get("nodes", {}).items()
             },
             "orphans": list(notes.get("orphans", [])),
+            "line_notes": _normalize_line_notes_map(notes.get("line_notes", {})),
         }
         atomic_write_text(path, json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
@@ -233,6 +298,19 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
                 if fp:
                     entry["last_fingerprint"] = fp
 
+        # Conservar únicamente `line_notes` de archivos aún vigentes en el grafo.
+        line_notes_map: dict[str, dict] = notes.setdefault("line_notes", {})
+        valid_file_ids = {
+            n["id"] for n in graph.get("nodes", []) if isinstance(n, dict) and n.get("type") == "file"
+        }
+        line_notes_changed = False
+        if valid_file_ids and line_notes_map:
+            for lk in list(line_notes_map):
+                entry = line_notes_map[lk]
+                if entry.get("file_id") not in valid_file_ids or not entry.get("note", "").strip():
+                    line_notes_map.pop(lk, None)
+                    line_notes_changed = True
+
         missing_ids = [
             node_id
             for node_id in list(nodes_map)
@@ -241,6 +319,8 @@ def reconcile_notes(target_path: str, graph: dict) -> dict:
             and not _is_layer_container_id(node_id)
         ]
         if not missing_ids:
+            if line_notes_changed:
+                save_notes(target_path, notes)
             return notes
 
         candidates = _new_functions_by_key(graph_nodes, set(nodes_map))
@@ -339,6 +419,23 @@ def update_notes(target_path: str, payload: dict, graph: dict) -> dict:
 
         if isinstance(payload.get("orphans"), list):
             notes["orphans"] = payload["orphans"]
+
+        if isinstance(payload.get("line_notes"), dict):
+            line_notes_map: dict[str, dict] = notes.setdefault("line_notes", {})
+            for raw_key, raw_val in payload["line_notes"].items():
+                key_str = str(raw_key)
+                if raw_val in (None, False, ""):
+                    line_notes_map.pop(key_str, None)
+                    continue
+                normalized_ln = normalize_line_note_entry(key_str, raw_val)
+                if normalized_ln is None:
+                    line_notes_map.pop(key_str, None)
+                else:
+                    canonical_key, clean_entry = normalized_ln
+                    clean_entry["updated_at"] = _utc_now_iso()
+                    if canonical_key != key_str:
+                        line_notes_map.pop(key_str, None)
+                    line_notes_map[canonical_key] = clean_entry
 
         save_notes(target_path, notes)
         return notes
