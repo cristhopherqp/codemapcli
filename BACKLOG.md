@@ -8,26 +8,6 @@
 
 ## Improvements & Refactoring
 
-### Lote 3 — Recorrido Visual Estático (*Static Walkthrough* / Debug Visual)
-
-- [ ] **Reproductor de Recorrido Visual Estático con partícula "Chispa", Call Stack simulado y contrato desacoplado:**
-  - *Objetivo:* Animar el viaje del control y los datos a través del grafo y del código línea por línea de forma 100 % estática (sin ejecutar el proyecto analizado).
-  - *Arquitectura y contrato de eventos:*
-    - Definir un formato estándar desacoplado de secuencia de pasos (`{ seq, kind, from, to, fn_id, step_id, edge_id, line, end_line, label, branch_kind, ... }`) que hoy produzca un generador estático a partir de `graph.json` (`edges`, `execution_flows`, `internal_flow`, `line`), pero que el reproductor consuma de forma agnóstica para soportar trazas dinámicas reales en el futuro sin reescribir la UI.
-  - *Motor visual de partículas (`<canvas>` superpuesto):*
-    - Superponer un `<canvas>` transparente (`pointer-events: none`) sincronizado con `cy.pan()`, `cy.zoom()` y `requestAnimationFrame` sin crear nodos temporales ni provocar recálculos de ELKjs.
-    - Interpolar la posición de la partícula sobre la polilínea ortogonal exacta de las aristas (`.elk-routed` `segments` / `taxi`), respetando sus ángulos de 90°.
-  - *Semántica de movimiento y ramificaciones:*
-    - **Llamada (`call`):** Chispa de ida (cian) desde la función llamadora hacia la invocada.
-    - **Retorno (`return`):** Chispa de vuelta (verde o ámbar) regresando desde la invocada hacia la llamadora para reflejar el desapilado antes de avanzar a la siguiente sentencia.
-    - **Ramas condicionales y error (`if` / `switch` / `throw` / `try-catch`):** Seguir el camino principal por defecto emitiendo un destello rojo breve hacia las ramas de error/guardas evaluadas, con control interactivo para alternar manualmente hacia una rama alternativa o simular el camino de excepción.
-  - *Controles y dos modos de reproducción:*
-    - Barra compacta flotante: `Play / Pause`, `← Paso atrás`, `→ Paso adelante`, selector de velocidad ("ciclos de reloj") y toggle `Profundizar en hijas` (*Step Into / Step Over*).
-    - **Modo Pulso (Nivel 3):** Saltos de función a función a ritmo constante + vista de **Call Stack simulado** en el Inspector que apila y desapila funciones activas en vivo.
-    - **Modo Paso a Paso (Nivel 3+):** Avance instrucción por instrucción sincronizado con el visor de código (`GET /source`) + tarjeta flotante breve junto al nodo activo resumiendo la acción actual (asignación, comprobación, llamada o retorno).
-
----
-
 ### Lote 4 — Fichas Vivas de Vocabulario Técnico ("Anki en vivo")
 
 - [ ] **Micro-diccionario estático de sintaxis/SO, contratos `Entrada → Salida` y glosario progresivo que se desvanece:**

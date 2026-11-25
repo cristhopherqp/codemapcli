@@ -218,6 +218,7 @@ const state = {
   windowIdCounter: 0,
   windowZCounter: 30,
   bridgeRenderRaf: null,
+  walkthrough: null,
   ws: null,
   cy: null,
   elk: null,
@@ -252,6 +253,7 @@ async function initViewer() {
   updateLayoutOrderButton();
   initCytoscape();
   bindControls();
+  initWalkthroughController();
   connectWebSocket();
 
   const totalFuncs = (state.rawGraph.meta && state.rawGraph.meta.total_functions) || 0;
@@ -337,6 +339,9 @@ async function applyLiveUpdate(newGraph, newNotes) {
     renderApisModal();
   }
   applyCanvasHighlights();
+  if (state.walkthrough) {
+    await state.walkthrough.onLiveGraphUpdated();
+  }
 }
 
 function pruneStaleExpansionState() {
@@ -2480,6 +2485,11 @@ function initCytoscape() {
   state.mainTooltipCleanup = bindNodeDocstringTooltip(state.cy, document.getElementById("canvas-area"));
   bindCanvasPanControls();
   state.cy.on("zoom", updateZoomIndicator);
+  state.cy.on("pan zoom resize", () => {
+    if (state.walkthrough) {
+      state.walkthrough.onViewportChanged();
+    }
+  });
 }
 
 const NODE_TOOLTIP_DELAY_MS = 1000;
@@ -9486,6 +9496,10 @@ function bindGlobalShortcuts() {
       if (closeMostRecentLeafFloatingWindow()) {
         return;
       }
+      if (state.walkthrough && state.walkthrough.isActive()) {
+        state.walkthrough.stop();
+        return;
+      }
       if (state.traceMode) {
         toggleTraceMode();
         return;
@@ -9539,6 +9553,10 @@ function bindGlobalShortcuts() {
       refreshGraphView({ fit: false });
     } else if (key === "t" && !event.ctrlKey && !event.metaKey) {
       toggleTraceMode();
+    } else if (key === "w" && !event.ctrlKey && !event.metaKey) {
+      if (state.walkthrough) {
+        state.walkthrough.toggle({ autoPlay: false });
+      }
     } else if (key === "f" && !event.ctrlKey && !event.metaKey) {
       fitGraphToScreen();
     } else if (event.key === "]" && !event.ctrlKey && !event.metaKey) {
@@ -9570,10 +9588,18 @@ function bindGlobalShortcuts() {
       confirmTraceBranch();
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      stepTrace("forward");
+      if (state.walkthrough && state.walkthrough.isActive() && !state.traceMode) {
+        state.walkthrough.stepForward();
+      } else {
+        stepTrace("forward");
+      }
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
-      stepTrace("backward");
+      if (state.walkthrough && state.walkthrough.isActive() && !state.traceMode) {
+        state.walkthrough.stepBackward();
+      } else {
+        stepTrace("backward");
+      }
     }
   });
 
@@ -11920,6 +11946,166 @@ function renderFloatingBridges() {
     const p2 = getNodeAnchorInArea(winB, null, toSide, areaRect);
     appendSvgBridgeCurve(svg, p1, p2, "parent_child", fromSide, toSide);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ciclo 8: Integración del Recorrido Visual Estático ("Chispa")
+// ---------------------------------------------------------------------------
+
+function highlightFloatingCodeLineRange(win, startLine, endLine, { scroll = true } = {}) {
+  if (!win || win.destroyed || !win.codeLinesEl) {
+    return;
+  }
+  const rows = win.codeLinesEl.querySelectorAll(".fw-code-line");
+  rows.forEach((row) => row.classList.remove("highlighted-step"));
+  if (!startLine || startLine <= 0) {
+    return;
+  }
+  const hiEnd = endLine && endLine >= startLine ? endLine : startLine;
+  let firstMatch = null;
+  rows.forEach((row) => {
+    const lineNum = Number(row.dataset.line || "0");
+    if (lineNum >= startLine && lineNum <= hiEnd) {
+      row.classList.add("highlighted-step");
+      if (!firstMatch) {
+        firstMatch = row;
+      }
+    }
+  });
+  if (scroll && firstMatch && typeof firstMatch.scrollIntoView === "function") {
+    firstMatch.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+function initWalkthroughController() {
+  if (typeof window === "undefined" || !window.CodeMapWalkthrough) {
+    return;
+  }
+  const ensureAncestorsOpen = (nodeId) => {
+    let changed = false;
+    let cur = state.nodesById.get(nodeId);
+    while (cur && cur.parent) {
+      if (state.collapsedContainers.delete(cur.parent)) {
+        changed = true;
+      }
+      cur = state.nodesById.get(cur.parent);
+    }
+    return changed;
+  };
+
+  state.walkthrough = window.CodeMapWalkthrough.createController({
+    getCy: () => state.cy,
+    getRawGraph: () => state.rawGraph,
+    getNodesById: () => state.nodesById,
+    getActiveFlowId: () => state.activeFlowId,
+    getPreferredRootId: () => {
+      if (state.selectedNodeId && state.nodesById.has(state.selectedNodeId)) {
+        return state.selectedNodeId;
+      }
+      return null;
+    },
+    getFloatingWindows: () => Array.from(state.floatingWindows.values()),
+    highlightCodeTokens: (parentEl, lineText, language) => {
+      appendHighlightedCodeTokens(parentEl, lineText, language);
+    },
+    prepareCanvasForTrace: async (trace) => {
+      if (!trace || !Array.isArray(trace.events) || trace.events.length === 0) {
+        return;
+      }
+      let needsRefresh = false;
+
+      // En Modo Pulso (N3) o Paso a Paso (N3+), aseguramos funciones visibles (>= Nivel 3).
+      if (state.activeLevel < 3) {
+        state.activeLevel = 3;
+        updateLevelButtons(3);
+        state.collapsedContainers.clear();
+        needsRefresh = true;
+      }
+
+      if (trace.granularity === "step") {
+        const fnIds = [];
+        const seen = new Set();
+        for (const ev of trace.events) {
+          if (ev.fn_id && !seen.has(ev.fn_id)) {
+            seen.add(ev.fn_id);
+            const rawFn = state.nodesById.get(ev.fn_id);
+            if (rawFn && rawFn.type === "function" && Array.isArray(rawFn.internal_flow) && rawFn.internal_flow.length > 0) {
+              fnIds.push(ev.fn_id);
+              if (fnIds.length >= 8) {
+                break;
+              }
+            }
+          }
+        }
+        for (const fid of fnIds) {
+          if (ensureAncestorsOpen(fid)) {
+            needsRefresh = true;
+          }
+          if (!state.expandedFunctions.has(fid)) {
+            state.expandedFunctions.add(fid);
+            needsRefresh = true;
+          }
+        }
+      } else {
+        for (const ev of trace.events) {
+          if (ev.fn_id && ensureAncestorsOpen(ev.fn_id)) {
+            needsRefresh = true;
+          }
+        }
+      }
+
+      if (needsRefresh) {
+        await refreshGraphView({ fit: false });
+      }
+    },
+    syncFloatingCodeForEvent: (ev) => {
+      if (!ev || !ev.fn_id) {
+        return;
+      }
+      const winId = state.floatingWindowByTarget.get(ev.fn_id);
+      if (!winId) {
+        return;
+      }
+      const win = state.floatingWindows.get(winId);
+      if (!win || win.destroyed || !win.isFunctionFlow) {
+        return;
+      }
+      if (ev.step_id) {
+        win.selectedStepId = ev.step_id;
+      }
+      if (win.viewMode === "code" || win.viewMode === "split") {
+        if (ev.line && ev.line > 0) {
+          highlightFloatingCodeLineRange(win, ev.line, ev.end_line || ev.line, { scroll: true });
+        } else if (ev.step_id) {
+          highlightFloatingCodeForStep(win, ev.step_id, { scroll: true });
+        }
+      }
+    },
+    openFunctionSplitWindow: async (fnId, ev) => {
+      const fnNode = state.nodesById.get(fnId);
+      if (!fnNode || !canOpenInFloatingWindow(fnNode)) {
+        return;
+      }
+      await openFloatingWindow(fnId, { parentWindowId: null });
+      const winId = state.floatingWindowByTarget.get(fnId);
+      const win = winId ? state.floatingWindows.get(winId) : null;
+      if (!win || win.destroyed) {
+        return;
+      }
+      const splitBtn = win.modeButtons && win.modeButtons.get("split");
+      if (splitBtn && win.viewMode !== "split") {
+        splitBtn.click();
+      }
+      await loadFloatingWindowSource(win);
+      if (ev && ev.line > 0) {
+        highlightFloatingCodeLineRange(win, ev.line, ev.end_line || ev.line, { scroll: true });
+      } else if (ev && ev.step_id) {
+        highlightFloatingCodeForStep(win, ev.step_id, { scroll: true });
+      }
+    },
+    focusNode: (nodeId) => navigateToNode(nodeId),
+  });
+  state.walkthrough.bindDomEvents();
 }
 
 initViewer().catch((error) => {

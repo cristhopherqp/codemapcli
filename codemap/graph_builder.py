@@ -1300,9 +1300,10 @@ def aggregate_edges(
     *,
     start_index: int = 1,
 ) -> list[dict]:
-    """Una arista por par (origen, destino). Preserva campos base y añade `edge_type`."""
+    """Una arista por par (origen, destino). Preserva campos base, `edge_type` y `call_lines`."""
     grouped: dict[tuple[str, str], dict] = {}
     edge_types_seen: dict[tuple[str, str], list[str]] = {}
+    lines_seen: dict[tuple[str, str], list[int]] = {}
 
     for call in calls:
         if call.source_id not in valid_ids or call.target_id not in valid_ids:
@@ -1322,10 +1323,13 @@ def aggregate_edges(
                 entry["event"] = call.event
             grouped[key] = entry
             edge_types_seen[key] = [call.edge_type]
+            lines_seen[key] = [call.line] if call.line > 0 else []
             continue
 
         edge["call_count"] += 1
         edge["line"] = min(edge["line"], call.line)
+        if call.line > 0:
+            lines_seen[key].append(call.line)
         if call.confidence == CONFIRMED:
             edge["confidence"] = CONFIRMED
         edge["edge_type"] = _pick_primary_edge_type(edge["edge_type"], call.edge_type)
@@ -1339,6 +1343,7 @@ def aggregate_edges(
         extra_types = edge_types_seen[key]
         if len(extra_types) > 1:
             edge["edge_types"] = sorted(extra_types, key=lambda t: EDGE_TYPE_PRIORITY.get(t, 99))
+        edge["call_lines"] = sorted(set(lines_seen[key]))
         edges.append({"id": f"e_{number}", **edge})
     return edges
 
